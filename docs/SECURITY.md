@@ -327,6 +327,7 @@ Two lanes, both owner-authored in `~/.config/hotl/config.toml` — hotl does not
 
 | Artifact | Location | Control |
 |---|---|---|
+| shell traces from the zsh plugin (`hotl -p --shell-trace`) | `$TMPDIR/hotl-trace.*`, `0600`, deleted on read | masked **before** they become a prompt item — the log masker's env-named values plus a token-shape pass (`sk-`, `gh?_`, `AKIA`, `xox?-`, JWT, `Bearer`, PEM) — so the model never sees the secret either; they ride the untrusted envelope (`<shell_trace trust="untrusted">`) and can never enter the system prompt, config or memory |
 | session log (append-only JSONL, permanent by design) | `~/.local/share/hotl/sessions/` | secret masking at ingestion: values of secret-named env vars (`KEY`/`TOKEN`/`SECRET`/`PASSWORD`/`CREDENTIAL`/`AUTH`…, ≥ 8 chars) are replaced with `«masked:NAME»` — including their JSON-escaped forms — before bytes land |
 | evicted oversized tool results | `<session>.blobs/` | same masking; files written `0600`; blob filenames sanitized against path injection |
 | background job files (`cmd`, `pid`, `started`, `log`, `rc`) | `<session>.jobs/<id>/` | dir `0700`, files `0600`; `log` is written by the child process and is **not masked** — the completion notification's 8 KiB excerpt is masked like any log entry |
@@ -365,6 +366,7 @@ Installs owned by a package manager (cargo, Nix, Homebrew) and source builds are
 - **The permission pipeline has no AST or LLM inspectors.** Command scanning is heuristic (shell-operator detection), not tree-sitter-based; there are no LLM judges voting on calls.
 - **No third-party extension trust screens.** Moot today — hooks and settings load only from owner config, never from the repo — but required before any repo-supplied or third-party extension lane ships.
 - **Release artifacts are not signed.** `hotl update` verifies a SHA-256 that ships alongside the archive, which is integrity against corruption, not provenance. Closing it means a minisign key held offline and its public half compiled in — and it should raise the installer script at the same time, since signing only the updater hardens the one path that isn't the documented install.
+- **Token-shape masking is a prefix list, not a classifier.** A shell trace's `sk-`/`ghp_`/`AKIA`/`xox`/JWT/`Bearer`/PEM shapes are blanked; an unprefixed secret printed to the terminal reaches the model like any other output. The env-named masker still covers anything your shell exports under a secret-shaped name.
 - **Browser/WASM profile does not exist** and has no kernel sandbox story yet; it will not ship without compensating controls.
 
 ## Standing rules

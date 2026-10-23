@@ -8,6 +8,20 @@ semver promise of their own.
 
 ### Added
 
+- **`: why did that fail` now carries the failure.** The zsh plugin remembers
+  the last command, its exit status and its duration, and inside tmux the last
+  200 lines it printed; a `: ` prompt attaches them as `--shell-trace FILE`
+  on `hotl -p`. The attachment is masked twice (secret-named environment
+  values, then common token shapes: `sk-…`, `ghp_…`, `AKIA…`, `xox…`, JWTs,
+  `Bearer …`, PEM blocks), marked untrusted, and appended after your prompt.
+  Outside tmux the command, status and duration still ride along and the block
+  says so. `HOTL_SHELL_TRACE=0` turns it off; `HOTL_TRACE_LINES` and
+  `HOTL_TRACE_MAX_AGE` bound it.
+- **`hotl doctor --args [--days N]`** replays recent sessions and counts the
+  tool calls whose arguments do not fit their schema (a quoted number, a
+  scalar for an array, double-encoded JSON, `null` on an optional) and the
+  turns a tool body ended unparsed. A number, not a fix: it is how the owner
+  decides whether argument coercion is worth building.
 - **The prompt cache is kept alive while a long tool runs.** When a session is
   on the 5-minute cache and a tool call (a long test run, a sub-agent, a
   background job) is about to outlive it, hotl sends one tiny cache-read
@@ -211,6 +225,14 @@ semver promise of their own.
   120 s while the socket keeps pinging is dropped and the sample retried
   (same ceiling as a mid-stream disconnect); the reasoning that streamed
   stays on screen. `[provider] thinking_stall_secs` changes the number.
+
+### Changed
+
+- **A compaction summary's `FILES:` section is computed, not recalled.** hotl
+  lists every path a `read`, `edit` or `write` touched in the folded span
+  (failed calls excluded, last operation wins, first-touch order) and hands
+  the list to the summarizer as authoritative; a summary that drops a path has
+  its section replaced by the list.
 
 ### Fixed
 
