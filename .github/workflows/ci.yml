@@ -327,22 +327,20 @@ jobs:
           echo "site=$site" >> "$GITHUB_OUTPUT"
           echo "build-inputs=$verdict rust=$rust site=$site"
 
-  # Flake evaluation + build gate. `nix flake check` builds checks.package,
-  # which is the package derivation with the test suite re-enabled — so this
-  # leg stays predictive of the nixpkgs build, which keeps tests on.
+  # Flake evaluation + build gate. `nix flake check` builds every workspace
+  # crate as its own Nix step (crate2nix, flake.nix `checks`) and runs each
+  # crate's tests. Hestia keeps finished steps in the GitHub Actions cache, so
+  # a push rebuilds and re-tests only the crates it touched and the ones above
+  # them; a cache GitHub evicted (7 days idle) means a cold run, which is no
+  # faster than before. The nixpkgs-shaped package build is nix-tag.yml's job.
   #
-  # Deliberately master-only: it is a full cold Rust build plus the suite on
-  # each leg (nixpkgs delivers the toolchain prebuilt, never our dependency
-  # tree), and it duplicates coverage the jobs above already have on PRs. Its
-  # real job is proving *the flake* still evaluates and builds. Release tags
-  # get their own leg in nix-tag.yml, against the published tag. Skipped
-  # entirely (via `changes`) when the push touched no build inputs: src = self
-  # means a docs-only push does yield a new derivation hash, but nothing in it
-  # can change what this leg gates — whether the flake evaluates, builds, and
-  # passes its suite.
+  # Master-only: it duplicates coverage the jobs above already have on PRs.
+  # Its real job is proving *the flake* still evaluates, builds, and passes
+  # its suite. Skipped entirely (via `changes`) when the push touched no build
+  # inputs.
   #
   # macos-latest is not redundant with ubuntu: darwin has the weaker sandbox
-  # and different PTY semantics, so checkPhase behavior diverges there.
+  # and different PTY semantics, so test behavior diverges there.
   nix:
     needs: changes
     if: github.ref == 'refs/heads/master' && needs.changes.outputs.build-inputs == 'true'
@@ -351,9 +349,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      actions: read # lets hestia see evicted cache entries before fetching them
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: NixOS/nix-installer-action@main
+      # No account or secret: uploads use the runner's own cache token.
+      - uses: Mic92/hestia@v3
       - name: nix flake check
         run: nix flake check --print-build-logs
 

@@ -1,0 +1,33 @@
+name: Nix cache GC
+
+# Keeps hestia's binary cache (ci.yml `nix` job) inside the repository's 10 GB
+# GitHub Actions cache quota, which rust-cache shares, by deleting packs no
+# branch uses anymore. Must run on the default branch: that scope is the one
+# that grows. Adapted from github.com/Mic92/hestia/.github/workflows/gc.yml.
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+# A second GC racing the first's deletes corrupts the repack; queue instead.
+concurrency:
+  group: hestia-gc
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  gc:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write # REST cache deletes
+      contents: read
+    steps:
+      - uses: NixOS/nix-installer-action@main
+      - uses: Mic92/hestia@v3
+      - name: Run garbage collection
+        run: '"$HESTIA_BIN" gc'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
