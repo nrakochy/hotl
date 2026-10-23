@@ -752,8 +752,11 @@ pub fn build_argv_with(
             apply_landlock_with(cmd, egress, &writable, &spawn_read_deny())
         }
         _ => {
+            // No floor to widen (Windows' is 0053's job).
             #[cfg(unix)]
             let _ = &writable;
+            #[cfg(not(unix))]
+            let _ = extra_write;
             let mut cmd = tokio::process::Command::new(program);
             cmd.args(args);
             cmd
