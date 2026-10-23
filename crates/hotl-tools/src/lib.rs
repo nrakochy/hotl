@@ -13,6 +13,7 @@ pub mod concurrency;
 pub mod diagnostics;
 pub mod formatters;
 pub(crate) mod fsguard;
+pub mod jobs;
 pub(crate) mod matcher;
 pub(crate) mod minified;
 pub mod net;

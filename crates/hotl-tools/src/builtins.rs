@@ -1558,6 +1558,27 @@ impl Tool for BashTool {
     }
 }
 
+/// The one shell builder the foreground call and a background job share
+/// (0064 T1): the sandbox floor and the egress state resolved at start,
+/// `cwd` = the tool's root, stdin closed, detached from our terminal (Vuln
+/// 2). Output wiring is the caller's: a pipe for the foreground, the job's
+/// log file for the background. Pinned by
+/// `background_and_foreground_share_one_command_builder`.
+pub(crate) fn prepare_command(
+    command: &str,
+    root: &Path,
+    egress: &crate::net::EgressState,
+) -> tokio::process::Command {
+    let mut cmd = sandbox::build_command(command, sandbox_status(), egress);
+    // `build_command` itself stays root-agnostic — the sandbox floor is
+    // process-wide and this is only where the shell starts, not where it is
+    // confined.
+    cmd.current_dir(root);
+    cmd.stdin(std::process::Stdio::null());
+    sandbox::detach_session(&mut cmd);
+    cmd
+}
+
 async fn bash_impl(root: &Path, input: &Value, cancel: CancellationToken) -> ToolResult {
     let command = str_arg(input, "command")?;
     let timeout_ms = input
@@ -1567,20 +1588,12 @@ async fn bash_impl(root: &Path, input: &Value, cancel: CancellationToken) -> Too
         .min(BASH_MAX_TIMEOUT_MS);
 
     let egress = crate::net::egress_state().await;
-    let mut cmd = sandbox::build_command(command, sandbox_status(), &egress);
-    // `build_command` itself stays root-agnostic — the sandbox floor is
-    // process-wide and this is only where the shell starts, not where it is
-    // confined.
-    cmd.current_dir(root);
+    let mut cmd = prepare_command(command, root, &egress);
     let (child_out, child_err, pipe) = merged_pipe()
         .map_err(|e| ToolOutcome::err(format!("Could not create the output pipe: {e}.")))?;
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(child_out)
-        .stderr(child_err)
-        .kill_on_drop(true);
-    // Detached from our terminal/console (Vuln 2), and adopted by a reaper that
-    // reaches descendants rather than just the direct child.
-    sandbox::detach_session(&mut cmd);
+    cmd.stdout(child_out).stderr(child_err).kill_on_drop(true);
+    // Adopted by a reaper that reaches descendants rather than just the
+    // direct child.
     let reaper = new_reaper();
     let child = cmd
         .spawn()
