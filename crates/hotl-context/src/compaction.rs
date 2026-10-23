@@ -139,7 +139,7 @@ GOAL: what the user is trying to accomplish\n\
 CONSTRAINTS: the user's own words, quoted, one per line\n\
 STATE: what has been done and what is true now\n\
 DECISIONS: choices made and their reasons\n\
-FILES: files touched and how\n\
+FILES: the harness's list, every path, verbatim; add what was done to each if known\n\
 NEXT: what remains\n\
 Be specific (paths, names, values). Omit pleasantries and tool mechanics. \
 A section with nothing in it gets the word none, never an invention.";
@@ -171,6 +171,12 @@ pub fn summarize_prompt<I: std::borrow::Borrow<Item>>(
         "Transcript to compress:\n\n{}",
         render_transcript_clipped(folded, RECENT_RESULTS)
     );
+    // The harness knows every path the span touched (0075 D1/D4); the model
+    // copies the list instead of recalling it, and `enforce_files` holds it to
+    // that after the answer.
+    if let Some(block) = files_block(folded) {
+        out.push_str(&format!("\n\n{FILES_BLOCK_INTRO}\n{block}\n"));
+    }
     if let Some(plan) = plan_md.map(str::trim).filter(|p| !p.is_empty()) {
         out.push_str(&format!("\n\nThe session's plan:\n\n{plan}\n"));
     }
@@ -189,6 +195,169 @@ pub fn summarize_prompt<I: std::borrow::Borrow<Item>>(
 /// The fold-focus validator lives beside `normalize_session_name` so the
 /// console (which does not depend on this crate) calls the same one.
 pub use hotl_types::{normalize_focus, FOCUS_MAX};
+
+/// Paths the FILES block lists before it says `… and N more`.
+pub const FILES_BLOCK_MAX: usize = 64;
+/// The sentence that introduces the computed block in the summarize prompt.
+pub const FILES_BLOCK_INTRO: &str = "Files touched in this span — computed by the harness and \
+authoritative: copy every path into FILES, add what was done if you know it, never add a path \
+that is not listed:";
+
+/// What a tool call did to a path, ranked: a write outranks an edit outranks
+/// a read when one path saw several.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Touch {
+    Read,
+    Edited,
+    Written,
+}
+
+/// Tool **names** and the string property `path` — this crate cannot see tool
+/// schemas, so an MCP tool named `read` is a known false positive (0075 D2).
+/// `bash`, `glob`, `grep` and everything else are ignored: redirects are never
+/// parsed in the engine and a search is not a touch.
+const TOUCH_TOOLS: [(&str, Touch); 3] = [
+    ("write", Touch::Written),
+    ("edit", Touch::Edited),
+    ("read", Touch::Read),
+];
+
+/// The files the folded span touched, one line per path in first-touch
+/// order, last op wins by rank, edits counted (0075 D3). Only calls whose
+/// paired result is not an error count: a failed edit touched nothing.
+/// `None` when the span touched no file. Byte-stable for the same input.
+pub fn files_block<I: std::borrow::Borrow<Item>>(folded: &[I]) -> Option<String> {
+    // Pass one: which call ids have a non-error result.
+    let mut ok = std::collections::HashSet::new();
+    for item in folded {
+        if let Item::ToolResults { results } = item.borrow() {
+            for r in results {
+                if !r.is_error {
+                    ok.insert(r.tool_use_id.clone());
+                }
+            }
+        }
+    }
+    // Pass two: the touches, folded per path.
+    let mut rows: Vec<(String, Touch, u32)> = Vec::new();
+    for item in folded {
+        let Item::Assistant { blocks, .. } = item.borrow() else {
+            continue;
+        };
+        for tu in hotl_types::assistant_tool_uses(blocks) {
+            let Some((_, touch)) = TOUCH_TOOLS.iter().find(|(n, _)| *n == tu.name) else {
+                continue;
+            };
+            if !ok.contains(&tu.id) {
+                continue;
+            }
+            let Some(path) = tu.input.get("path").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let edits = u32::from(*touch == Touch::Edited);
+            match rows.iter_mut().find(|(p, _, _)| p == path) {
+                Some((_, t, n)) => {
+                    *t = (*t).max(*touch);
+                    *n += edits;
+                }
+                None => rows.push((path.to_string(), *touch, edits)),
+            }
+        }
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for (path, touch, edits) in rows.iter().take(FILES_BLOCK_MAX) {
+        let what = match touch {
+            Touch::Written => "written".to_string(),
+            Touch::Edited => format!("edited ({edits}×)"),
+            Touch::Read => "read".to_string(),
+        };
+        out.push_str(&format!("- {path} — {what}\n"));
+    }
+    if rows.len() > FILES_BLOCK_MAX {
+        out.push_str(&format!(
+            "- … and {} more (see recall)\n",
+            rows.len() - FILES_BLOCK_MAX
+        ));
+    }
+    Some(out.trim_end().to_string())
+}
+
+const DIGEST_HEADERS: [&str; 6] = [
+    "GOAL:",
+    "CONSTRAINTS:",
+    "STATE:",
+    "DECISIONS:",
+    "FILES:",
+    "NEXT:",
+];
+
+fn is_header(line: &str) -> bool {
+    let t = line.trim_start().to_ascii_uppercase();
+    DIGEST_HEADERS.iter().any(|h| t.starts_with(h))
+}
+
+/// Every path the block lists (the text between `- ` and ` — `).
+fn block_paths(block: &str) -> Vec<&str> {
+    block
+        .lines()
+        .filter_map(|l| l.strip_prefix("- "))
+        .filter(|l| !l.starts_with('…'))
+        .map(|l| l.split(" — ").next().unwrap_or(l).trim())
+        .collect()
+}
+
+/// Hold the digest to the computed block (0075 D4, owner: replace, not
+/// append): when the model's `FILES:` section is missing any listed path, or
+/// is absent, it becomes `FILES:` plus the block. A complete section is left
+/// as the model wrote it; `None` leaves the digest alone. Header match is
+/// case-insensitive; a digest with two `FILES:` lines keeps the first.
+pub fn enforce_files(digest: &str, block: Option<&str>) -> String {
+    let Some(block) = block else {
+        return digest.to_string();
+    };
+    let lines: Vec<&str> = digest.lines().collect();
+    let files_at = lines
+        .iter()
+        .position(|l| l.trim_start().to_ascii_uppercase().starts_with("FILES:"));
+    let replacement = format!("FILES:\n{block}");
+    match files_at {
+        Some(start) => {
+            let end = lines[start + 1..]
+                .iter()
+                .position(|l| is_header(l))
+                .map_or(lines.len(), |i| start + 1 + i);
+            let section = lines[start..end].join("\n");
+            if block_paths(block).iter().all(|p| section.contains(p)) {
+                return digest.to_string();
+            }
+            let mut out: Vec<&str> = lines[..start].to_vec();
+            out.push(&replacement);
+            out.extend_from_slice(&lines[end..]);
+            out.join("\n")
+        }
+        None => {
+            let next_at = lines
+                .iter()
+                .position(|l| l.trim_start().to_ascii_uppercase().starts_with("NEXT:"));
+            let mut out: Vec<&str> = Vec::with_capacity(lines.len() + 1);
+            match next_at {
+                Some(i) => {
+                    out.extend_from_slice(&lines[..i]);
+                    out.push(&replacement);
+                    out.extend_from_slice(&lines[i..]);
+                }
+                None => {
+                    out.extend_from_slice(&lines);
+                    out.push(&replacement);
+                }
+            }
+            out.join("\n")
+        }
+    }
+}
 
 /// The plain-text transcript both small-model calls read (the compaction
 /// summarizer and the goal evaluator): tool results clipped per-item, images
@@ -297,6 +466,194 @@ mod tests {
     use super::*;
     use hotl_types::ToolResultItem;
     use serde_json::json;
+
+    fn call(id: &str, name: &str, path: &str) -> Item {
+        Item::Assistant {
+            blocks: vec![
+                json!({"type": "tool_use", "id": id, "name": name, "input": {"path": path}}),
+            ],
+            model: None,
+        }
+    }
+
+    fn result_of(id: &str, is_error: bool) -> Item {
+        Item::ToolResults {
+            results: vec![ToolResultItem {
+                tool_use_id: id.into(),
+                content: "ok".into(),
+                is_error,
+            }],
+        }
+    }
+
+    /// Six calls on three paths: `a.rs` read then edited twice, `b.rs`
+    /// written after a read, `c.rs` read; the fixed golden for `files_block`.
+    fn six_call_span() -> Vec<Item> {
+        vec![
+            call("t1", "read", "src/a.rs"),
+            result_of("t1", false),
+            call("t2", "edit", "src/a.rs"),
+            result_of("t2", false),
+            call("t3", "read", "src/b.rs"),
+            result_of("t3", false),
+            call("t4", "edit", "src/a.rs"),
+            result_of("t4", false),
+            call("t5", "write", "src/b.rs"),
+            result_of("t5", false),
+            call("t6", "read", "src/c.rs"),
+            result_of("t6", false),
+        ]
+    }
+
+    #[test]
+    fn files_block_ranks_written_over_edited_over_read() {
+        let block = files_block(&six_call_span()).unwrap();
+        assert!(block.contains("- src/a.rs — edited (2×)"), "{block}");
+        assert!(block.contains("- src/b.rs — written"), "{block}");
+        assert!(block.contains("- src/c.rs — read"), "{block}");
+    }
+
+    #[test]
+    fn files_block_drops_calls_whose_result_errored() {
+        let span = vec![
+            call("t1", "edit", "src/a.rs"),
+            result_of("t1", true),
+            call("t2", "read", "src/b.rs"),
+            result_of("t2", false),
+            // No result at all (the fold caught it in flight): not a touch.
+            call("t3", "write", "src/c.rs"),
+        ];
+        assert_eq!(files_block(&span).unwrap(), "- src/b.rs — read");
+    }
+
+    #[test]
+    fn files_block_keeps_first_touch_order() {
+        let block = files_block(&six_call_span()).unwrap();
+        let a = block.find("src/a.rs").unwrap();
+        let b = block.find("src/b.rs").unwrap();
+        let c = block.find("src/c.rs").unwrap();
+        assert!(a < b && b < c, "{block}");
+    }
+
+    #[test]
+    fn files_block_caps_at_sixty_four_and_counts_the_rest() {
+        let mut span = Vec::new();
+        for i in 0..70 {
+            span.push(call(&format!("t{i}"), "read", &format!("f{i:03}.rs")));
+            span.push(result_of(&format!("t{i}"), false));
+        }
+        let block = files_block(&span).unwrap();
+        assert_eq!(block.lines().count(), FILES_BLOCK_MAX + 1);
+        assert!(block.ends_with("- … and 6 more (see recall)"), "{block}");
+        assert!(block.contains("f063.rs") && !block.contains("f064.rs"));
+    }
+
+    #[test]
+    fn files_block_ignores_bash_glob_grep_and_unknown_tools() {
+        let span = vec![
+            Item::Assistant {
+                blocks: vec![
+                    json!({"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "echo x > out.txt"}}),
+                    json!({"type": "tool_use", "id": "t2", "name": "glob", "input": {"pattern": "*.rs", "path": "src"}}),
+                    json!({"type": "tool_use", "id": "t3", "name": "grep", "input": {"pattern": "fn", "path": "src"}}),
+                    json!({"type": "tool_use", "id": "t4", "name": "mcp_reader", "input": {"path": "x"}}),
+                ],
+                model: None,
+            },
+            Item::ToolResults {
+                results: ["t1", "t2", "t3", "t4"]
+                    .iter()
+                    .map(|id| ToolResultItem {
+                        tool_use_id: (*id).into(),
+                        content: "ok".into(),
+                        is_error: false,
+                    })
+                    .collect(),
+            },
+        ];
+        assert_eq!(files_block(&span), None);
+    }
+
+    #[test]
+    fn files_block_is_none_for_a_span_with_no_touches() {
+        let span = vec![Item::User {
+            text: "hi".into(),
+            synthetic: None,
+            images: Vec::new(),
+        }];
+        assert_eq!(files_block(&span), None);
+        assert_eq!(files_block::<Item>(&[]), None);
+    }
+
+    #[test]
+    fn files_block_is_byte_stable() {
+        let golden = "- src/a.rs — edited (2×)\n- src/b.rs — written\n- src/c.rs — read";
+        assert_eq!(files_block(&six_call_span()).unwrap(), golden);
+        assert_eq!(files_block(&six_call_span()), files_block(&six_call_span()));
+    }
+
+    #[test]
+    fn summarize_prompt_carries_the_files_block_after_the_transcript() {
+        let prompt = summarize_prompt(&six_call_span(), Some("- step one"), None);
+        let transcript = prompt.find("Transcript to compress").unwrap();
+        let files = prompt.find(FILES_BLOCK_INTRO).unwrap();
+        let plan = prompt.find("The session's plan").unwrap();
+        assert!(transcript < files && files < plan, "{prompt}");
+        assert!(prompt.contains("- src/b.rs — written"));
+        // No touches, no block.
+        let none = summarize_prompt(
+            &[Item::User {
+                text: "hi".into(),
+                synthetic: None,
+                images: Vec::new(),
+            }],
+            None,
+            None,
+        );
+        assert!(!none.contains(FILES_BLOCK_INTRO));
+    }
+
+    const BLOCK: &str = "- src/a.rs — edited (2×)\n- src/b.rs — written";
+
+    #[test]
+    fn enforce_files_replaces_a_files_section_missing_a_path() {
+        let digest = "GOAL: g\nSTATE: s\nFILES: src/a.rs edited\n- and prose\nNEXT: n";
+        let out = enforce_files(digest, Some(BLOCK));
+        assert_eq!(
+            out,
+            "GOAL: g\nSTATE: s\nFILES:\n- src/a.rs — edited (2×)\n- src/b.rs — written\nNEXT: n"
+        );
+        // Case-insensitive header, FILES last: the section runs to the end.
+        let out = enforce_files("GOAL: g\nfiles: nothing", Some(BLOCK));
+        assert_eq!(
+            out,
+            "GOAL: g\nFILES:\n- src/a.rs — edited (2×)\n- src/b.rs — written"
+        );
+    }
+
+    #[test]
+    fn enforce_files_leaves_a_complete_section_alone() {
+        let digest = "GOAL: g\nFILES: touched src/a.rs (two edits) and wrote src/b.rs\nNEXT: n";
+        assert_eq!(enforce_files(digest, Some(BLOCK)), digest);
+        assert_eq!(enforce_files(digest, None), digest, "no block, no change");
+        // Two FILES lines: the first is the section; the second is prose to us.
+        let twice = "FILES: src/a.rs src/b.rs\nFILES: again\nNEXT: n";
+        assert_eq!(enforce_files(twice, Some(BLOCK)), twice);
+    }
+
+    #[test]
+    fn enforce_files_adds_the_section_when_absent() {
+        let out = enforce_files("GOAL: g\nNEXT: n", Some(BLOCK));
+        assert_eq!(
+            out,
+            "GOAL: g\nFILES:\n- src/a.rs — edited (2×)\n- src/b.rs — written\nNEXT: n"
+        );
+        let out = enforce_files("GOAL: g\nSTATE: s", Some(BLOCK));
+        assert_eq!(
+            out,
+            "GOAL: g\nSTATE: s\nFILES:\n- src/a.rs — edited (2×)\n- src/b.rs — written"
+        );
+    }
 
     fn user(text: &str) -> Item {
         Item::User {

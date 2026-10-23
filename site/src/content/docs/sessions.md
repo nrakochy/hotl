@@ -276,7 +276,11 @@ prompt to compose, nothing selectively remembered. The wrap-up child is a
 first-class descendant in the store: it records its parent and its fork point,
 so the lineage-aware `hotl gc` will not prune the history it descends from.
 To keep working in the *same* session instead, `/compact <what the next phase
-needs>` folds the history in place ([tui.md](../tui/#folding-on-purpose)).
+needs>` folds the history in place ([tui.md](../tui/#folding-on-purpose)). In
+every compaction summary the `FILES:` section is computed by hotl from the
+folded tool calls — each path a `read`, `edit` or `write` touched and succeeded
+on, last operation first — and held to that list; the model copies it rather
+than recalling it.
 
 ## Seeing lineage
 

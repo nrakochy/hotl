@@ -3861,7 +3861,10 @@ pub(crate) async fn summarize(
             }
         }
         if let Some(t) = text.filter(|t| !t.trim().is_empty()) {
-            return (Some(t), spent);
+            // 0075 D4: the FILES section is the harness's list or it is
+            // replaced. Here, so the speculative digest gets it too.
+            let block = compaction::files_block(folded);
+            return (Some(compaction::enforce_files(&t, block.as_deref())), spent);
         }
     }
     (None, spent)
