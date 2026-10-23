@@ -138,10 +138,14 @@ fn alive(pid: &str) -> bool {
             .and_then(|s| s.rsplit(')').next().map(|r| r.trim().to_string()))
             .is_some_and(|r| !r.starts_with('Z'));
     }
-    let out = std::process::Command::new("ps")
+    // The darwin nix sandbox has no `ps`; `kill 0` cannot see a zombie, but
+    // the caller polls until the reaper runs.
+    let Ok(out) = std::process::Command::new("ps")
         .args(["-o", "stat=", "-p", pid])
         .output()
-        .unwrap();
+    else {
+        return unsafe { libc::kill(pid.parse().unwrap(), 0) } == 0;
+    };
     let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
     !stat.is_empty() && !stat.starts_with('Z')
 }
