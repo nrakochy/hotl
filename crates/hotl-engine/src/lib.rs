@@ -168,6 +168,8 @@ pub struct EngineConfig {
     /// How long a `/remember` confirm waits for the owner before it counts as
     /// a no (`[behavior] ask_expiry_secs`).
     pub ask_expiry: std::time::Duration,
+    /// Running background jobs per session (0064 D6, `[behavior] max_jobs`).
+    pub max_jobs: usize,
     /// Skills with `paths:` globs (0068 D3): the turn hints the first time a
     /// tool input path matches one. Rides the config rather than
     /// `SessionDeps` so the hundred test literals stay as they are; children
@@ -274,6 +276,7 @@ impl Default for EngineConfig {
             fallback_models: Vec::new(),
             memory_files: None,
             ask_expiry: std::time::Duration::from_secs(3600),
+            max_jobs: 8,
             skill_paths: Arc::from(Vec::new()),
             tool_failure_budget: 5,
             max_tool_calls: 0,

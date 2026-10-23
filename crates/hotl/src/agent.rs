@@ -1284,6 +1284,7 @@ async fn scaffold(
     warnings.extend(memory_warning.map(|w| format!("WARNING — {w}")));
     config.memory_files = memory_files;
     config.ask_expiry = cfg.behavior.ask_expiry();
+    config.max_jobs = cfg.behavior.max_jobs();
     Ok(Scaffold {
         plan_files,
         provider,

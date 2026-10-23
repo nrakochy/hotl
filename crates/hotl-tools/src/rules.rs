@@ -1278,6 +1278,37 @@ mod tests {
     /// case reading as it did before the overlay landed. `protected: true`
     /// means the execute-later class — the class most pre-0036 cases meant;
     /// tests that care about another class write the `CallFacts` literal.
+    /// 0064 D2: a background job is the same `command` subject, so an allow
+    /// prefix auto-allows it exactly as it would the foreground call.
+    #[test]
+    fn an_allow_prefix_rule_matches_a_background_call_the_same() {
+        let r = Rules::from_toml("[[allow]]\ntool = \"bash\"\nprefix = \"cargo \"\n").unwrap();
+        let fg = r.evaluate(
+            r.mode(),
+            false,
+            "bash",
+            &json!({"command": "cargo test"}),
+            facts(true, false, false),
+        );
+        let bg = r.evaluate(
+            r.mode(),
+            false,
+            "bash",
+            &json!({"command": "cargo test", "background": true}),
+            facts(true, false, false),
+        );
+        assert!(matches!(fg, Verdict::Auto { .. }), "{fg:?}");
+        assert_eq!(fg, bg);
+        let other = r.evaluate(
+            r.mode(),
+            false,
+            "bash",
+            &json!({"command": "npm test", "background": true}),
+            facts(true, false, false),
+        );
+        assert_eq!(other, Verdict::Ask);
+    }
+
     fn facts(sandbox_enforced: bool, protected: bool, read_only: bool) -> CallFacts {
         CallFacts {
             sandbox_enforced,

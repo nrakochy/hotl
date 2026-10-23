@@ -738,6 +738,9 @@ pub struct BehaviorCfg {
     /// Seconds a parked permission ask waits for a human before it is denied.
     /// Resolve via [`BehaviorCfg::ask_expiry`] — absent means one hour.
     pub ask_expiry_secs: Option<u64>,
+    /// Running background jobs per session (0064 D6). Resolve via
+    /// [`BehaviorCfg::max_jobs`] — absent or zero means 8.
+    pub max_jobs: Option<usize>,
     /// Title an unnamed console session on the utility model after its
     /// first completed turn (0071 T4). Resolve via
     /// [`BehaviorCfg::auto_title`] — absent means **on**. Headless runs
@@ -786,6 +789,11 @@ impl BehaviorCfg {
     /// who really does come back the next day.
     pub fn ask_expiry(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.ask_expiry_secs.unwrap_or(3600))
+    }
+    /// At least one: a cap of zero would make `background` a tool error on
+    /// every call, which is a config mistake, not a policy.
+    pub fn max_jobs(&self) -> usize {
+        self.max_jobs.filter(|n| *n >= 1).unwrap_or(8)
     }
 }
 
@@ -2699,6 +2707,19 @@ path_prefix = "/Volumes/secrets"
         // different home than `expand_home` resolved.
         let home = home_dir().expect("a home directory");
         assert_eq!(cfg.history.resolved_path(data), home.join("notes/h.jsonl"));
+    }
+
+    #[test]
+    fn max_jobs_defaults_to_eight_and_rejects_zero() {
+        assert_eq!(cfg_with("").behavior.max_jobs(), 8);
+        assert_eq!(
+            cfg_with("[behavior]\nmax_jobs = 3\n").behavior.max_jobs(),
+            3
+        );
+        assert_eq!(
+            cfg_with("[behavior]\nmax_jobs = 0\n").behavior.max_jobs(),
+            8
+        );
     }
 
     #[test]

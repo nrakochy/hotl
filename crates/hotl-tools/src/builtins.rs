@@ -1507,7 +1507,13 @@ impl Tool for BashTool {
          for what only a shell can do: builds, tests, git, package managers, running programs. \
          Optional `expect`: state what you predict this call returns. If the result misses the \
          prediction, the rest of this batch is not run and you are told which call surprised \
-         you. Use it when you are testing a belief, not on every call."
+         you. Use it when you are testing a belief, not on every call. \
+         `background: true` starts the command as a job and returns at once with its log and \
+         rc file paths and the literal line that stops it — for a test suite, a build or a \
+         server that needs longer than one call; no timeout unless you set one. You will be \
+         told when it ends — do not poll it in a loop; carry on with other work. `detach: true` \
+         (implies background) lets the job outlive this session, for a server that must keep \
+         running; headless runs end at the turn and kill their jobs, so use detach there."
     }
     fn schema(&self) -> Value {
         json!({
@@ -1524,7 +1530,9 @@ impl Tool for BashTool {
                         "empty": {"type": "boolean"}
                     },
                     "additionalProperties": false
-                }
+                },
+                "background": {"type": "boolean", "description": "Start as a background job: returns at once with the log/rc paths; you are told when it ends. No timeout unless timeout_ms is set."},
+                "detach": {"type": "boolean", "description": "Background job that outlives this session (a server). Implies background; asks like a protected write."}
             },
             "required": ["command"]
         })
@@ -1539,7 +1547,21 @@ impl Tool for BashTool {
             Some(net) => format!("{} {net}", sandbox_status().label()),
             None => sandbox_status().label(),
         };
-        let summary = format!("bash [{label}]: {short}");
+        // A job is the foreground call with one more word (0064 D2): the
+        // same subject, so allow and deny rules see the same `command`.
+        let (background, detach) = job_flags(input);
+        let marker = if background { " (background)" } else { "" };
+        let summary = format!("bash [{label}]{marker}: {short}");
+        // `detach` is the execute-later class (D2): the job outlives the
+        // session, like a planted hook outlives the write.
+        if detach {
+            return Permission::AskProtected {
+                summary,
+                why: "a detached job outlives this session — it keeps running after hotl exits"
+                    .into(),
+                class: ProtectedClass::ExecuteLater,
+            };
+        }
         // Vuln 4: a bash command that writes an execute-later path escalates
         // to the protected class, just like the `write` tool — an ask under
         // ask/dontask/plan, an allow-with-⚑-notice under bypass (0036).
@@ -1579,8 +1601,85 @@ pub(crate) fn prepare_command(
     cmd
 }
 
+/// `(background, detach)`; `detach` implies `background`.
+fn job_flags(input: &Value) -> (bool, bool) {
+    let flag = |k: &str| input.get(k).and_then(Value::as_bool).unwrap_or(false);
+    let detach = flag("detach");
+    (flag("background") || detach, detach)
+}
+
+/// The start call's result (0064): the file contract and the literal lines to
+/// read, page and stop the job. `facts.exit` stays `None` — nothing exited.
+fn job_started_text(r: &crate::jobs::JobRecord) -> String {
+    let log = r.log_path();
+    let rc = r.rc_path();
+    let reach = if r.detached && cfg!(windows) {
+        " (detached on Windows: stop reaches the direct child only)"
+    } else {
+        ""
+    };
+    let outlives = if r.detached {
+        " It is detached: it keeps running after this session ends."
+    } else {
+        ""
+    };
+    format!(
+        "Started background job {id} (pid {pid}): {cmd}\n\
+         \x20 log  {log}   — read tool (offset/limit to page), or `tail -n 50 {log}`\n\
+         \x20 rc   {rc}   — absent while running; exit code or `killed:SIG…` when done\n\
+         \x20 stop {stop}{reach}\n\
+         You will be told when it ends. Do not poll in a loop; carry on with other work.{outlives}",
+        id = r.id,
+        pid = r.pid,
+        cmd = r.command,
+        log = log.display(),
+        rc = rc.display(),
+        stop = r.stop_line(),
+    )
+}
+
+/// `background: true` (0064): hand the command to the session's job registry
+/// and return at once. Runs before any pipe exists.
+async fn start_job(root: &Path, input: &Value, command: &str) -> ToolResult {
+    if input.get("expect").is_some() {
+        return Err(ToolOutcome::err(
+            "`expect` and `background` do not mix: an expectation cannot be checked on a job \
+             that has not finished. Drop one of them.",
+        ));
+    }
+    let Some(ctx) = crate::jobs::job_context() else {
+        return Err(ToolOutcome::err(
+            "background jobs are not available in this context; run the command in the \
+             foreground.",
+        ));
+    };
+    let (_, detach) = job_flags(input);
+    let timeout = input
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .map(std::time::Duration::from_millis);
+    let record = ctx
+        .start(crate::jobs::JobSpec {
+            command: command.to_string(),
+            root: root.to_path_buf(),
+            timeout,
+            detach,
+        })
+        .await
+        .map_err(ToolOutcome::err)?;
+    Ok(
+        ToolOutcome::ok(job_started_text(&record)).with_facts(crate::OutcomeFacts {
+            exit: None,
+            ..Default::default()
+        }),
+    )
+}
+
 async fn bash_impl(root: &Path, input: &Value, cancel: CancellationToken) -> ToolResult {
     let command = str_arg(input, "command")?;
+    if job_flags(input).0 {
+        return start_job(root, input, command).await;
+    }
     let timeout_ms = input
         .get("timeout_ms")
         .and_then(Value::as_u64)
@@ -2276,6 +2375,223 @@ mod tests {
         };
         assert_eq!(miss.facts.matched, Some(false), "{}", miss.content);
         assert!(!miss.is_error, "no-match is a success: {}", miss.content);
+    }
+
+    // ---- 0064 background jobs ----------------------------------------------
+
+    #[cfg(unix)]
+    fn job_ctx(dir: &Path) -> Arc<crate::jobs::JobContext> {
+        crate::jobs::JobContext::new(dir.join("s.jobs"), 8, Arc::new(|_| {}))
+    }
+
+    /// Run a bash call with a job context in scope, as `turn.rs` scopes it.
+    #[cfg(unix)]
+    fn run_with_jobs(ctx: Arc<crate::jobs::JobContext>, input: Value) -> ToolOutcome {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let out = crate::jobs::JOBS
+                    .scope(
+                        Arc::clone(&ctx),
+                        BashTool::default().run(input, CancellationToken::new()),
+                    )
+                    .await;
+                // Leave nothing running behind the test.
+                ctx.jobs.kill_all();
+                for _ in 0..100 {
+                    if ctx.jobs.running_attached() == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                out
+            })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_background_call_returns_at_once_with_the_file_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = job_ctx(dir.path());
+        let started = std::time::Instant::now();
+        let out = run_with_jobs(
+            Arc::clone(&ctx),
+            json!({"command": "sleep 5", "background": true}),
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.facts.exit, None, "nothing has exited");
+        let rec = &ctx.jobs.list()[0];
+        assert!(
+            out.content.starts_with(&format!(
+                "Started background job {} (pid {}): sleep 5",
+                rec.id, rec.pid
+            )),
+            "{}",
+            out.content
+        );
+        for needle in [
+            format!("log  {}", rec.log_path().display()),
+            format!("rc   {}", rec.rc_path().display()),
+            format!("stop kill -- -{}", rec.pid),
+            "You will be told when it ends".to_string(),
+        ] {
+            assert!(out.content.contains(&needle), "{needle}: {}", out.content);
+        }
+        assert!(!rec.detached);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detach_implies_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = job_ctx(dir.path());
+        let out = run_with_jobs(
+            Arc::clone(&ctx),
+            json!({"command": "sleep 60", "detach": true}),
+        );
+        assert!(!out.is_error, "{}", out.content);
+        let rec = ctx.jobs.list().remove(0);
+        assert!(rec.detached);
+        assert!(out.content.contains("It is detached"), "{}", out.content);
+        // Not killed by the helper's kill_all; stop it by name.
+        assert!(ctx.jobs.stop(&rec.id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expect_with_background_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = job_ctx(dir.path());
+        let out = run_with_jobs(
+            Arc::clone(&ctx),
+            json!({"command": "true", "background": true, "expect": {"exit": "zero"}}),
+        );
+        assert!(out.is_error);
+        assert!(out.content.contains("do not mix"), "{}", out.content);
+        assert!(ctx.jobs.list().is_empty(), "nothing started");
+    }
+
+    #[test]
+    fn background_without_a_job_context_is_a_tool_error() {
+        let out = run(
+            &BashTool::default(),
+            json!({"command": "sleep 5", "background": true}),
+        );
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("not available in this context"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn the_background_summary_is_the_foreground_summary_plus_a_marker() {
+        let tool = BashTool::default();
+        let fg = match tool.permission(&json!({"command": "cargo test"})) {
+            Permission::Ask { summary } => summary,
+            other => panic!("{other:?}"),
+        };
+        let bg = match tool.permission(&json!({"command": "cargo test", "background": true})) {
+            Permission::Ask { summary } => summary,
+            other => panic!("{other:?}"),
+        };
+        let (head, tail) = fg.split_once("]: ").unwrap();
+        assert_eq!(bg, format!("{head}] (background): {tail}"));
+    }
+
+    #[test]
+    fn detach_is_the_execute_later_class() {
+        let tool = BashTool::default();
+        let Permission::AskProtected {
+            summary,
+            why,
+            class,
+        } = tool.permission(&json!({"command": "python -m http.server", "detach": true}))
+        else {
+            panic!("detach must be protected");
+        };
+        assert_eq!(class, ProtectedClass::ExecuteLater);
+        assert!(summary.contains("(background)"), "{summary}");
+        assert!(why.contains("outlives this session"), "{why}");
+    }
+
+    #[test]
+    fn bash_schema_advertises_background_and_detach() {
+        let schema = BashTool::default().schema();
+        for key in ["background", "detach"] {
+            assert_eq!(schema["properties"][key]["type"], "boolean", "{key}");
+        }
+        let desc = BashTool::default().description().to_string();
+        assert!(
+            desc.contains("background: true") && desc.contains("detach: true"),
+            "{desc}"
+        );
+        assert!(desc.contains("do not poll"), "{desc}");
+    }
+
+    /// The seatbelt profile must let a sandboxed shell signal its own job, or
+    /// the literal stop line is a lie on macOS. Runs only where the floor is
+    /// actually enforced.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sandboxed_shell_can_signal_its_own_job() {
+        if !matches!(sandbox_status(), SandboxStatus::Enforced(_)) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = job_ctx(dir.path());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Started by hand (not `run_with_jobs`, whose cleanup would kill
+            // the job before the probes run).
+            let out = crate::jobs::JOBS
+                .scope(
+                    Arc::clone(&ctx),
+                    BashTool::default().run(
+                        json!({"command": "sleep 60", "background": true}),
+                        CancellationToken::new(),
+                    ),
+                )
+                .await;
+            assert!(!out.is_error, "{}", out.content);
+            let rec = ctx.jobs.list().remove(0);
+            let probe = BashTool::default()
+                .run(
+                    json!({"command": format!("kill -0 {}", rec.pid)}),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(
+                !probe.is_error,
+                "kill -0 under the floor: {}",
+                probe.content
+            );
+            let stop = BashTool::default()
+                .run(
+                    json!({"command": format!("kill -- -{}", rec.pid)}),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(
+                !stop.is_error,
+                "kill -- -pgid under the floor: {}",
+                stop.content
+            );
+            for _ in 0..100 {
+                if ctx.jobs.running() == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(ctx.jobs.running(), 0, "the shell's kill reached the job");
+        });
     }
 
     /// The field is the model's only teaching. If it is not in the schema and
