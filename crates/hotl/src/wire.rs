@@ -138,11 +138,15 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
             subagent_runs,
             duplicate_work_paths,
             false_completions,
+            usage,
+            tool_calls,
         } => json!({
             "type": "delegation",
             "subagent_runs": subagent_runs,
             "duplicate_work_paths": duplicate_work_paths,
             "false_completions": false_completions,
+            "usage": usage,
+            "tool_calls": tool_calls,
         }),
         EngineEvent::Retrying {
             attempt,

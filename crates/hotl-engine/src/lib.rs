@@ -603,6 +603,10 @@ pub enum EngineEvent {
         /// Children that reported `completed` while the caller's own
         /// `validate_cmd` said otherwise.
         false_completions: u32,
+        /// The children's summed bill (0072 D11): what a parent that is itself
+        /// a child passes up, so a grandchild's spend reaches the root.
+        usage: TokenUsage,
+        tool_calls: u64,
     },
     Retrying {
         attempt: u32,

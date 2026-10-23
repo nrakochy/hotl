@@ -306,9 +306,43 @@ pub struct AgentsCfg {
     /// the parent's (0070 T10). A config key, not a user def: built-in names
     /// win over `agents/*.md` on purpose.
     pub review_model: Option<String>,
+    /// How deep sub-agents may nest (0072 D9): the main session is depth 0,
+    /// and a child at depth `n` gets `spawn` only while `n < max_depth`.
+    /// `1..=3`; default 1 (children never recurse).
+    pub max_depth: Option<u32>,
+    /// Running plus parked sub-agents per session (0072 D7). Default 8.
+    pub max_children: Option<usize>,
 }
 
+/// The most `[agents] max_depth` may say.
+pub const MAX_DEPTH_CAP: u32 = 3;
+
 impl AgentsCfg {
+    /// `[agents] max_depth`, validated `1..=3`. `0` is refused with the
+    /// right way to turn sub-agents off; past the cap is refused naming it.
+    pub fn max_depth(&self) -> Result<u32, String> {
+        match self.max_depth {
+            None => Ok(1),
+            Some(0) => Err(
+                "`[agents] max_depth = 0` is not a setting: to disable sub-agents, \
+                            deny the tool (`[[deny]]\ntool = \"spawn\"`)."
+                    .into(),
+            ),
+            Some(n) if n > MAX_DEPTH_CAP => Err(format!(
+                "`[agents] max_depth = {n}` is above the cap of {MAX_DEPTH_CAP}."
+            )),
+            Some(n) => Ok(n),
+        }
+    }
+
+    /// `[agents] max_children`, at least one (a cap of zero would make every
+    /// `spawn` a tool error, which is a config mistake, not a policy).
+    pub fn max_children(&self) -> usize {
+        self.max_children
+            .filter(|n| *n >= 1)
+            .unwrap_or(hotl_tools::children::DEFAULT_MAX_CHILDREN)
+    }
+
     /// `[agents] prefix_stagger_ms`, or the built-in default.
     pub fn prefix_stagger(&self) -> std::time::Duration {
         std::time::Duration::from_millis(
@@ -2707,6 +2741,42 @@ path_prefix = "/Volumes/secrets"
         // different home than `expand_home` resolved.
         let home = home_dir().expect("a home directory");
         assert_eq!(cfg.history.resolved_path(data), home.join("notes/h.jsonl"));
+    }
+
+    #[test]
+    fn max_depth_defaults_to_one_and_rejects_zero_and_four() {
+        assert_eq!(cfg_with("").agents.max_depth(), Ok(1));
+        assert_eq!(
+            cfg_with("[agents]\nmax_depth = 3\n").agents.max_depth(),
+            Ok(3)
+        );
+        let zero = cfg_with("[agents]\nmax_depth = 0\n")
+            .agents
+            .max_depth()
+            .unwrap_err();
+        assert!(zero.contains("deny the tool"), "{zero}");
+        let four = cfg_with("[agents]\nmax_depth = 4\n")
+            .agents
+            .max_depth()
+            .unwrap_err();
+        assert!(four.contains("cap of 3"), "{four}");
+    }
+
+    #[test]
+    fn max_children_defaults_to_eight_and_rejects_zero() {
+        assert_eq!(cfg_with("").agents.max_children(), 8);
+        assert_eq!(
+            cfg_with("[agents]\nmax_children = 2\n")
+                .agents
+                .max_children(),
+            2
+        );
+        assert_eq!(
+            cfg_with("[agents]\nmax_children = 0\n")
+                .agents
+                .max_children(),
+            8
+        );
     }
 
     #[test]

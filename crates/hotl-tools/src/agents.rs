@@ -444,9 +444,10 @@ pub fn list(config_dir: &Path, include_claude: bool) -> Vec<(String, String)> {
 }
 
 /// Build a child's registry from `full` per the resolved def's [`ToolScope`].
-/// `spawn` and `workflow` are defensively excluded regardless of scope —
-/// depth-1 is a structural invariant, not something a `tools:` list can
-/// override.
+/// `spawn` and `workflow` are excluded regardless of scope: `workflow` never
+/// nests, and `spawn` is a registration the child's builder adds after this
+/// filter when `[agents] max_depth` and the scope allow (0072 D9) — a
+/// `tools:` list cannot add it by itself.
 pub fn filter_registry(def: &AgentDef, full: &Registry) -> Registry {
     filter_registry_under(def, &ToolScope::All, full)
 }

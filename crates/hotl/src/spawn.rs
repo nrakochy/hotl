@@ -331,6 +331,13 @@ impl SpawnTool {
         }
     }
 
+    /// Mark this tool as a child session's own (0072 D10): a foreground spawn
+    /// from it draws no `agents` permit and takes no shared-tree lock.
+    pub fn under_parent_permit(mut self, nested: bool) -> Self {
+        self.under_parent_permit = nested;
+        self
+    }
+
     /// Attach the parent actor's command sender (0072). Same registration-time
     /// story as [`Self::with_snapshot`].
     pub fn with_notify(
@@ -1544,6 +1551,12 @@ pub(crate) async fn drain_child(
                     // a start.
                     let summary = format!("{name} (denied)");
                     forward_child_tool(&forward, id, name, summary, Some(false)).await;
+                }
+                // The child's own children's bill (0072 D11): folded in here
+                // so a grandchild's spend reaches the root by construction.
+                Some(EngineEvent::Delegation { usage: u, tool_calls: n, .. }) => {
+                    usage += u;
+                    tool_calls += n;
                 }
                 Some(EngineEvent::TurnDone { outcome, usage: u, .. }) => {
                     usage += u;
@@ -4318,5 +4331,87 @@ mod background_tests {
         let names: Vec<&str> = wrapup.tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"report_result") && !names.contains(&"write"));
         assert!(charge.unwrap().tool_calls >= 3, "both globs and the report");
+    }
+}
+
+/// 0072 T5 — nested permits and locks (D10).
+#[cfg(test)]
+mod nested_permit_tests {
+    use super::tests::ScriptedChild;
+    use super::*;
+    use hotl_tools::concurrency::{ConcurrencyLimits, SessionConcurrency};
+    use std::time::Duration;
+
+    fn one_agent() -> SessionConcurrency {
+        SessionConcurrency::new(ConcurrencyLimits {
+            agents: 1,
+            ..Default::default()
+        })
+    }
+
+    fn tool(concurrency: SessionConcurrency, nested: bool) -> SpawnTool {
+        SpawnTool::new(
+            Arc::new(ScriptedChild::new()),
+            tempfile::tempdir().unwrap().keep(),
+            tempfile::tempdir().unwrap().keep(),
+            false,
+            concurrency,
+        )
+        .with_prefix_stagger(Duration::ZERO)
+        .under_parent_permit(nested)
+    }
+
+    /// The one `agents` permit is held (by "the parent") and the shared-tree
+    /// lock too: a nested foreground spawn of a mutating child still runs.
+    #[tokio::test]
+    async fn a_nested_foreground_spawn_draws_no_agents_permit_and_no_tree_lock() {
+        let concurrency = one_agent();
+        let _parent_permit = concurrency.agent_queued().await.unwrap();
+        let _parent_lock = mutating_child_lock().lock().await;
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            tool(concurrency.clone(), true).run(
+                json!({"agent_type": "general-purpose", "task": "t"}),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("a nested foreground child must not wait on its parent's permit or lock");
+        assert!(!out.is_error, "{}", out.content);
+        // Without the marker the same call waits for the permit forever.
+        let waited = tokio::time::timeout(
+            Duration::from_millis(300),
+            tool(concurrency, false).run(
+                json!({"agent_type": "explore", "task": "t"}),
+                CancellationToken::new(),
+            ),
+        )
+        .await;
+        assert!(
+            waited.is_err(),
+            "a top-level spawn queues behind the held permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_nested_background_spawn_draws_a_real_permit() {
+        let concurrency = one_agent();
+        let _parent_permit = concurrency.agent_queued().await.unwrap();
+        let reg = Arc::new(hotl_tools::children::Children::default());
+        let waited = tokio::time::timeout(
+            Duration::from_millis(300),
+            hotl_tools::children::CHILDREN.scope(
+                reg.clone(),
+                tool(concurrency, true).run(
+                    json!({"agent_type": "explore", "task": "t", "background": true}),
+                    CancellationToken::new(),
+                ),
+            ),
+        )
+        .await;
+        assert!(
+            waited.is_err(),
+            "a background child keeps its parent sampling, so it queues for its own permit"
+        );
     }
 }

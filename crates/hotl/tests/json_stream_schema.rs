@@ -92,6 +92,8 @@ fn every_frame_is_tagged_and_versioned() {
             subagent_runs: 3,
             duplicate_work_paths: 1,
             false_completions: 0,
+            usage: Default::default(),
+            tool_calls: 0,
         },
         EngineEvent::Retrying {
             attempt: 1,
@@ -784,12 +786,19 @@ fn child_text_and_delegation_are_tagged_additive_frames() {
         subagent_runs: 4,
         duplicate_work_paths: 2,
         false_completions: 1,
+        usage: hotl_types::TokenUsage {
+            input_tokens: 7,
+            ..Default::default()
+        },
+        tool_calls: 9,
     })
     .expect("delegation is a stream frame");
     assert_eq!(d["type"], "delegation");
     assert_eq!(d["subagent_runs"], json!(4));
     assert_eq!(d["duplicate_work_paths"], json!(2));
     assert_eq!(d["false_completions"], json!(1));
+    assert_eq!(d["usage"]["input_tokens"], json!(7));
+    assert_eq!(d["tool_calls"], json!(9));
 }
 
 #[test]

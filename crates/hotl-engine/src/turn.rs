@@ -138,6 +138,9 @@ struct DelegationTally {
     /// One entry per child, in call order.
     files: Vec<Vec<String>>,
     false_completions: u32,
+    /// The children's summed bill (0072 D11).
+    usage: TokenUsage,
+    tool_calls: u64,
 }
 
 impl DelegationTally {
@@ -145,6 +148,8 @@ impl DelegationTally {
         self.runs += 1;
         self.files.push(facts.files_touched.clone());
         self.false_completions += u32::from(facts.false_completion);
+        self.usage += facts.usage;
+        self.tool_calls += facts.tool_calls;
     }
 
     /// Paths more than one child touched. Counted per distinct path, not per
@@ -197,6 +202,8 @@ pub(crate) async fn run(
                 subagent_runs: turn.delegation.runs,
                 duplicate_work_paths: turn.delegation.duplicate_paths(),
                 false_completions: turn.delegation.false_completions,
+                usage: turn.delegation.usage,
+                tool_calls: turn.delegation.tool_calls,
             })
             .await;
     }

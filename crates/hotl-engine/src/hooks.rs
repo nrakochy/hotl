@@ -826,10 +826,83 @@ pub struct ChildHooks {
 
 impl ChildHooks {
     pub fn new(inner: Arc<dyn Hooks>, child_session_id: &str) -> Self {
+        Self::nested(inner, ACTOR_MAIN, child_session_id)
+    }
+
+    /// A child of `parent_actor` (0072 D9): `main`'s children are
+    /// `child:<a>`, theirs `child:<a>/<b>`, so a hook reads the whole lineage.
+    pub fn nested(inner: Arc<dyn Hooks>, parent_actor: &str, child_session_id: &str) -> Self {
         Self {
             inner,
-            actor: format!("child:{child_session_id}"),
+            actor: Self::nested_actor(parent_actor, child_session_id),
         }
+    }
+
+    /// The actor every forwarded call carries.
+    pub fn actor(&self) -> &str {
+        &self.actor
+    }
+
+    /// The actor a child of `parent_actor` runs under, without the wrapper.
+    pub fn nested_actor(parent_actor: &str, child_session_id: &str) -> String {
+        match parent_actor == ACTOR_MAIN {
+            true => format!("child:{child_session_id}"),
+            false => format!("{parent_actor}/{child_session_id}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod child_hooks_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Records the actor of every `pre_tool`.
+    struct Seen(Mutex<Vec<String>>);
+
+    impl Hooks for Seen {
+        fn pre_tool<'a>(
+            &'a self,
+            actor: &'a str,
+            _name: &'a str,
+            _input: &'a Value,
+        ) -> BoxFuture<'a, PreToolDecision> {
+            self.0.lock().unwrap().push(actor.to_string());
+            Box::pin(async { PreToolDecision::Continue })
+        }
+        fn post_tool<'a>(
+            &'a self,
+            _actor: &'a str,
+            _name: &'a str,
+            _result: &'a str,
+        ) -> BoxFuture<'a, Option<String>> {
+            Box::pin(async { None })
+        }
+    }
+
+    /// 0072 D9: a grandchild's hooks read `child:<a>/<b>` — the lineage, not
+    /// the last segment (tracker 170).
+    #[tokio::test]
+    async fn nested_hook_envelopes_read_child_a_slash_b() {
+        let seen = Arc::new(Seen(Mutex::new(Vec::new())));
+        let child = ChildHooks::nested(seen.clone(), ACTOR_MAIN, "aaa");
+        assert_eq!(child.actor(), "child:aaa");
+        // Both wrap the raw hooks; the lineage rides the actor string (a
+        // wrapper around a wrapper would rename the actor back).
+        let grandchild = ChildHooks::nested(seen.clone(), "child:aaa", "bbb");
+        assert_eq!(grandchild.actor(), "child:aaa/bbb");
+        assert_eq!(
+            ChildHooks::nested_actor("child:aaa/bbb", "ccc"),
+            "child:aaa/bbb/ccc"
+        );
+        grandchild.pre_tool("ignored", "read", &Value::Null).await;
+        child.pre_tool("ignored", "read", &Value::Null).await;
+        assert_eq!(
+            *seen.0.lock().unwrap(),
+            vec!["child:aaa/bbb".to_string(), "child:aaa".to_string()]
+        );
+        // The old constructor is the main session's children.
+        assert_eq!(ChildHooks::new(seen, "x").actor(), "child:x");
     }
 }
 

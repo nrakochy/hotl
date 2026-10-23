@@ -589,6 +589,7 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
         Some(scaffold.recall_registration(session_id)),
         scaffold.hooks.clone(),
         scaffold.plan_artifact_path(),
+        false,
         |registry| {
             let mut deps = scaffold.deps(
                 log,
@@ -1201,12 +1202,16 @@ async fn scaffold(
     let sandbox_enforced = matches!(sandbox_status, sandbox::SandboxStatus::Enforced(_))
         && hotl_tools::net::auto_allow_permitted(&sandbox_status);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let (config, config_warnings) = engine_config(&model, secrets, &cfg);
+    let (mut config, config_warnings) = engine_config(&model, secrets, &cfg);
     warnings.extend(
         config_warnings
             .into_iter()
             .map(|w| format!("WARNING — {w}")),
     );
+    // The depth knob (0072 D9) refuses at startup; the cap on children rides
+    // the engine config so every child's registry carries it too.
+    let max_depth = cfg.agents.max_depth()?;
+    config.max_children = cfg.agents.max_children();
     // The one process-wide SessionConcurrency (Layer-B budget): built once
     // here and cloned (shared Arc semaphores, not a fresh pool) into the
     // registry — today `web_fetch` is its only consumer.
@@ -1242,6 +1247,14 @@ async fn scaffold(
         sessions_dir.clone(),
         concurrency.clone(),
         cfg.agents.review_model.clone(),
+        max_depth,
+        NestedSpawn {
+            prefix_stagger: cfg.agents.prefix_stagger(),
+            child_deadlines: cfg.agents.child_deadlines(),
+            config_dir: config_dir.clone(),
+            include_claude: cfg.agents.claude.unwrap_or(true),
+            data_dir: data_dir(),
+        },
     );
     // `spawn`'s own registration (agent.rs::spawn_session_with_todos) needs a
     // *clone* of this same instance (shared Arc semaphores) — cloned before
@@ -1356,6 +1369,7 @@ impl Scaffold {
     fn spawn_registration(&self, session_id: String) -> SpawnRegistration {
         SpawnRegistration {
             builder: self.spawn_builder.clone() as Arc<dyn crate::spawn::ChildBuilder>,
+            nested: false,
             memory_write: self
                 .config
                 .memory_files
@@ -1367,8 +1381,7 @@ impl Scaffold {
             config_dir: self.config_dir.clone(),
             include_claude: self.agents_include_claude,
             session_id,
-            workflow_gate: self.workflow_gate.clone(),
-            workflow_limits: self.workflow_limits,
+            workflow: Some((self.workflow_gate.clone(), self.workflow_limits)),
             data_dir: data_dir(),
         }
     }
@@ -1949,6 +1962,7 @@ async fn run_session(
         Some(scaffold.recall_registration(session_id.clone())),
         scaffold.hooks.clone(),
         scaffold.plan_artifact_path(),
+        false,
         |registry| {
             let mut deps = scaffold.deps(
                 log,
@@ -2028,10 +2042,15 @@ async fn run_session(
 /// (not baked into the shared `Scaffold.registry`) because `fork` needs a
 /// reader of *this* session's own published head — see `snapshot_provider`,
 /// which holds a `HeadCell` (a `watch::Receiver`), not a sender of any kind.
-/// `None` for a child session (`HotlChildBuilder`): depth-1 is structural,
-/// children never get a `spawn` tool at all.
+/// `None` for a child session whose depth or scope rules `spawn` out (0072
+/// D9); a child under `[agents] max_depth` gets its own, built by its
+/// parent's `HotlChildBuilder` for one level deeper.
 struct SpawnRegistration {
     builder: Arc<dyn crate::spawn::ChildBuilder>,
+    /// This registration belongs to a child session (0072 D10): its
+    /// foreground `spawn` draws no `agents` permit and takes no shared-tree
+    /// lock, because the blocked parent already holds both.
+    nested: bool,
     /// Register the `remember` tool (0069): only a top-level session under
     /// `[memory] mode = "read-write"`, never headless, never a child.
     memory_write: bool,
@@ -2047,10 +2066,9 @@ struct SpawnRegistration {
     /// parent. Per-session, like the head reader beside it; the builder itself
     /// is process-wide and cannot know it.
     session_id: String,
-    /// The `workflow` tool's share (0044): the one process-wide gate, the
-    /// configured limits, and where run artefacts land.
-    workflow_gate: Arc<tokio::sync::Semaphore>,
-    workflow_limits: hotl_workflow::Limits,
+    /// The `workflow` tool's share (0044): the one process-wide gate and the
+    /// configured limits. `None` for a child: `workflow` never nests (D9).
+    workflow: Option<(Arc<tokio::sync::Semaphore>, hotl_workflow::Limits)>,
     data_dir: PathBuf,
 }
 
@@ -2089,10 +2107,13 @@ fn spawn_interactive_session(
         hooks,
         true,
         plan_artifact_path,
+        false,
         build_deps,
     )
 }
 
+/// `is_child`: a sub-agent's session (0072 D9) — `ask_user` tells it nobody
+/// is reachable, whatever tools it carries.
 #[allow(clippy::type_complexity)]
 fn spawn_session_with_todos(
     registry: Registry,
@@ -2100,6 +2121,7 @@ fn spawn_session_with_todos(
     recall: Option<RecallRegistration>,
     hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
     plan_artifact_path: Option<String>,
+    is_child: bool,
     build_deps: impl FnOnce(Arc<Registry>) -> SessionDeps,
 ) -> SessionHandle {
     spawn_session_inner(
@@ -2109,11 +2131,12 @@ fn spawn_session_with_todos(
         hooks,
         false,
         plan_artifact_path,
+        is_child,
         build_deps,
     )
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn spawn_session_inner(
     mut registry: Registry,
     spawn: Option<SpawnRegistration>,
@@ -2121,6 +2144,7 @@ fn spawn_session_inner(
     hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
     egress_ask: bool,
     plan_artifact_path: Option<String>,
+    is_child: bool,
     build_deps: impl FnOnce(Arc<Registry>) -> SessionDeps,
 ) -> SessionHandle {
     let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
@@ -2154,10 +2178,9 @@ fn spawn_session_inner(
         }),
         plan_artifact_path.clone(),
     )));
-    // A session with no `spawn` registration IS a child — depth-1 makes that
-    // structural, so it doubles as the marker for "nobody is reachable from
-    // here" (0058 T9). `ask_user` then tells the child to escalate through
-    // its typed return instead of inventing an assumption.
+    // A child has nobody reachable from it (0058 T9), whether or not it
+    // carries `spawn` (0072 D9): `ask_user` tells it to escalate through its
+    // typed return instead of inventing an assumption.
     let question_sink = hotl_engine::question_sink(
         cmd_tx.downgrade(),
         event_tx.downgrade(),
@@ -2165,9 +2188,9 @@ fn spawn_session_inner(
         notifications.clone(),
     );
     let ask_user = hotl_tools::AskUserTool::new(question_sink.clone());
-    registry.register(Box::new(match spawn.is_some() {
-        true => ask_user,
-        false => ask_user.with_no_human(hotl_tools::ask::CHILD_NO_HUMAN),
+    registry.register(Box::new(match is_child {
+        false => ask_user,
+        true => ask_user.with_no_human(hotl_tools::ask::CHILD_NO_HUMAN),
     }));
     // `recall`, always: the `session-log` backend needs no configuration, so
     // the tool is advertised for every session — one schema change at the
@@ -2189,6 +2212,7 @@ fn spawn_session_inner(
     }
     if let Some(SpawnRegistration {
         builder,
+        nested,
         memory_write,
         prefix_stagger,
         child_deadlines,
@@ -2196,8 +2220,7 @@ fn spawn_session_inner(
         config_dir,
         include_claude,
         session_id,
-        workflow_gate,
-        workflow_limits,
+        workflow,
         data_dir,
     }) = spawn
     {
@@ -2209,8 +2232,8 @@ fn spawn_session_inner(
             )));
         }
         let snapshot = snapshot_provider(Arc::clone(&head_cell), session_id);
-        // `.with_events`: children never get `spawn` at all, so there is no
-        // recursive wiring to worry about — one hop, child to parent.
+        // `.with_events`: one hop, child to parent — a grandchild's frames
+        // reach its own parent's stream, which `drain_child` re-emits.
         registry.register(Box::new(
             crate::spawn::SpawnTool::new(
                 builder.clone(),
@@ -2224,7 +2247,8 @@ fn spawn_session_inner(
             .with_plan(plan_provider(Arc::clone(&head_cell)))
             .with_snapshot(snapshot)
             .with_events(event_tx.downgrade())
-            .with_notify(cmd_tx.downgrade()),
+            .with_notify(cmd_tx.downgrade())
+            .under_parent_permit(nested),
         ));
         // The three verbs for a background child (0072 D1), beside `spawn`.
         registry.register(Box::new(crate::children_tools::WaitTool::new(Some(
@@ -2235,23 +2259,27 @@ fn spawn_session_inner(
             cmd_tx.downgrade(),
         ))));
         // The workflow runner (0044) drives the same child builder; its
-        // agents never see it either (`Registry::filtered`).
-        registry.register(Box::new(
-            crate::workflow::WorkflowTool::new(
-                builder,
-                config_dir,
-                include_claude,
-                data_dir,
-                workflow_limits,
-                workflow_gate,
-            )
-            .with_prefix_stagger(prefix_stagger)
-            // A `human_input` phase asks through the same sink `ask_user`
-            // does, so a workflow pause parks and re-issues like any other
-            // question.
-            .with_ask(question_sink)
-            .with_events(event_tx.downgrade()),
-        ));
+        // agents never see it either (`Registry::filtered`), and neither does
+        // any child (D9: a batch runner under a batch runner is fan-out
+        // squared with one ask).
+        if let Some((workflow_gate, workflow_limits)) = workflow {
+            registry.register(Box::new(
+                crate::workflow::WorkflowTool::new(
+                    builder,
+                    config_dir,
+                    include_claude,
+                    data_dir,
+                    workflow_limits,
+                    workflow_gate,
+                )
+                .with_prefix_stagger(prefix_stagger)
+                // A `human_input` phase asks through the same sink `ask_user`
+                // does, so a workflow pause parks and re-issues like any other
+                // question.
+                .with_ask(question_sink)
+                .with_events(event_tx.downgrade()),
+            ));
+        }
     }
     let deps = build_deps(Arc::new(registry));
     // Taken before the sender moves into the session; only a weak one is kept,
@@ -2585,9 +2613,95 @@ struct HotlChildBuilder {
     concurrency: hotl_tools::concurrency::SessionConcurrency,
     /// `[agents] review_model`: applied to the built-in `review` def only.
     review_model: Option<String>,
+    /// The depth of the children this builder makes: 1 under the main
+    /// session, one more per nesting (0072 D9).
+    depth: u32,
+    /// `[agents] max_depth`: a child at depth `n` carries `spawn` only while
+    /// `n < max_depth`.
+    max_depth: u32,
+    /// The actor the parent's hooks run under (`main`, or `child:<a>` for a
+    /// child's builder); a child built here runs them as the next segment.
+    actor: String,
+    /// What a child's own `spawn` registration needs; `None` (tests) means a
+    /// child never gets one.
+    nested: Option<NestedSpawn>,
+}
+
+/// The per-process halves of a child's `SpawnRegistration` (0072 D9) —
+/// everything but the builder, the session id and the concurrency, which the
+/// child's own builder supplies.
+#[derive(Clone)]
+struct NestedSpawn {
+    prefix_stagger: std::time::Duration,
+    child_deadlines: (u64, u64),
+    config_dir: PathBuf,
+    include_claude: bool,
+    data_dir: PathBuf,
 }
 
 impl HotlChildBuilder {
+    /// Whether a child built here, under `scope`, carries `spawn` (D9): the
+    /// depth knob and its roster both have to allow it. A `tools:` list
+    /// grants it only by naming it; a read-only roster never does.
+    fn gets_spawn(&self, scope: &hotl_tools::agents::ToolScope) -> bool {
+        use hotl_tools::agents::ToolScope;
+        self.depth < self.max_depth
+            && match scope {
+                ToolScope::All => true,
+                ToolScope::ReadOnly => false,
+                ToolScope::Only(names) => names.iter().any(|n| n == "spawn"),
+            }
+    }
+
+    /// The builder for a child's own children: one level deeper, narrowed to
+    /// the child's scope, rooted where the child runs (its worktree when
+    /// isolated), its hooks nested under the child's actor.
+    fn nested_for(
+        &self,
+        scope: hotl_tools::agents::ToolScope,
+        root: &std::path::Path,
+        hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
+        actor: String,
+    ) -> HotlChildBuilder {
+        HotlChildBuilder {
+            depth: self.depth + 1,
+            parent_scope: scope,
+            cwd: root.to_path_buf(),
+            hooks,
+            actor,
+            ..self.clone()
+        }
+    }
+
+    /// The child's `spawn` registration, when D9 grants one.
+    fn nested_registration(
+        &self,
+        def: &hotl_tools::agents::AgentDef,
+        root: &std::path::Path,
+        hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
+        actor: &str,
+        session_id: &str,
+    ) -> Option<SpawnRegistration> {
+        let scope = def.tools.narrow(&self.parent_scope);
+        let nested = self.nested.as_ref()?;
+        if !self.gets_spawn(&scope) {
+            return None;
+        }
+        Some(SpawnRegistration {
+            builder: Arc::new(self.nested_for(scope, root, hooks, actor.to_string())),
+            nested: true,
+            memory_write: false,
+            prefix_stagger: nested.prefix_stagger,
+            child_deadlines: nested.child_deadlines,
+            concurrency: self.concurrency.clone(),
+            config_dir: nested.config_dir.clone(),
+            include_claude: nested.include_claude,
+            session_id: session_id.to_string(),
+            workflow: None,
+            data_dir: nested.data_dir.clone(),
+        })
+    }
+
     /// Same masking as `Scaffold::masker` — a child session can echo the
     /// same acquired key into its own log.
     fn masker(&self) -> Masker {
@@ -2798,21 +2912,40 @@ impl HotlChildBuilder {
         let config = self.child_config(def);
         let config_model = config.model.clone();
         // The parent's hooks under this child's own actor marker: a hook can
-        // tell parent from child, and can still only deny — never grant.
+        // tell parent from child, and can still only deny — never grant. The
+        // marker nests (`child:<a>/<b>`), so a hook reads the whole lineage.
+        let child_actor =
+            hotl_engine::hooks::ChildHooks::nested_actor(&self.actor, &log.session_id);
         let hooks = self
             .hooks
             .clone()
             .map(|h| -> Arc<dyn hotl_engine::hooks::Hooks> {
-                Arc::new(hotl_engine::hooks::ChildHooks::new(h, &log.session_id))
+                Arc::new(hotl_engine::hooks::ChildHooks::nested(
+                    h,
+                    &self.actor,
+                    &log.session_id,
+                ))
             });
+        // `spawn` (and `wait`/`send`/`resume`) only when `[agents] max_depth`
+        // and the def's scope allow (D9); `workflow` never. The nested builder
+        // gets the *raw* hooks and the lineage string: a wrapper around a
+        // wrapper would rename the actor back to the child's.
+        let nested_spawn = self.nested_registration(
+            def,
+            &root,
+            self.hooks.clone(),
+            &child_actor,
+            &log.session_id,
+        );
         let handle = spawn_session_with_todos(
             registry,
-            None, // children never get their own `spawn` tool — depth-1 is structural
-            // Nor `recall`: a child's own log is one turn deep, and reaching
+            nested_spawn,
+            // No `recall`: a child's own log is one turn deep, and reaching
             // the parent's would leak history the parent chose not to pass.
             None,
             hooks.clone(),
             None, // …and no plan artifact: a child's plan is its parent's business
+            true,
             |registry| SessionDeps {
                 provider: self.provider.clone(),
                 registry,
@@ -2961,8 +3094,14 @@ fn child_builder(
     sessions_dir: PathBuf,
     concurrency: hotl_tools::concurrency::SessionConcurrency,
     review_model: Option<String>,
+    max_depth: u32,
+    nested: NestedSpawn,
 ) -> Arc<HotlChildBuilder> {
     Arc::new(HotlChildBuilder {
+        depth: 1,
+        max_depth,
+        actor: hotl_engine::hooks::ACTOR_MAIN.to_string(),
+        nested: Some(nested),
         provider,
         hooks,
         parent_scope: hotl_tools::agents::ToolScope::All,
@@ -3376,6 +3515,7 @@ impl Surface {
                 subagent_runs,
                 duplicate_work_paths,
                 false_completions,
+                ..
             } => {
                 if duplicate_work_paths > 0 || false_completions > 0 {
                     eprintln!(
@@ -5619,6 +5759,10 @@ mod tests {
             sessions_dir: store.path().to_path_buf(),
             concurrency: Default::default(),
             review_model: None,
+            depth: 1,
+            max_depth: 1,
+            actor: hotl_engine::hooks::ACTOR_MAIN.to_string(),
+            nested: None,
         };
         (cb, store)
     }
@@ -6439,27 +6583,32 @@ mod tests {
             ),
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
-        let mut handle =
-            spawn_session_with_todos(Registry::builtin(), None, None, None, None, |registry| {
-                SessionDeps {
-                    concurrency: Default::default(),
-                    provider,
-                    registry,
-                    rules: Arc::new(hotl_tools::rules::Rules::default()),
-                    sandbox_enforced: false,
-                    clock: Arc::new(SystemClock),
-                    log,
-                    system: "sys".into(),
-                    cwd: dir.path().to_path_buf(),
-                    hooks: None,
-                    initial_items: Vec::new(),
-                    initial_todos: Vec::new(),
-                    initial_decisions: Vec::new(),
-                    plan_files: None,
-                    initial_goal: None,
-                    config,
-                }
-            });
+        let mut handle = spawn_session_with_todos(
+            Registry::builtin(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            |registry| SessionDeps {
+                concurrency: Default::default(),
+                provider,
+                registry,
+                rules: Arc::new(hotl_tools::rules::Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: dir.path().to_path_buf(),
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
+                initial_goal: None,
+                config,
+            },
+        );
         handle.prompt("go".into()).await;
 
         let mut seen = None;
@@ -6496,36 +6645,41 @@ mod tests {
         let provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
-        let handle =
-            spawn_session_with_todos(Registry::builtin(), None, None, None, None, |registry| {
-                SessionDeps {
-                    concurrency: Default::default(),
-                    provider,
-                    registry,
-                    rules: Arc::new(hotl_tools::rules::Rules::default()),
-                    sandbox_enforced: false,
-                    clock: Arc::new(SystemClock),
-                    log,
-                    system: "sys".into(),
-                    cwd: dir.path().to_path_buf(),
-                    hooks: None,
-                    initial_items: vec![hotl_types::Item::User {
-                        text: "earlier parent context".into(),
-                        synthetic: None,
-                        images: Vec::new(),
-                    }],
-                    initial_todos: vec![hotl_types::Todo {
-                        content: "wire the gate".into(),
-                        status: hotl_types::TodoStatus::InProgress,
-                        active_form: None,
-                        ..Default::default()
-                    }],
-                    initial_decisions: Vec::new(),
-                    plan_files: None,
-                    initial_goal: None,
-                    config,
-                }
-            });
+        let handle = spawn_session_with_todos(
+            Registry::builtin(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            |registry| SessionDeps {
+                concurrency: Default::default(),
+                provider,
+                registry,
+                rules: Arc::new(hotl_tools::rules::Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: dir.path().to_path_buf(),
+                hooks: None,
+                initial_items: vec![hotl_types::Item::User {
+                    text: "earlier parent context".into(),
+                    synthetic: None,
+                    images: Vec::new(),
+                }],
+                initial_todos: vec![hotl_types::Todo {
+                    content: "wire the gate".into(),
+                    status: hotl_types::TodoStatus::InProgress,
+                    active_form: None,
+                    ..Default::default()
+                }],
+                initial_decisions: Vec::new(),
+                plan_files: None,
+                initial_goal: None,
+                config,
+            },
+        );
 
         // The actor publishes its seeded head at startup; wait for that rather
         // than racing it.
@@ -6608,27 +6762,32 @@ mod tests {
         // would defeat the point — the actor must be observed to exit
         // *before* the assertion below, not merely by the time the test
         // function itself ends).
-        let SessionHandle { mut events, .. } =
-            spawn_session_with_todos(Registry::builtin(), None, None, None, None, |registry| {
-                SessionDeps {
-                    concurrency: Default::default(),
-                    provider,
-                    registry,
-                    rules: Arc::new(hotl_tools::rules::Rules::default()),
-                    sandbox_enforced: false,
-                    clock: Arc::new(SystemClock),
-                    log,
-                    system: "sys".into(),
-                    cwd: dir.path().to_path_buf(),
-                    hooks: None,
-                    initial_items: Vec::new(),
-                    initial_todos: Vec::new(),
-                    initial_decisions: Vec::new(),
-                    plan_files: None,
-                    initial_goal: None,
-                    config,
-                }
-            });
+        let SessionHandle { mut events, .. } = spawn_session_with_todos(
+            Registry::builtin(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            |registry| SessionDeps {
+                concurrency: Default::default(),
+                provider,
+                registry,
+                rules: Arc::new(hotl_tools::rules::Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: dir.path().to_path_buf(),
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
+                initial_goal: None,
+                config,
+            },
+        );
 
         // With no turn ever started, the only strong `SessionCmd` sender was
         // the handle's own — dropping it should let `cmd_rx.recv()` return
@@ -6668,27 +6827,32 @@ mod tests {
             ),
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
-        let mut handle =
-            spawn_session_with_todos(Registry::builtin(), None, None, None, None, |registry| {
-                SessionDeps {
-                    concurrency: Default::default(),
-                    provider,
-                    registry,
-                    rules: Arc::new(hotl_tools::rules::Rules::default()),
-                    sandbox_enforced: false,
-                    clock: Arc::new(SystemClock),
-                    log,
-                    system: "sys".into(),
-                    cwd: dir.path().to_path_buf(),
-                    hooks: None,
-                    initial_items: Vec::new(),
-                    initial_todos: Vec::new(),
-                    initial_decisions: Vec::new(),
-                    plan_files: None,
-                    initial_goal: None,
-                    config,
-                }
-            });
+        let mut handle = spawn_session_with_todos(
+            Registry::builtin(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            |registry| SessionDeps {
+                concurrency: Default::default(),
+                provider,
+                registry,
+                rules: Arc::new(hotl_tools::rules::Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: dir.path().to_path_buf(),
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
+                initial_goal: None,
+                config,
+            },
+        );
         handle.prompt("go".into()).await;
 
         let mut answered = false;
@@ -6729,27 +6893,32 @@ mod tests {
         let provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
-        let SessionHandle { mut events, .. } =
-            spawn_session_with_todos(Registry::builtin(), None, None, None, None, |registry| {
-                SessionDeps {
-                    concurrency: Default::default(),
-                    provider,
-                    registry,
-                    rules: Arc::new(hotl_tools::rules::Rules::default()),
-                    sandbox_enforced: false,
-                    clock: Arc::new(SystemClock),
-                    log,
-                    system: "sys".into(),
-                    cwd: dir.path().to_path_buf(),
-                    hooks: None,
-                    initial_items: Vec::new(),
-                    initial_todos: Vec::new(),
-                    initial_decisions: Vec::new(),
-                    plan_files: None,
-                    initial_goal: None,
-                    config,
-                }
-            });
+        let SessionHandle { mut events, .. } = spawn_session_with_todos(
+            Registry::builtin(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            |registry| SessionDeps {
+                concurrency: Default::default(),
+                provider,
+                registry,
+                rules: Arc::new(hotl_tools::rules::Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: dir.path().to_path_buf(),
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
+                initial_goal: None,
+                config,
+            },
+        );
 
         let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while events.recv().await.is_some() {}
@@ -8200,6 +8369,7 @@ mod tests {
                 None,
                 Some(hooks.clone()),
                 None,
+                false,
                 move |registry| SessionDeps {
                     concurrency: Default::default(),
                     provider,
@@ -8251,5 +8421,408 @@ mod tests {
             "the session_end hook's subprocess never completed before the runtime dropped \
              — Finding 1's detached `spawn_session_end` task was silently killed mid-flight"
         );
+    }
+}
+
+/// 0072 T5 — the depth knob: which children carry `spawn`, how deep, under
+/// whose scope, and the nested permits that must not deadlock.
+#[cfg(test)]
+mod depth_tests {
+    use super::tests::test_child_builder;
+    use super::*;
+    use hotl_tools::agents::{builtin, parse_def, AgentSource, ToolScope};
+    use hotl_tools::Tool as _;
+    use std::sync::Arc;
+
+    fn nested() -> NestedSpawn {
+        NestedSpawn {
+            prefix_stagger: std::time::Duration::ZERO,
+            child_deadlines: (0, 0),
+            config_dir: tempfile::tempdir().unwrap().keep(),
+            include_claude: false,
+            data_dir: tempfile::tempdir().unwrap().keep(),
+        }
+    }
+
+    /// The tool names a child built by `cb` for `def` advertises on its first
+    /// sample.
+    async fn roster(cb: &mut HotlChildBuilder, def: &hotl_tools::agents::AgentDef) -> Vec<String> {
+        let provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
+            hotl_provider::ScriptedProvider::text_reply("ok"),
+        ]));
+        cb.provider = provider.clone();
+        let mut child = cb.spawn_child(def, Vec::new(), None, None).unwrap();
+        child.handle.prompt("go".into()).await;
+        loop {
+            match child.handle.events.recv().await {
+                Some(hotl_engine::EngineEvent::TurnDone { .. }) | None => break,
+                _ => {}
+            }
+        }
+        let mut names: Vec<String> = provider.requests()[0]
+            .tools
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    const VERBS: [&str; 4] = ["spawn", "wait", "send", "resume"];
+
+    fn has_verbs(names: &[String]) -> bool {
+        VERBS.iter().all(|v| names.iter().any(|n| n == v))
+    }
+
+    fn has_no_verbs(names: &[String]) -> bool {
+        VERBS.iter().all(|v| !names.iter().any(|n| n == v))
+    }
+
+    #[tokio::test]
+    async fn a_child_at_the_default_depth_has_no_spawn_wait_send_or_resume() {
+        let (mut cb, _store) = test_child_builder();
+        cb.nested = Some(nested());
+        for name in ["general-purpose", "explore"] {
+            let names = roster(&mut cb, &builtin(name).unwrap()).await;
+            assert!(has_no_verbs(&names), "{name}: {names:?}");
+        }
+        assert!(!cb.gets_spawn(&ToolScope::All));
+    }
+
+    #[tokio::test]
+    async fn a_child_gets_the_four_tools_when_max_depth_allows_and_its_scope_is_all() {
+        let (mut cb, _store) = test_child_builder();
+        cb.nested = Some(nested());
+        cb.max_depth = 2;
+        let names = roster(&mut cb, &builtin("general-purpose").unwrap()).await;
+        assert!(has_verbs(&names), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n == "workflow"),
+            "workflow never nests: {names:?}"
+        );
+        // Without the registration halves (no `NestedSpawn`), the knob alone
+        // grants nothing.
+        cb.nested = None;
+        let names = roster(&mut cb, &builtin("general-purpose").unwrap()).await;
+        assert!(has_no_verbs(&names), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_child_never_gets_spawn() {
+        let (mut cb, _store) = test_child_builder();
+        cb.nested = Some(nested());
+        cb.max_depth = 3;
+        for name in ["explore", "plan", "review"] {
+            let names = roster(&mut cb, &builtin(name).unwrap()).await;
+            assert!(has_no_verbs(&names), "{name}: {names:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_only_list_gets_spawn_only_by_naming_it() {
+        let (mut cb, _store) = test_child_builder();
+        cb.nested = Some(nested());
+        cb.max_depth = 2;
+        let named = parse_def(
+            "---\nname: n\ntools: read, spawn\n---\nbody",
+            AgentSource::User,
+        )
+        .unwrap();
+        let names = roster(&mut cb, &named).await;
+        assert!(has_verbs(&names), "{names:?}");
+        assert!(!names.iter().any(|n| n == "write"));
+        let unnamed = parse_def(
+            "---\nname: u\ntools: read, glob\n---\nbody",
+            AgentSource::User,
+        )
+        .unwrap();
+        let names = roster(&mut cb, &unnamed).await;
+        assert!(has_no_verbs(&names), "{names:?}");
+    }
+
+    #[test]
+    fn a_grandchild_at_the_limit_is_built_without_spawn() {
+        let (mut cb, _store) = test_child_builder();
+        cb.nested = Some(nested());
+        cb.max_depth = 2;
+        assert!(cb.gets_spawn(&ToolScope::All), "depth 1 < 2");
+        let grand = cb.nested_for(ToolScope::All, &cb.cwd, None, "child:a".into());
+        assert_eq!(grand.depth, 2);
+        assert!(!grand.gets_spawn(&ToolScope::All), "depth 2 is the limit");
+        assert!(grand
+            .nested_registration(
+                &builtin("general-purpose").unwrap(),
+                &cb.cwd,
+                None,
+                "child:a/b",
+                "sid"
+            )
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_grandchild_never_gets_workflow_mcp_skills_recall_or_web() {
+        let (mut cb, _store) = test_child_builder();
+        cb.nested = Some(nested());
+        cb.max_depth = 3;
+        let mut grand = cb.nested_for(ToolScope::All, &cb.cwd, None, "child:a".into());
+        let names = roster(&mut grand, &builtin("general-purpose").unwrap()).await;
+        assert!(has_verbs(&names), "depth 2 < 3: {names:?}");
+        for banned in [
+            "workflow",
+            "recall",
+            "skill",
+            "web_fetch",
+            "web_search",
+            "remember",
+        ] {
+            assert!(!names.iter().any(|n| n == banned), "{banned}: {names:?}");
+        }
+        assert!(!names.iter().any(|n| n.starts_with("mcp")), "{names:?}");
+    }
+
+    #[test]
+    fn grandchild_mode_is_dontask_and_bypass_never_inherits() {
+        use hotl_tools::rules::PermissionMode;
+        let (mut cb, _store) = test_child_builder();
+        cb.rules = Arc::new(hotl_tools::rules::Rules::default().with_mode(PermissionMode::Bypass));
+        let grand = cb.nested_for(ToolScope::All, &cb.cwd, None, "child:a".into());
+        assert_eq!(
+            child_rules(&grand.rules).mode(),
+            PermissionMode::DontAsk,
+            "the grandchild runs the same forced dontask"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grandchild_narrows_against_its_parents_scope_not_the_roots() {
+        let (mut cb, _store) = test_child_builder();
+        cb.nested = Some(nested());
+        cb.max_depth = 3;
+        // The child was `explore` (read-only): its own `general-purpose`
+        // grandchild cannot write either.
+        let mut grand = cb.nested_for(ToolScope::ReadOnly, &cb.cwd, None, "child:a".into());
+        let names = roster(&mut grand, &builtin("general-purpose").unwrap()).await;
+        assert!(names.iter().any(|n| n == "read"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n == "write" || n == "bash"),
+            "{names:?}"
+        );
+        assert!(
+            has_no_verbs(&names),
+            "read-only never carries spawn: {names:?}"
+        );
+    }
+
+    #[test]
+    fn an_isolated_childs_grandchild_roots_in_the_childs_worktree() {
+        let (mut cb, _store) = test_child_builder();
+        cb.nested = Some(nested());
+        cb.max_depth = 2;
+        let worktree = tempfile::tempdir().unwrap();
+        let reg = cb
+            .nested_registration(
+                &builtin("general-purpose").unwrap(),
+                worktree.path(),
+                None,
+                "child:a",
+                "sid",
+            )
+            .expect("depth 1 < 2 and scope all");
+        assert!(reg.nested && reg.workflow.is_none() && !reg.memory_write);
+        assert_eq!(reg.session_id, "sid");
+        let grand = cb.nested_for(ToolScope::All, worktree.path(), None, "child:a".into());
+        assert_eq!(grand.cwd, worktree.path());
+        assert_eq!(grand.actor, "child:a");
+    }
+
+    /// The marker is the session's role now, not "has no spawn tool".
+    #[tokio::test]
+    async fn a_child_with_spawn_still_tells_ask_user_there_is_no_human() {
+        let (mut cb, _store) = test_child_builder();
+        cb.nested = Some(nested());
+        cb.max_depth = 2;
+        let provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
+            hotl_provider::ScriptedProvider::tool_call(
+                "q1",
+                "ask_user",
+                serde_json::json!({"header": "pick", "prompt": "which one?", "options": [{"label": "a", "description": "a"}, {"label": "b", "description": "b"}]}),
+            ),
+            hotl_provider::ScriptedProvider::text_reply("ok"),
+        ]));
+        cb.provider = provider.clone();
+        let mut child = cb
+            .spawn_child(&builtin("general-purpose").unwrap(), Vec::new(), None, None)
+            .unwrap();
+        child.handle.prompt("go".into()).await;
+        loop {
+            match child.handle.events.recv().await {
+                Some(hotl_engine::EngineEvent::TurnDone { .. }) | None => break,
+                _ => {}
+            }
+        }
+        let second = &provider.requests()[1];
+        let answer = second
+            .items
+            .iter()
+            .find_map(|i| match i.as_ref() {
+                hotl_types::Item::ToolResults { results } => Some(results[0].content.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            answer.contains("No human is reachable from a sub-agent"),
+            "{answer}"
+        );
+        assert!(has_verbs(
+            &provider.requests()[0]
+                .tools
+                .iter()
+                .map(|t| t.name.clone())
+                .collect::<Vec<_>>()
+        ));
+    }
+
+    /// Answers by shape, not by script order, so many sessions can share it:
+    /// a roster with `spawn` and no results yet → spawn an `explore`
+    /// grandchild; anything else → a text reply.
+    struct Routing;
+
+    impl hotl_provider::Provider for Routing {
+        fn stream(
+            &self,
+            req: hotl_provider::SamplingRequest,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            Result<hotl_provider::StreamEvent, hotl_provider::ProviderError>,
+        > {
+            let has_spawn = req.tools.iter().any(|t| t.name == "spawn");
+            let answered = req
+                .items
+                .iter()
+                .any(|i| matches!(i.as_ref(), hotl_types::Item::ToolResults { .. }));
+            let script = match (has_spawn, answered) {
+                (true, false) => hotl_provider::ScriptedProvider::tool_call(
+                    "s1",
+                    "spawn",
+                    serde_json::json!({"agent_type": "explore", "task": "look"}),
+                ),
+                _ => hotl_provider::ScriptedProvider::text_reply("done"),
+            };
+            Box::pin(futures_util::stream::iter(script))
+        }
+    }
+
+    /// D10's pin: four children at the `agents` cap, each spawning a
+    /// foreground grandchild. The grandchild draws no permit (its parent
+    /// holds the slot) — otherwise four parents wait on four children that
+    /// can never start.
+    #[tokio::test]
+    async fn four_children_each_spawning_a_foreground_grandchild_do_not_deadlock() {
+        let (mut cb, _store) = test_child_builder();
+        cb.nested = Some(nested());
+        cb.max_depth = 2;
+        cb.provider = Arc::new(Routing);
+        // The child's `spawn` asks; under its forced `dontask` only an allow
+        // rule lets it through.
+        cb.rules = Arc::new(
+            hotl_tools::rules::Rules::from_toml(
+                "[[allow]]\ntool = \"spawn\"\nprefix = \"explore\"\n",
+            )
+            .unwrap(),
+        );
+        let concurrency = hotl_tools::concurrency::SessionConcurrency::new(
+            hotl_tools::concurrency::ConcurrencyLimits {
+                agents: 4,
+                ..Default::default()
+            },
+        );
+        cb.concurrency = concurrency.clone();
+        // A read-only roster that names `spawn`: no shared-tree lock either,
+        // so the four really overlap.
+        let config_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(config_dir.path().join("agents")).unwrap();
+        std::fs::write(
+            config_dir.path().join("agents/lead.md"),
+            "---\nname: lead\ndescription: delegates\ntools: read, spawn\n---\nlead",
+        )
+        .unwrap();
+        let tool = Arc::new(
+            crate::spawn::SpawnTool::new(
+                Arc::new(cb),
+                config_dir.path().to_path_buf(),
+                tempfile::tempdir().unwrap().keep(),
+                false,
+                concurrency,
+            )
+            .with_prefix_stagger(std::time::Duration::ZERO),
+        );
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..4 {
+            let tool = tool.clone();
+            set.spawn(async move {
+                tool.run(
+                    serde_json::json!({"agent_type": "lead", "task": format!("t{i}")}),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+            });
+        }
+        let all = async {
+            let mut outs = Vec::new();
+            while let Some(r) = set.join_next().await {
+                outs.push(r.unwrap());
+            }
+            outs
+        };
+        let outs = tokio::time::timeout(std::time::Duration::from_secs(10), all)
+            .await
+            .expect("four parents and four grandchildren within 10s: a nested permit deadlock");
+        assert_eq!(outs.len(), 4);
+        for out in &outs {
+            assert!(!out.is_error, "{}", out.content);
+            assert!(out.content.contains("done"), "{}", out.content);
+        }
+    }
+
+    /// The grandchild's bill reaches the root: the child's `Delegation` event
+    /// carries it, and `drain_child` folds it into the child's own.
+    #[tokio::test]
+    async fn grandchild_spend_folds_through_to_the_root_cap() {
+        let (mut cb, _store) = test_child_builder();
+        cb.nested = Some(nested());
+        cb.max_depth = 2;
+        cb.provider = Arc::new(Routing);
+        cb.rules = Arc::new(
+            hotl_tools::rules::Rules::from_toml(
+                "[[allow]]\ntool = \"spawn\"\nprefix = \"explore\"\n",
+            )
+            .unwrap(),
+        );
+        let tool = crate::spawn::SpawnTool::new(
+            Arc::new(cb),
+            tempfile::tempdir().unwrap().keep(),
+            tempfile::tempdir().unwrap().keep(),
+            false,
+            Default::default(),
+        )
+        .with_prefix_stagger(std::time::Duration::ZERO);
+        let out = tool
+            .run(
+                serde_json::json!({"agent_type": "general-purpose", "task": "lead"}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        let facts = out.facts.delegation.unwrap();
+        // The child alone: a spawn sample (10/8), its answer and two report
+        // nudges (3 × 10/5) = 40/23. The grandchild's three texts (30/15)
+        // ride the child's `Delegation` event and land here too.
+        assert_eq!(
+            (facts.usage.input_tokens, facts.usage.output_tokens),
+            (70, 38),
+            "{facts:?}"
+        );
+        assert_eq!(facts.tool_calls, 1, "the child's one spawn call");
     }
 }

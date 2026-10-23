@@ -399,6 +399,9 @@ impl Registry {
                 .tools
                 .iter()
                 // `remember` too (0069): a child's lesson is its typed return.
+                // `workflow` is the one stripped for structure (never nested,
+                // 0072 D9); `spawn` is a per-session registration a child's
+                // builder adds back when `[agents] max_depth` allows.
                 .filter(|t| {
                     !matches!(t.name(), "spawn" | "workflow" | "remember") && keep(t.as_ref())
                 })
