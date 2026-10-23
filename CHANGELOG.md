@@ -16,6 +16,22 @@ semver promise of their own.
 
 ### Added
 
+- **Published wire schemas.** The `-p --json` stream and the `hotl acp`
+  payloads now have JSON Schemas generated from the code that writes them:
+  `json-stream-v2.schema.json` and `acp-v1.schema.json`, published with the
+  docs and printed by `hotl schema json-stream|acp`. A test keeps them in step
+  with the code, and every pinned frame is validated against them.
+- **`hotl features` and feature stages.** Every switch — environment variables
+  and the newer config keys — is listed with its stage (experimental, beta,
+  stable, deprecated) and the release that added it; `--md` prints the table
+  the docs page shows. `hotl doctor` warns for each non-stable switch you have
+  turned on, and is one `ok` line otherwise.
+- **`hotl acp` says what it speaks.** `initialize` now carries `agentInfo` and,
+  under `agentCapabilities._meta.hotl`, the dialect (`0.1`), the upstream ACP
+  schema it was checked against, and every method it answers. hotl's dialect
+  is still not ACP v1; a ready ACP Registry entry sits in `.acp-registry/` but
+  is not filed.
+
 - **`: why did that fail` now carries the failure.** The zsh plugin remembers
   the last command, its exit status and its duration, and inside tmux the last
   200 lines it printed; a `: ` prompt attaches them as `--shell-trace FILE`
@@ -236,32 +252,6 @@ semver promise of their own.
 
 ### Changed
 
-- **A compaction summary's `FILES:` section is computed, not recalled.** hotl
-  lists every path a `read`, `edit` or `write` touched in the folded span
-  (failed calls excluded, last operation wins, first-touch order) and hands
-  the list to the summarizer as authoritative; a summary that drops a path has
-  its section replaced by the list.
-
-### Fixed
-
-- **A background job or sub-agent that finished in the last instant of a turn
-  was never answered.** Its notice was released by the commit that landed
-  just after the turn ended, and nothing asked for the follow-up turn; the
-  session sat idle with the result in context. The release now asks for the
-  continuation itself.
-- **An isolated sub-agent spawned inside a linked worktree no longer silently
-  runs shared-cwd.** Its worktree is now cut under the repository's common
-  `.git` dir, and a spawn from below the repository root degrades to
-  shared-cwd on purpose instead of landing outside the sandbox floor.
-- **A background job that ended behind the turn's last sample was never
-  answered.** Its notification landed in the context, but no turn followed;
-  the model now gets one, like a notification released at turn end.
-- **A shell command that needs longer than one call has an honest shape.**
-  0.17.0 recorded the limit that a `cmd &` is reaped with the call; `bash
-  {background: true}` is the way to keep it running.
-
-### Changed
-
 - **Sub-agent spend counts against your caps.** A child's tokens, priced at
   its model, now charge `max_cost_usd`, and its tool calls count toward
   `max_tool_calls` — when a blocking `spawn` returns, or when a background
@@ -286,6 +276,33 @@ semver promise of their own.
   spiral, a stalled `--goal`), `1` = it failed or the model refused (and an
   `impossible` goal). `0`, `2`, `3` and `130` are unchanged. A script that
   tested `$? -eq 1` for a turn limit must test `4`.
+
+- **`HOTL_OPENAI_BASE_URL` and `HOTL_ANTHROPIC_BASE_URL` are called
+  deprecated** (they still work): `HOTL_PROVIDER_BASE_URL` replaces both.
+
+- **A compaction summary's `FILES:` section is computed, not recalled.** hotl
+  lists every path a `read`, `edit` or `write` touched in the folded span
+  (failed calls excluded, last operation wins, first-touch order) and hands
+  the list to the summarizer as authoritative; a summary that drops a path has
+  its section replaced by the list.
+
+### Fixed
+
+- **A background job or sub-agent that finished in the last instant of a turn
+  was never answered.** Its notice was released by the commit that landed
+  just after the turn ended, and nothing asked for the follow-up turn; the
+  session sat idle with the result in context. The release now asks for the
+  continuation itself.
+- **An isolated sub-agent spawned inside a linked worktree no longer silently
+  runs shared-cwd.** Its worktree is now cut under the repository's common
+  `.git` dir, and a spawn from below the repository root degrades to
+  shared-cwd on purpose instead of landing outside the sandbox floor.
+- **A background job that ended behind the turn's last sample was never
+  answered.** Its notification landed in the context, but no turn followed;
+  the model now gets one, like a notification released at turn end.
+- **A shell command that needs longer than one call has an honest shape.**
+  0.17.0 recorded the limit that a `cmd &` is reaped with the call; `bash
+  {background: true}` is the way to keep it running.
 
 ## [0.28.0] - 2026-09-28
 
