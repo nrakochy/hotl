@@ -6,6 +6,14 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Internal
+
+- The testkit gained a scripted Anthropic SSE server (`hotl_testkit::fake_anthropic`,
+  with a hand-run `fake_anthropic` example) and a thin tmux driver
+  (`hotl_testkit::tmux`); `crates/hotl/tests/tmux_smoke.rs` drives the real binary
+  under a private tmux against it, so the owed live checks for the strip, the tool
+  cards, the agent band, the composer and the layout run as tests. Not user-facing.
+
 ### Added
 
 - **`: why did that fail` now carries the failure.** The zsh plugin remembers

@@ -13,10 +13,21 @@ Things deliberately **not** in scope: telemetry, a plugin marketplace, hosted/en
 Run before you push — CI enforces all of it:
 
 ```
-cargo test --workspace --locked
+cargo test --workspace --locked          # what CI runs
+cargo nextest run --workspace            # the same suite, a couple of minutes locally
 cargo clippy --workspace --all-targets -- -D warnings
 cargo audit          # dependency vulnerabilities
 ```
+
+**Driving the real binary without credentials.** `cargo run -p hotl-testkit --example
+fake_anthropic -- script.jsonl` starts a scripted Anthropic SSE server on loopback and
+prints its URL (one JSON reply per line; see the example's header for the shapes). Point a
+real `hotl` at it with `ANTHROPIC_API_KEY=x HOTL_ANTHROPIC_BASE_URL=http://127.0.0.1:PORT`
+and a throwaway `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`HOME`, in a detached tmux
+(`tmux -L x -f /dev/null new-session -d -x 80 -y 24 …`, then `capture-pane -p`). The
+terminal-level scenarios in `crates/hotl/tests/tmux_smoke.rs` do exactly that; they skip
+with a printed reason where tmux is absent, and `HOTL_TMUX_SMOKE=required` (the Linux CI
+leg) turns a skip into a failure, so run it that way to prove the smoke really ran.
 
 CI is also the release gate: a version tag is not created until CI is green on
 the exact commit being tagged, and the crates.io publish re-checks it.
@@ -27,6 +38,7 @@ Local conventions on top of that:
 - **No string-sniffing for provenance.** Injected items carry a `SyntheticReason`; never parse text to learn where something came from.
 - **Forward-compat serde on anything persisted** (`#[serde(other)] Unknown`, default + skip-when-none).
 - **Rust practices** — idiomatic and warning-clean; no `unsafe` without a written justification.
+- **Terminal-level claims go in `crates/hotl/tests/tmux_smoke.rs`.** Wait-for-substring is the assertion; a full-frame golden is evidence only for a frame at rest (the strip's resting wave). Moving parts are masked by `hotl_testkit::tmux::normalize_rows`.
 - **Tests are golden and deterministic.** The engine is tested by driving the real actor/turn/persistence stack with a scripted provider (`hotl-testkit`) and asserting on the normalized log. Add a scenario there for behavior changes.
 
 ## Comments that assert a guarantee
