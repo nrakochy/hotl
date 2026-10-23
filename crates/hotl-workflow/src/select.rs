@@ -111,27 +111,27 @@ impl Selector {
         let mut cursor = Cursor::One(root.clone());
         for step in &self.steps {
             cursor = match (cursor, step) {
-                (Cursor::One(v), Step::Key(k)) => Cursor::One(key(&v, k).map_err(&err)?),
-                (Cursor::One(v), Step::Index(n)) => Cursor::One(index(&v, *n).map_err(&err)?),
-                (Cursor::One(v), Step::Flatten) => Cursor::Many(spread(&v).map_err(&err)?),
+                (Cursor::One(v), Step::Key(k)) => Cursor::One(key(&v, k).map_err(err)?),
+                (Cursor::One(v), Step::Index(n)) => Cursor::One(index(&v, *n).map_err(err)?),
+                (Cursor::One(v), Step::Flatten) => Cursor::Many(spread(&v).map_err(err)?),
                 (Cursor::Many(vs), Step::Key(k)) => Cursor::Many(
                     vs.iter()
                         .filter(|v| !v.is_null())
                         .map(|v| key(v, k))
                         .collect::<Result<_, _>>()
-                        .map_err(&err)?,
+                        .map_err(err)?,
                 ),
                 (Cursor::Many(vs), Step::Index(n)) => Cursor::Many(
                     vs.iter()
                         .filter(|v| !v.is_null())
                         .map(|v| index(v, *n))
                         .collect::<Result<_, _>>()
-                        .map_err(&err)?,
+                        .map_err(err)?,
                 ),
                 (Cursor::Many(vs), Step::Flatten) => {
                     let mut out = Vec::new();
                     for v in vs.iter().filter(|v| !v.is_null()) {
-                        out.extend(spread(v).map_err(&err)?);
+                        out.extend(spread(v).map_err(err)?);
                     }
                     Cursor::Many(out)
                 }
