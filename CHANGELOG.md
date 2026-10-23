@@ -6,6 +6,17 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Fixed
+
+- The TUI's `/<skill> args` prompt names the skill call with its keys in a
+  fixed order, whatever features a dependency switches on in `serde_json`.
+
+### Internal
+
+- `nix flake check` builds each crate as its own Nix step (crate2nix) and
+  runs its tests; CI caches finished steps with Hestia, so a push rebuilds
+  only the crates it touched. The package Nix users install is unchanged.
+
 ## [0.30.0] - 2026-10-23
 
 ### Fixed
