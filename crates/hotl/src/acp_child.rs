@@ -678,7 +678,9 @@ async fn prompt_outcome(
     let _ = shared
         .send(&json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": sid}}))
         .await;
-    if tokio::time::timeout(grace, &mut rx).await.is_err() {
+    // An answer keeps the agent for the next prompt; silence or an exit
+    // (its group may still hold children) gets the kill.
+    if !matches!(tokio::time::timeout(grace, &mut rx).await, Ok(Ok(_))) {
         shared.kill();
     }
     match stop {
