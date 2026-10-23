@@ -457,7 +457,7 @@ impl Harness {
                 self.handle.events.recv(),
             )
             .await
-            .expect("event timeout")
+            .unwrap_or_else(|_| panic!("event timeout; seen so far: {:#?}", self.seen))
             .expect("event channel closed");
             self.seen.push(format!("{event:?}"));
             match event {

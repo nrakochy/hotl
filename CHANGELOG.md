@@ -236,6 +236,11 @@ semver promise of their own.
 
 ### Fixed
 
+- **A background job or sub-agent that finished in the last instant of a turn
+  was never answered.** Its notice was released by the commit that landed
+  just after the turn ended, and nothing asked for the follow-up turn; the
+  session sat idle with the result in context. The release now asks for the
+  continuation itself.
 - **An isolated sub-agent spawned inside a linked worktree no longer silently
   runs shared-cwd.** Its worktree is now cut under the repository's common
   `.git` dir, and a spawn from below the repository root degrades to

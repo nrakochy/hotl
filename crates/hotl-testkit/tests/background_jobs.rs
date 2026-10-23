@@ -30,6 +30,12 @@ fn alive(pid: u32) -> bool {
 }
 
 /// `(kind, synthetic)` per item, the coarse order proof.
+/// `[.., user(BackgroundJob), assistant]`: the notice is in and answered.
+fn ends_with_answered_job(items: &[Item]) -> bool {
+    let s = shape(items);
+    s.len() >= 2 && s[s.len() - 2] == "user Some(BackgroundJob)" && s[s.len() - 1] == "assistant"
+}
+
 fn shape(items: &[Item]) -> Vec<String> {
     items
         .iter()
@@ -62,8 +68,13 @@ async fn a_notify_while_idle_starts_a_tagged_turn() {
         EngineConfig::default(),
     );
     h.prompt_and_wait("run it").await;
-    // The job is short; its completion starts the second turn on its own.
-    h.wait_for_outcome().await;
+    // The job is short. Its notice lands either behind the turn (a second,
+    // tagged turn answers it) or at the tool-results commit, inside the first
+    // turn's last sample — then that sample is the answer and no second
+    // turn is owed. Both are D3; wait for the second turn only when needed.
+    if !ends_with_answered_job(&h.items()) {
+        h.wait_for_outcome().await;
+    }
     let items = h.items();
     let s = shape(&items);
     assert_eq!(
@@ -330,21 +341,30 @@ async fn a_job_notification_is_masked_like_any_entry() {
         config,
     });
     handle.prompt("go".into()).await;
-    let mut dones = 0;
-    while dones < 2 {
-        let ev = tokio::time::timeout(Duration::from_secs(20), handle.events.recv())
-            .await
-            .expect("timeout")
-            .expect("closed");
-        match ev {
-            EngineEvent::Ask { reply, .. } => {
-                let _ = reply.send(hotl_engine::AskReply::Allow);
-            }
-            EngineEvent::TurnDone { .. } => dones += 1,
-            _ => {}
+    // One turn when the notice lands inside the first turn's last sample,
+    // two when it lands behind the turn; the log entry is what is asserted,
+    // so wait for that, with a bounded number of turns behind it.
+    let mut seen: Vec<String> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let text = loop {
+        let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if text.contains("background_job") {
+            break text;
         }
-    }
-    let text = std::fs::read_to_string(&log_path).unwrap();
+        if std::time::Instant::now() > deadline {
+            panic!("no job notice in the log; seen: {seen:#?}\n{text}");
+        }
+        match tokio::time::timeout(Duration::from_millis(200), handle.events.recv()).await {
+            Ok(Some(ev)) => {
+                seen.push(format!("{ev:?}"));
+                if let EngineEvent::Ask { reply, .. } = ev {
+                    let _ = reply.send(hotl_engine::AskReply::Allow);
+                }
+            }
+            Ok(None) => panic!("closed; seen: {seen:#?}"),
+            Err(_) => {}
+        }
+    };
     assert!(
         text.contains("background_job"),
         "the notification was logged"

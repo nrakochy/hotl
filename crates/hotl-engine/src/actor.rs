@@ -1394,6 +1394,18 @@ pub(crate) async fn run(
                 )
                 .await;
                 head.publish();
+                // The turn may have finished while this ack was in flight —
+                // its `TurnFinished` arm has run and found nothing to
+                // release. A notice released here, behind that turn, has
+                // nobody to answer it: ask for the continuation now (0064
+                // D3), the same way `TurnFinished` does.
+                if !running && std::mem::take(&mut released_notice) {
+                    if let Some(tx) = cmd_tx.upgrade() {
+                        tokio::spawn(async move {
+                            let _ = tx.send(SessionCmd::Continue).await;
+                        });
+                    }
+                }
                 settled.resolve();
                 continue;
             }
