@@ -6,6 +6,18 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Fixed
+
+- **0.29.0 shipped no binaries and nothing to crates.io.** Its release page
+  held only `dist-manifest.json`, so the installers had nothing to download.
+  This release carries everything listed under 0.29.0, built and published.
+  A release now requires its builds to succeed.
+
+### Internal
+
+- Crates publish with `cargo publish --workspace`, and CI skips jobs whose
+  inputs have not changed since the last green run.
+
 ## [0.29.0] - 2026-10-23
 
 ### Internal
