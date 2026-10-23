@@ -3237,10 +3237,18 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                 .and_then(|r| r.split_once(char::is_whitespace))
                 .map(|(_, a)| a.trim())
                 .unwrap_or("");
-            let mut text = format!("Load the skill `{other}` and follow it for this task.");
-            if !expanded_arg.is_empty() {
-                text.push_str(&format!("\n\nARGUMENTS: {expanded_arg}"));
-            }
+            // With arguments the prompt names the exact tool call so the
+            // body's `$ARGUMENTS` get filled at load (0068 D5); the
+            // `ARGUMENTS:` line stays for a model that ignores the field.
+            let text = if expanded_arg.is_empty() {
+                format!("Load the skill `{other}` and follow it for this task.")
+            } else {
+                let call = serde_json::json!({"name": other, "arguments": expanded_arg});
+                format!(
+                    "Load the skill `{other}` by calling the skill tool with `{call}` and \
+                     follow it for this task.\n\nARGUMENTS: {expanded_arg}"
+                )
+            };
             let payload = paste::PromptPayload {
                 text: text.clone(),
                 images: payload.images,
@@ -8825,20 +8833,31 @@ mod tests {
         };
         assert!(p.text.contains("`brainstorming`"), "{}", p.text);
         assert!(
-            p.text.contains("ARGUMENTS: redesign the skill system"),
+            p.text.contains(
+                "calling the skill tool with `{\"arguments\":\"redesign the skill system\",\"name\":\"brainstorming\"}`"
+            ),
+            "the exact call is named so $ARGUMENTS fill at load: {}",
+            p.text
+        );
+        assert!(
+            p.text.ends_with("ARGUMENTS: redesign the skill system"),
             "the argument rides along: {}",
             p.text
         );
         assert_eq!(s.phase, Phase::Sampling { ticks: 0 });
 
-        // Qualified names resolve too, and take no argument fine.
+        // Qualified names resolve too, and take no argument fine — and the
+        // bare form is byte-identical to the pre-0068 prompt.
         let mut s = State::test_default();
         s.skills = vec!["superpowers:brainstorming".into()];
         let cmds = type_and_submit(&mut s, "/superpowers:brainstorming");
         let Some(Cmd::SendPrompt(p)) = cmds.first() else {
             panic!("expected a prompt, got {cmds:?}");
         };
-        assert!(!p.text.contains("ARGUMENTS"), "{}", p.text);
+        assert_eq!(
+            p.text,
+            "Load the skill `superpowers:brainstorming` and follow it for this task."
+        );
     }
 
     #[test]
