@@ -133,6 +133,34 @@ pub fn parse_effort(raw: &str, whose: &str) -> Option<Effort> {
     }
 }
 
+/// What runs a def's child: hotl's own engine, or an external agent binary
+/// spoken to over standard ACP v1 (0077).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    #[default]
+    Hotl,
+    Acp,
+}
+
+/// `hotl` | `acp`. Unknown is `None` and the caller drops the def: unlike
+/// `isolation:`, this value decides what runs, so no guess is safe.
+pub fn parse_backend(raw: &str, whose: &str) -> Option<Backend> {
+    match raw.trim() {
+        "hotl" | "" => Some(Backend::Hotl),
+        "acp" => Some(Backend::Acp),
+        other => {
+            eprintln!(
+                "hotl: {whose} sets `backend: {other}`, which is not a known value \
+                 (`hotl` | `acp`) — the def is ignored."
+            );
+            None
+        }
+    }
+}
+
+/// The default wall clock for an external child, in seconds.
+pub const DEFAULT_ACP_TIMEOUT_SECS: u64 = 900;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentDef {
     pub name: String,
@@ -157,6 +185,27 @@ pub struct AgentDef {
     /// inherits), so `spawn_child` has nothing to reject.
     pub max_turns: Option<i64>,
     pub source: AgentSource,
+    /// `backend:` — `Acp` runs `command` as an external ACP agent (0077).
+    pub backend: Backend,
+    /// `command:` split without a shell; empty for a `Hotl` def.
+    pub command: Vec<String>,
+    /// `state_dirs:` — the external agent's own home state, the only
+    /// widening of its write floor. Absolute, `~/` already expanded.
+    pub state_dirs: Vec<PathBuf>,
+    /// `timeout:` in seconds; `None` = [`DEFAULT_ACP_TIMEOUT_SECS`].
+    pub timeout: Option<u64>,
+    /// `mode:` — the agent's session mode id, sent after `session/new`.
+    pub mode: Option<String>,
+}
+
+impl AgentDef {
+    /// The program an `acp` def runs, for the ask and the roster.
+    pub fn program(&self) -> Option<&str> {
+        match self.backend {
+            Backend::Acp => self.command.first().map(String::as_str),
+            Backend::Hotl => None,
+        }
+    }
 }
 
 /// The three built-in agent types, matching the corpus convergence (03):
@@ -184,6 +233,11 @@ pub fn builtin(name: &str) -> Option<AgentDef> {
             isolation: Isolation::None,
             max_turns: None,
             source: AgentSource::BuiltIn,
+            backend: Backend::Hotl,
+            command: Vec::new(),
+            state_dirs: Vec::new(),
+            timeout: None,
+            mode: None,
         }),
         "explore" => Some(AgentDef {
             name: "explore".into(),
@@ -203,6 +257,11 @@ pub fn builtin(name: &str) -> Option<AgentDef> {
             isolation: Isolation::None,
             max_turns: None,
             source: AgentSource::BuiltIn,
+            backend: Backend::Hotl,
+            command: Vec::new(),
+            state_dirs: Vec::new(),
+            timeout: None,
+            mode: None,
         }),
         "plan" => Some(AgentDef {
             name: "plan".into(),
@@ -222,6 +281,11 @@ pub fn builtin(name: &str) -> Option<AgentDef> {
             isolation: Isolation::None,
             max_turns: None,
             source: AgentSource::BuiltIn,
+            backend: Backend::Hotl,
+            command: Vec::new(),
+            state_dirs: Vec::new(),
+            timeout: None,
+            mode: None,
         }),
         "review" => Some(AgentDef {
             name: "review".into(),
@@ -245,6 +309,11 @@ pub fn builtin(name: &str) -> Option<AgentDef> {
             isolation: Isolation::None,
             max_turns: None,
             source: AgentSource::BuiltIn,
+            backend: Backend::Hotl,
+            command: Vec::new(),
+            state_dirs: Vec::new(),
+            timeout: None,
+            mode: None,
         }),
         _ => None,
     }
@@ -308,6 +377,63 @@ pub fn parse_def_or_named(
     } else {
         Some(body.trim().to_string())
     };
+    let whose = format!("agent def `{name}`");
+    let backend = match get("backend:") {
+        Some(raw) => parse_backend(&raw, &whose)?,
+        None => Backend::Hotl,
+    };
+    let (mut command, mut state_dirs, mut timeout, mut mode) = (Vec::new(), Vec::new(), None, None);
+    if backend == Backend::Acp {
+        // A cloned repo or a Claude-compat dir must not name a program hotl runs.
+        if source != AgentSource::User {
+            eprintln!(
+                "hotl: {whose} sets `backend: acp` outside the hotl config dir's agents/ — \
+                 the def is ignored. External agents are honoured only there."
+            );
+            return None;
+        }
+        // Fail-closed: a silently ignored `tools:` would read as a narrowed roster.
+        for key in ["tools:", "model:", "effort:", "max_turns:"] {
+            if get(key).is_some() {
+                eprintln!(
+                    "hotl: {whose} is an external agent (`backend: acp`) and sets `{}`, which \
+                     hotl cannot apply to it — the def is ignored. Remove the key.",
+                    key.trim_end_matches(':')
+                );
+                return None;
+            }
+        }
+        command = match get("command:").and_then(|c| crate::rules::argv(&c)) {
+            Some(argv) => argv,
+            None => {
+                eprintln!(
+                    "hotl: {whose} sets `backend: acp` without a usable `command:` — the def \
+                     is ignored."
+                );
+                return None;
+            }
+        };
+        state_dirs = get("state_dirs:")
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty())
+                    .map(expand_home)
+                    .collect()
+            })
+            .unwrap_or_default();
+        timeout = get("timeout:").and_then(|raw| match raw.parse::<u64>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                eprintln!(
+                    "hotl: {whose} sets `timeout: {raw}`, which is not a positive number of \
+                     seconds — using {DEFAULT_ACP_TIMEOUT_SECS}."
+                );
+                None
+            }
+        });
+        mode = get("mode:");
+    }
     Some(AgentDef {
         name,
         description,
@@ -318,7 +444,25 @@ pub fn parse_def_or_named(
         isolation,
         max_turns,
         source,
+        backend,
+        command,
+        state_dirs,
+        timeout,
+        mode,
     })
+}
+
+/// `~/x` against the platform home; anything else verbatim.
+fn expand_home(raw: &str) -> PathBuf {
+    use hotl_platform::KnownPaths as _;
+    match raw.strip_prefix("~/") {
+        Some(rest) => hotl_platform::KNOWN_PATHS
+            .home()
+            .unwrap_or_default()
+            .join(rest),
+        None if raw == "~" => hotl_platform::KNOWN_PATHS.home().unwrap_or_default(),
+        None => PathBuf::from(raw),
+    }
 }
 
 /// `all` | `read-only`/`readonly` | a comma list of tool names.
@@ -431,7 +575,13 @@ pub fn list(config_dir: &Path, include_claude: bool) -> Vec<(String, String)> {
     out.extend(
         scan_root(&user_agents_root(config_dir), AgentSource::User)
             .into_iter()
-            .map(|d| (d.name, d.description)),
+            .map(|d| {
+                let description = match d.program() {
+                    Some(p) => format!("{} (external: {p})", d.description),
+                    None => d.description,
+                };
+                (d.name, description)
+            }),
     );
     if include_claude {
         out.extend(
@@ -468,7 +618,13 @@ pub fn filter_registry_under(def: &AgentDef, parent: &ToolScope, full: &Registry
 /// mutating child" (index: "guard parallel mutating children"). Computed
 /// dynamically off the actual filtered set (not just `ToolScope::ReadOnly`)
 /// so an `Only([...])` list of exclusively read tools also counts.
+///
+/// An external (`acp`) def is never read-only: hotl cannot see its roster, so
+/// the shared-tree guard must hold for it.
 pub fn is_read_only(def: &AgentDef) -> bool {
+    if def.backend == Backend::Acp {
+        return false;
+    }
     filter_registry(def, &Registry::builtin()).all_read_only()
 }
 
@@ -663,6 +819,11 @@ mod tests {
             isolation: Isolation::None,
             max_turns: None,
             source: AgentSource::User,
+            backend: Backend::Hotl,
+            command: Vec::new(),
+            state_dirs: Vec::new(),
+            timeout: None,
+            mode: None,
         };
         let child = filter_registry(&all_def, &full);
         assert!(
@@ -704,6 +865,11 @@ mod tests {
             isolation: Isolation::None,
             max_turns: None,
             source: AgentSource::User,
+            backend: Backend::Hotl,
+            command: Vec::new(),
+            state_dirs: Vec::new(),
+            timeout: None,
+            mode: None,
         };
         assert!(is_read_only(&only_reads));
         let mixed = AgentDef {
@@ -798,5 +964,122 @@ mod tests {
         .unwrap();
         assert_eq!(d.name, "typo");
         assert_eq!(d.max_turns, None);
+    }
+
+    /// A plain user def, for tests that vary one field.
+    fn def(name: &str) -> AgentDef {
+        AgentDef {
+            name: name.into(),
+            description: String::new(),
+            system_prompt: None,
+            tools: ToolScope::All,
+            model: None,
+            effort: None,
+            isolation: Isolation::None,
+            max_turns: None,
+            source: AgentSource::User,
+            backend: Backend::Hotl,
+            command: Vec::new(),
+            state_dirs: Vec::new(),
+            timeout: None,
+            mode: None,
+        }
+    }
+
+    #[test]
+    fn parse_def_reads_an_acp_backend_with_its_command_and_state_dirs() {
+        use hotl_platform::KnownPaths as _;
+        let md = "---\nname: gemini\ndescription: reviewer\nbackend: acp\ncommand: gemini --acp \"--x y\"\nstate_dirs: ~/.gemini, /opt/state\ntimeout: 600\nmode: ask\nisolation: worktree\n---\n";
+        let d = parse_def(md, AgentSource::User).unwrap();
+        assert_eq!(d.backend, Backend::Acp);
+        assert_eq!(d.command, vec!["gemini", "--acp", "--x y"]);
+        let home = hotl_platform::KNOWN_PATHS.home().unwrap_or_default();
+        assert_eq!(
+            d.state_dirs,
+            vec![home.join(".gemini"), PathBuf::from("/opt/state")]
+        );
+        assert_eq!(d.timeout, Some(600));
+        assert_eq!(d.mode.as_deref(), Some("ask"));
+        assert_eq!(d.isolation, Isolation::Worktree);
+        assert_eq!(d.program(), Some("gemini"));
+        // A silent def is hotl's own, with nothing external set.
+        let plain = parse_def("---\nname: p\n---\nbody", AgentSource::User).unwrap();
+        assert_eq!(
+            plain,
+            AgentDef {
+                system_prompt: Some("body".into()),
+                ..def("p")
+            }
+        );
+        assert_eq!(plain.program(), None);
+        // A bad timeout warns and keeps the def on the default.
+        let d = parse_def(
+            "---\nname: g\nbackend: acp\ncommand: g\ntimeout: soon\n---\n",
+            AgentSource::User,
+        )
+        .unwrap();
+        assert_eq!(d.timeout, None);
+        // No usable command drops it.
+        assert!(parse_def("---\nname: g\nbackend: acp\n---\n", AgentSource::User).is_none());
+    }
+
+    #[test]
+    fn an_acp_def_that_names_tools_or_model_is_dropped_with_a_warning() {
+        for key in ["tools: read", "model: m", "effort: high", "max_turns: 3"] {
+            let md = format!("---\nname: g\nbackend: acp\ncommand: g\n{key}\n---\n");
+            assert!(parse_def(&md, AgentSource::User).is_none(), "{key}");
+        }
+    }
+
+    #[test]
+    fn an_acp_def_outside_the_user_dir_is_dropped() {
+        let md = "---\nname: g\nbackend: acp\ncommand: g\n---\n";
+        assert!(parse_def(md, AgentSource::User).is_some());
+        assert!(parse_def(md, AgentSource::Claude).is_none());
+        assert!(parse_def(md, AgentSource::BuiltIn).is_none());
+    }
+
+    #[test]
+    fn an_unknown_backend_drops_the_def() {
+        let md = "---\nname: g\nbackend: codex\ncommand: g\n---\n";
+        assert!(parse_def(md, AgentSource::User).is_none());
+        assert_eq!(parse_backend("hotl", "t"), Some(Backend::Hotl));
+        assert_eq!(parse_backend("acp", "t"), Some(Backend::Acp));
+    }
+
+    #[test]
+    fn acp_defs_are_never_read_only() {
+        let ext = AgentDef {
+            tools: ToolScope::ReadOnly,
+            backend: Backend::Acp,
+            command: vec!["g".into()],
+            ..def("g")
+        };
+        assert!(!is_read_only(&ext));
+        assert!(is_read_only(&AgentDef {
+            tools: ToolScope::ReadOnly,
+            ..def("r")
+        }));
+    }
+
+    #[test]
+    fn list_marks_external_defs() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("gemini.md"),
+            "---\nname: gemini\ndescription: a reviewer\nbackend: acp\ncommand: gemini --acp\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agents.join("mine.md"),
+            "---\nname: mine\ndescription: native\n---\nbody",
+        )
+        .unwrap();
+        let listed = list(dir.path(), false);
+        let get = |n: &str| listed.iter().find(|(name, _)| name == n).unwrap().1.clone();
+        assert_eq!(get("gemini"), "a reviewer (external: gemini)");
+        assert_eq!(get("mine"), "native");
     }
 }

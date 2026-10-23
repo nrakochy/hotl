@@ -6946,6 +6946,11 @@ mod tests {
             isolation: hotl_tools::agents::Isolation::None,
             max_turns: None,
             source: hotl_tools::agents::AgentSource::User,
+            backend: hotl_tools::agents::Backend::Hotl,
+            command: Vec::new(),
+            state_dirs: Vec::new(),
+            timeout: None,
+            mode: None,
         };
         let (items, inherited) = cb.fork_initial_items(&cross_model, "brief", Vec::new());
         assert_eq!(items.len(), 1);
