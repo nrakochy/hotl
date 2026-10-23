@@ -357,8 +357,9 @@ jobs:
       - uses: NixOS/nix-installer-action@main
       # No account or secret: uploads use the runner's own cache token.
       - uses: Mic92/hestia@v3
+      # Many small build steps: build several at once (Nix defaults to one).
       - name: nix flake check
-        run: nix flake check --print-build-logs
+        run: nix flake check --print-build-logs --max-jobs auto
 
   # Dependency vulnerability scan. Runs
   # cargo-audit against the committed Cargo.lock. cargo-audit installs from
