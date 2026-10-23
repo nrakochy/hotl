@@ -44,6 +44,9 @@ pub enum SyntheticReason {
     /// the rest of that batch was not run, and this reminder says which call
     /// surprised it.
     Misprediction,
+    /// A tool touched a path one skill's `paths:` globs cover (0068 D3):
+    /// harness text naming the skill, once per skill per session.
+    SkillHint,
     #[serde(other)]
     Unknown,
 }

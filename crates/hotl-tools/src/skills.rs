@@ -89,6 +89,40 @@ struct SkillMeta {
 pub struct SkillTool {
     entries: Vec<SkillEntry>,
     description: String,
+    /// One rule per skill with `paths:` (0068 D3); the engine matches tool
+    /// input paths against them and injects the hint.
+    path_rules: Vec<SkillPathRule>,
+}
+
+/// A skill's `paths:` globs, compiled. Matched against a path relative to
+/// the session cwd with `/` separators (`hotl_context::relative_to_cwd`).
+#[derive(Debug, Clone)]
+pub struct SkillPathRule {
+    pub name: String,
+    pub globs: globset::GlobSet,
+}
+
+impl SkillPathRule {
+    /// gitignore-style globs: `src/**`, `*.rs`, `crates/*/src/**`. A bad
+    /// pattern is the error text the discovery warning carries.
+    pub fn new(name: &str, patterns: &[String]) -> Result<Self, String> {
+        let mut b = globset::GlobSetBuilder::new();
+        for p in patterns {
+            let glob = globset::GlobBuilder::new(p)
+                .literal_separator(true)
+                .build()
+                .map_err(|e| format!("`{p}`: {e}"))?;
+            b.add(glob);
+        }
+        Ok(Self {
+            name: name.to_string(),
+            globs: b.build().map_err(|e| e.to_string())?,
+        })
+    }
+
+    pub fn matches(&self, rel: &str) -> bool {
+        self.globs.is_match(rel)
+    }
 }
 
 /// One `hotl skills list` row (0068 T1): the flags column names what the
@@ -199,11 +233,26 @@ impl SkillTool {
     /// The warnings come back even then.
     pub fn with_roots(roots: &SkillRoots) -> (Option<Self>, Vec<String>) {
         let Discovery {
-            entries,
+            mut entries,
             mut warnings,
         } = discover(roots);
         if entries.is_empty() {
             return (None, warnings);
+        }
+        // `paths:` compiles here, once. A bad glob is a warning and the skill
+        // loses its rule — it then behaves as a plain skill.
+        let mut path_rules = Vec::new();
+        for e in entries.iter_mut().filter(|e| !e.paths.is_empty()) {
+            match SkillPathRule::new(&e.name, &e.paths) {
+                Ok(rule) => path_rules.push(rule),
+                Err(why) => {
+                    warnings.push(format!(
+                        "skill `{}`: bad `paths:` glob {why}; the skill loads but is never hinted",
+                        e.name
+                    ));
+                    e.paths.clear();
+                }
+            }
         }
         // Both flags set: nothing can reach it (D4). A warning, not an error.
         for e in entries
@@ -221,9 +270,15 @@ impl SkillTool {
             Some(Self {
                 entries,
                 description,
+                path_rules,
             }),
             warnings,
         )
+    }
+
+    /// The compiled `paths:` rules, for the engine's hint (0068 D3).
+    pub fn path_rules(&self) -> &[SkillPathRule] {
+        &self.path_rules
     }
 
     /// One row per skill, name-sorted — `hotl skills list`.
@@ -294,13 +349,20 @@ fn model_visible(e: &&SkillEntry) -> bool {
     !e.disable_model_invocation
 }
 
+/// In the always-sent roster: model-visible and without `paths:` (D3 — a
+/// paths skill is pointed at when its path is touched, and showing it after
+/// the touch would change the cached prefix mid-session).
+fn in_roster(e: &&SkillEntry) -> bool {
+    model_visible(e) && e.paths.is_empty()
+}
+
 /// The always-sent tool description: one line per source, large sources
 /// collapsed. Descriptions are deliberately absent — `query` searches
 /// them, including inside collapsed sources, so a skill that is not named
 /// here is still reachable.
 fn describe(entries: &[SkillEntry]) -> String {
     let mut sources: Vec<(u8, &str)> = Vec::new();
-    for e in entries.iter().filter(model_visible) {
+    for e in entries.iter().filter(in_roster) {
         if !sources.iter().any(|(_, s)| *s == e.source.as_str()) {
             sources.push((e.tier, &e.source));
         }
@@ -316,7 +378,7 @@ fn describe(entries: &[SkillEntry]) -> String {
     for (_, source) in sources {
         let names: Vec<&str> = entries
             .iter()
-            .filter(model_visible)
+            .filter(in_roster)
             .filter(|e| e.source == source)
             .map(|e| e.name.as_str())
             .collect();
@@ -1740,6 +1802,121 @@ mod tests {
             pos("hotl:") < pos("acme.tools") && pos("acme.tools") < pos("mkt:"),
             "{desc}"
         );
+    }
+
+    #[test]
+    fn path_rules_match_relative_to_cwd_and_never_outside_it() {
+        let rule = SkillPathRule::new("rusty", &["src/**".into(), "*.toml".into()]).unwrap();
+        assert!(rule.matches("src/lib.rs"));
+        assert!(rule.matches("src/deep/er/mod.rs"));
+        assert!(rule.matches("Cargo.toml"));
+        assert!(!rule.matches("tests/lib.rs"));
+        assert!(
+            !rule.matches("crates/x/Cargo.toml"),
+            "`*` stays inside one segment"
+        );
+        // The engine hands in `hotl_context::relative_to_cwd`'s output; a
+        // path outside cwd never reaches the rule.
+        let cwd = std::path::Path::new("/w");
+        assert_eq!(
+            hotl_context::relative_to_cwd(cwd, std::path::Path::new("src/a.rs")).as_deref(),
+            Some("src/a.rs")
+        );
+        assert_eq!(
+            hotl_context::relative_to_cwd(cwd, std::path::Path::new("/w/src/a.rs")).as_deref(),
+            Some("src/a.rs")
+        );
+        assert_eq!(
+            hotl_context::relative_to_cwd(cwd, std::path::Path::new("/elsewhere/src/a.rs")),
+            None
+        );
+        assert_eq!(
+            hotl_context::relative_to_cwd(cwd, std::path::Path::new("../w2/src/a.rs")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_paths_skill_is_hidden_from_the_roster_but_found_by_query_and_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join(".agents/skills");
+        write_skill(
+            &proj.join("rusty"),
+            "name: rusty\ndescription: Rust conventions for this crate\npaths: [\"src/**\"]",
+            "rusty body",
+        );
+        write_skill(
+            &proj.join("plain"),
+            "name: plain\ndescription: always listed",
+            "p",
+        );
+        let (tool, warnings) = SkillTool::with_roots(&SkillRoots {
+            project_dirs: vec![proj],
+            ..Default::default()
+        });
+        let tool = tool.unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            tool.description().contains("project: plain"),
+            "{}",
+            tool.description()
+        );
+        assert!(
+            !tool.description().contains("rusty"),
+            "{}",
+            tool.description()
+        );
+        assert!(tool
+            .run_impl(&json!({"query": "rust conventions"}))
+            .content
+            .starts_with("rusty"));
+        assert!(tool
+            .run_impl(&json!({"source": "project"}))
+            .content
+            .contains("rusty"));
+        assert!(tool
+            .run_impl(&json!({"name": "rusty"}))
+            .content
+            .contains("rusty body"));
+        assert!(
+            tool.catalog().any(|(n, _)| n == "rusty"),
+            "the `/` menu still has it"
+        );
+        let rules = tool.path_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].name, "rusty");
+        assert!(rules[0].matches("src/main.rs"));
+        assert!(tool
+            .roster()
+            .any(|r| r.name == "rusty" && r.flags == vec!["paths"]));
+    }
+
+    #[test]
+    fn a_bad_glob_is_a_warning_not_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join(".agents/skills");
+        write_skill(
+            &proj.join("broken"),
+            "name: broken\ndescription: d\npaths: [\"src/[**\"]",
+            "body",
+        );
+        let (tool, warnings) = SkillTool::with_roots(&SkillRoots {
+            project_dirs: vec![proj],
+            ..Default::default()
+        });
+        let tool = tool.unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("skill `broken`: bad `paths:` glob"),
+            "{warnings:?}"
+        );
+        assert!(tool.path_rules().is_empty());
+        // Now a plain skill: back in the roster, still loadable.
+        assert!(tool.description().contains("project: broken"));
+        assert!(tool
+            .run_impl(&json!({"name": "broken"}))
+            .content
+            .contains("body"));
     }
 
     #[test]

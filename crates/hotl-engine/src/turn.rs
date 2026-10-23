@@ -2667,8 +2667,9 @@ impl Turn {
         ) + hotl_context::tokens::estimate_items_with(&snapshot.tail, profile)
     }
 
-    /// Just-in-time nested AGENTS.md injection (M2), deduped per turn and
-    /// against the projection (hints from earlier turns are in the snapshot).
+    /// Just-in-time nested AGENTS.md injection (M2) and the skill `paths:`
+    /// hint (0068 D3), deduped per turn and against the projection (hints
+    /// from earlier turns are in the snapshot).
     fn subdir_hints(&mut self, uses: &[ToolUse]) -> Vec<Item> {
         let mut out = Vec::new();
         for tu in uses {
@@ -2677,20 +2678,40 @@ impl Turn {
             };
             // The human half of a truncation notice has no channel mid-turn;
             // the model half rides inside the envelope.
-            let Some((marker, item, _notice)) = hotl_context::nested_instructions(
+            if let Some((marker, item, _notice)) = hotl_context::nested_instructions(
                 &self.shared.cwd,
                 Path::new(path),
                 self.shared.config.instructions_max_bytes,
-            ) else {
+            ) {
+                if self.fresh_hint(marker) {
+                    out.push(item);
+                }
+            }
+            // One hint per skill per session; a path outside cwd never matches.
+            let Some(rel) = hotl_context::relative_to_cwd(&self.shared.cwd, Path::new(path)) else {
                 continue;
             };
-            if self.injected_hints.contains(&marker) || self.in_projection(&marker) {
-                continue;
+            for rule in self.shared.config.skill_paths.clone().iter() {
+                if !rule.matches(&rel) {
+                    continue;
+                }
+                let (marker, item) = hotl_context::skill_hint(&rule.name, &rel);
+                if self.fresh_hint(marker) {
+                    out.push(item);
+                }
             }
-            self.injected_hints.insert(marker);
-            out.push(item);
         }
         out
+    }
+
+    /// True once per marker: records it, unless this turn or the committed
+    /// projection already carries it.
+    fn fresh_hint(&mut self, marker: String) -> bool {
+        if self.injected_hints.contains(&marker) || self.in_projection(&marker) {
+            return false;
+        }
+        self.injected_hints.insert(marker);
+        true
     }
 
     fn in_projection(&self, marker: &str) -> bool {
@@ -2698,12 +2719,18 @@ impl Turn {
             return false;
         };
         // Durable only: a hint is deduped against what is actually committed,
-        // and nothing ephemeral is ever a `SubdirInstructions` item anyway.
+        // and nothing ephemeral is ever a hint item anyway.
         snapshot.durable.iter().any(|i| {
             matches!(
                 &**i,
-                Item::User { text, synthetic: Some(hotl_types::SyntheticReason::SubdirInstructions), .. }
-                    if text.contains(marker)
+                Item::User {
+                    text,
+                    synthetic: Some(
+                        hotl_types::SyntheticReason::SubdirInstructions
+                            | hotl_types::SyntheticReason::SkillHint
+                    ),
+                    ..
+                } if text.contains(marker)
             )
         })
     }

@@ -333,6 +333,40 @@ pub fn nested_instructions(
     None
 }
 
+/// `touched` relative to `cwd` with `/` separators, or `None` when it lies
+/// outside cwd — a `paths:` glob (0068 D3) never matches a file the session
+/// did not start under.
+pub fn relative_to_cwd(cwd: &Path, touched: &Path) -> Option<String> {
+    let abs = if touched.is_absolute() {
+        touched.to_path_buf()
+    } else {
+        cwd.join(touched)
+    };
+    let rel = abs.strip_prefix(cwd).ok()?;
+    let parts: Vec<&str> = rel.iter().map(|c| c.to_str().unwrap_or("")).collect();
+    if parts.contains(&"..") {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+/// The `paths:` activation hint (0068 D3): harness-authored, so no untrusted
+/// envelope and no skill text — only the D8-clean name and the model's own
+/// path. Returns `(marker, item)`; the caller dedupes on the marker, which
+/// is one per skill per session.
+pub fn skill_hint(skill: &str, rel_path: &str) -> (String, Item) {
+    let marker = format!("skill-paths=\"{skill}\"");
+    let item = Item::User {
+        text: format!(
+            "<skill-hint {marker} path=\"{rel_path}\"/> Skill `{skill}` applies to \
+             `{rel_path}`. Load it with skill{{\"name\":\"{skill}\"}} if it fits the task."
+        ),
+        synthetic: Some(SyntheticReason::SkillHint),
+        images: Vec::new(),
+    };
+    (marker, item)
+}
+
 /// This turn's step budget, as the MOIM reports it (0059 T3). Rides the
 /// ephemeral tag rather than joining `goal::GoalProgress`: the budget applies
 /// whether or not a goal is set, and a per-sample number in a durable item
@@ -436,6 +470,24 @@ pub fn defang(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_skill_hint_is_harness_text_with_the_marker_and_no_skill_body() {
+        let (marker, item) = skill_hint("rusty", "src/lib.rs");
+        assert_eq!(marker, "skill-paths=\"rusty\"");
+        let Item::User {
+            text, synthetic, ..
+        } = item
+        else {
+            panic!("a user item");
+        };
+        assert_eq!(synthetic, Some(SyntheticReason::SkillHint));
+        assert!(text.contains(&marker) && text.contains("skill{\"name\":\"rusty\"}"));
+        assert!(
+            !text.contains("<untrusted"),
+            "harness-authored, no envelope"
+        );
+    }
 
     #[test]
     fn turn_context_carries_the_step_budget_and_the_sentence() {

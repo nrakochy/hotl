@@ -119,6 +119,11 @@ pub struct EngineConfig {
     pub cache_ttl: CacheTtl,
     /// Availability-only fallback models (≤3 total — RELIABILITY.md).
     pub fallback_models: Vec<String>,
+    /// Skills with `paths:` globs (0068 D3): the turn hints the first time a
+    /// tool input path matches one. Rides the config rather than
+    /// `SessionDeps` so the hundred test literals stay as they are; children
+    /// get an empty slice (`child_config`).
+    pub skill_paths: Arc<[hotl_tools::skills::SkillPathRule]>,
     /// Consecutive failures of one tool before the turn stops.
     pub tool_failure_budget: u32,
     /// Tool calls this **session** may run before a batch is refused
@@ -218,6 +223,7 @@ impl Default for EngineConfig {
             cache_static: true,
             cache_ttl: CacheTtl::FiveMinutes,
             fallback_models: Vec::new(),
+            skill_paths: Arc::from(Vec::new()),
             tool_failure_budget: 5,
             max_tool_calls: 0,
             max_cost_usd: 0.0,

@@ -66,6 +66,7 @@ pub fn classify(item: &Item) -> ContextKind {
                 | SyntheticReason::Environment
                 | SyntheticReason::GoalGuidance
                 | SyntheticReason::Misprediction
+                | SyntheticReason::SkillHint
                 | SyntheticReason::Unknown,
             ) => ContextKind::HarnessInjections,
         },
@@ -162,7 +163,7 @@ mod tests {
             .tokens
     }
 
-    const ALL_REASONS: [SyntheticReason; 15] = [
+    const ALL_REASONS: [SyntheticReason; 16] = [
         SyntheticReason::ProjectInstructions,
         SyntheticReason::SystemReminder,
         SyntheticReason::Steer,
@@ -177,6 +178,7 @@ mod tests {
         SyntheticReason::Environment,
         SyntheticReason::GoalGuidance,
         SyntheticReason::Misprediction,
+        SyntheticReason::SkillHint,
         SyntheticReason::Unknown,
     ];
 

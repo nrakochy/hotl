@@ -1238,9 +1238,13 @@ async fn scaffold(
     // `build_registry` consumes the original for the web tools, so the
     // `agents` cap and the `requests` cap draw from one shared budget, not
     // two independently-built ones.
-    let (registry, skills, discovery_warnings, retrieval) =
+    let (registry, skills, discovery_warnings, retrieval, skill_paths) =
         build_registry(&cfg, &config_dir, &cwd, concurrency.clone());
     warnings.extend(discovery_warnings);
+    // The `paths:` rules ride the session config (0068 D3); `child_config`
+    // clears them, so a sub-agent is never hinted.
+    let mut config = config;
+    config.skill_paths = Arc::from(skill_paths);
     let registry = Arc::new(registry);
     let agents_include_claude = cfg.agents.claude.unwrap_or(true);
     let prefix_stagger = cfg.agents.prefix_stagger();
@@ -2299,6 +2303,7 @@ fn build_registry(
     Vec<(String, String)>,
     Vec<String>,
     Vec<hotl_retrieval::config::BackendConfig>,
+    Vec<hotl_tools::skills::SkillPathRule>,
 ) {
     let mut discovery_warnings: Vec<String> = Vec::new();
     // Everything is config.toml: [diagnostics] and [[mcp]] sections.
@@ -2347,6 +2352,7 @@ fn build_registry(
     // come off the same tool that goes into the registry, never a second
     // scan of the roots.
     let mut skills_catalog: Vec<(String, String)> = Vec::new();
+    let mut skill_paths = Vec::new();
     let (skills, skill_warnings) = hotl_tools::skills::SkillTool::with_roots(&roots);
     discovery_warnings.extend(skill_warnings);
     if let Some(skills) = skills {
@@ -2354,6 +2360,7 @@ fn build_registry(
             .catalog()
             .map(|(n, d)| (n.to_string(), d.to_string()))
             .collect();
+        skill_paths = skills.path_rules().to_vec();
         registry.register(Box::new(skills));
     }
     // `recall` is registered per session (`RecallRegistration`), not here: its
@@ -2410,7 +2417,13 @@ fn build_registry(
             hotl_tools::filter_for_shell(registry, false)
         }
     };
-    (registry, skills_catalog, discovery_warnings, retrieval)
+    (
+        registry,
+        skills_catalog,
+        discovery_warnings,
+        retrieval,
+        skill_paths,
+    )
 }
 
 /// A `ChildBuilder` that spawns an isolated sub-agent sharing the parent's
@@ -2493,6 +2506,8 @@ impl HotlChildBuilder {
         // future refactor (or an `engine_config()` default change) silently
         // breaks.
         config.cache_ttl = CacheTtl::FiveMinutes;
+        // Sub-agents keep no `skill` tool and get no `paths:` hints (0068 D9).
+        config.skill_paths = Arc::from(Vec::new());
         if let Some(e) = def.effort {
             config.effort = Some(e);
         }
@@ -5312,7 +5327,7 @@ mod tests {
         cfg.skills.claude = Some(false);
         cfg.skills.agents = Some(false);
         cfg.skills.project = Some(false);
-        let (_registry, catalog, _warnings, _retrieval) =
+        let (_registry, catalog, _warnings, _retrieval, _paths) =
             build_registry(&cfg, dir.path(), dir.path(), test_concurrency());
         assert_eq!(
             catalog,
@@ -5322,7 +5337,7 @@ mod tests {
 
         // No skills configured → no names, and no tool registered.
         let empty = tempfile::tempdir().unwrap();
-        let (_registry, catalog, _warnings, _retrieval) =
+        let (_registry, catalog, _warnings, _retrieval, _paths) =
             build_registry(&cfg, empty.path(), empty.path(), test_concurrency());
         assert!(catalog.is_empty(), "{catalog:?}");
     }
@@ -6194,14 +6209,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = crate::config::Config::default();
         cfg.skills.claude = Some(false);
-        let (registry, _, _, _) = build_registry(&cfg, dir.path(), dir.path(), test_concurrency());
+        let (registry, _, _, _, _) =
+            build_registry(&cfg, dir.path(), dir.path(), test_concurrency());
         assert!(registry.get("web_fetch").is_some());
         assert!(registry.get("web_search").is_none());
 
         let cfg = config_from_toml(
             "[web]\n[web.search]\nurl = \"https://s.example/api\"\napi_key_env = \"SEARCH_KEY\"\n",
         );
-        let (registry, _, _, _) = build_registry(&cfg, dir.path(), dir.path(), test_concurrency());
+        let (registry, _, _, _, _) =
+            build_registry(&cfg, dir.path(), dir.path(), test_concurrency());
         assert!(registry.get("web_fetch").is_some());
         assert!(registry.get("web_search").is_some());
     }
