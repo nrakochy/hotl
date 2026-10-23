@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 use hotl_engine::{AskReply, EngineEvent, Outcome, SessionHandle};
+use schemars::JsonSchema;
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -345,18 +347,24 @@ impl std::fmt::Debug for ServerInfo {
 }
 
 /// The `skills` array `initialize` and `config_reloaded` both carry.
-fn skill_roster(info: &ServerInfo) -> Vec<Value> {
+fn skill_roster(info: &ServerInfo) -> Vec<RosterEntry> {
     info.skills
         .iter()
-        .map(|s| json!({"name": s.name, "description": s.description}))
+        .map(|s| RosterEntry {
+            name: s.name.clone(),
+            description: s.description.clone(),
+        })
         .collect()
 }
 
 /// The `workflows` array beside it (0044) — additive, same shape.
-fn workflow_roster(info: &ServerInfo) -> Vec<Value> {
+fn workflow_roster(info: &ServerInfo) -> Vec<RosterEntry> {
     info.workflows
         .iter()
-        .map(|w| json!({"name": w.name, "description": w.description}))
+        .map(|w| RosterEntry {
+            name: w.name.clone(),
+            description: w.description.clone(),
+        })
         .collect()
 }
 
@@ -473,15 +481,15 @@ async fn handle_request(
             reply_ok(
                 writer,
                 id,
-                json!({
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "schemaVersion": UPDATE_SCHEMA_VERSION,
-                    "skills": skills,
-                    "workflows": workflow_roster(info),
-                    "defaultMode": info.default_mode,
-                    "defaultPlan": info.default_plan,
-                    "contextWindow": info.context_window,
-                    "streamIdleSecs": info.stream_idle_secs,
+                to_json(&InitializeResult {
+                    protocol_version: PROTOCOL_VERSION.into(),
+                    schema_version: UPDATE_SCHEMA_VERSION,
+                    skills,
+                    workflows: workflow_roster(info),
+                    default_mode: info.default_mode.clone(),
+                    default_plan: info.default_plan,
+                    context_window: info.context_window,
+                    stream_idle_secs: info.stream_idle_secs,
                 }),
             )
             .await;
@@ -624,43 +632,31 @@ async fn handle_request(
                     // `images: true` is the client's feature detection: an
                     // old server simply never sends the key, so a client can
                     // tell "images accepted" from "images silently ignored".
-                    let mut reply = json!({"sessionId": sid, "name": name, "mode": mode,
-                           "plan": plan, "defaultEffort": default_effort, "goal": goal,
-                           "images": true, "todos": todos});
-                    // Inserted rather than in the literal: `json!` cannot say
-                    // absent-vs-null, and these keys mean different things
-                    // absent (probe failed / never set / same model) than null.
-                    let obj = reply.as_object_mut().expect("the open reply is an object");
-                    if let Some(n) = context_tokens {
-                        obj.insert("contextTokens".into(), json!(n));
-                    }
-                    if let Some(e) = effort {
-                        obj.insert("effort".into(), e.map_or(Value::Null, |l| json!(l)));
-                    }
-                    if let Some(m) = previous_model {
-                        obj.insert("previousModel".into(), json!(m));
-                    }
-                    if let Some(sched) = effort_schedule {
-                        obj.insert("effortSchedule".into(), json!(sched));
-                    }
-                    if !open_warnings.is_empty() {
-                        obj.insert("warnings".into(), json!(open_warnings));
-                    }
-                    if let Some(t) = open_title {
-                        obj.insert("title".into(), json!(t));
-                    }
-                    // The model this session actually runs (a resumed switch
-                    // may differ from the process default).
-                    obj.insert("model".into(), json!(open_model));
-                    if let Some(m) = memory_mode {
-                        obj.insert("memoryMode".into(), json!(m));
-                    }
-                    // The session's worktree (0065): absent for a main-checkout
-                    // session, so an old client sees exactly today's reply.
-                    if let Some((path, branch)) = open_worktree {
-                        obj.insert("worktree".into(), json!({"path": path, "branch": branch}));
-                    }
-                    reply_ok(writer, id, reply).await;
+                    // Absent keys mean something different from null (probe
+                    // failed / never set / same model) — see `SessionOpenResult`.
+                    let reply = SessionOpenResult {
+                        session_id: sid,
+                        name,
+                        mode,
+                        plan,
+                        default_effort,
+                        goal,
+                        images: true,
+                        todos,
+                        context_tokens,
+                        effort,
+                        previous_model,
+                        effort_schedule,
+                        warnings: open_warnings,
+                        title: open_title,
+                        // The model this session actually runs (a resumed
+                        // switch may differ from the process default).
+                        model: open_model,
+                        memory_mode,
+                        // Absent for a main-checkout session (0065).
+                        worktree: open_worktree.map(|(path, branch)| WorktreeInfo { path, branch }),
+                    };
+                    reply_ok(writer, id, to_json(&reply)).await;
                 }
                 Err(e) => reply_err(writer, id, &e).await,
             }
@@ -705,7 +701,7 @@ async fn handle_request(
                 .await;
             };
             state.handle.rename(name).await;
-            reply_ok(writer, id, json!({"ok": true})).await;
+            reply_ok(writer, id, to_json(&Ack { ok: true })).await;
         }
         "session/set_mode" => {
             let Some(state) = session.as_ref() else {
@@ -718,11 +714,19 @@ async fn handle_request(
             if raw.is_some_and(hotl_tools::rules::is_legacy_plan_word) {
                 state.handle.set_plan(true).await;
                 let session_id = state.id.clone();
-                reply_ok(writer, id, json!({"ok": true, "plan": true})).await;
+                reply_ok(
+                    writer,
+                    id,
+                    to_json(&PlanAck {
+                        ok: true,
+                        plan: true,
+                    }),
+                )
+                .await;
                 return notify(
                     writer,
                     &session_id,
-                    json!({"type": "plan_changed", "plan": true}),
+                    to_json(&AcpOnlyUpdate::PlanChanged { plan: true }),
                 )
                 .await;
             }
@@ -741,14 +745,24 @@ async fn handle_request(
             let effective = hotl_tools::rules::enforced_mode(mode);
             state.handle.set_mode(mode).await;
             let session_id = state.id.clone();
-            reply_ok(writer, id, json!({"ok": true, "mode": effective.as_str()})).await;
+            reply_ok(
+                writer,
+                id,
+                to_json(&ModeAck {
+                    ok: true,
+                    mode: effective.as_str().into(),
+                }),
+            )
+            .await;
             // Broadcast, not just ack: a mode changed by *any* client (or by
             // resume inheritance) has to reach every attached surface, and
             // `session/update` needs no id-plumbing in a client's loop.
             notify(
                 writer,
                 &session_id,
-                json!({"type": "mode_changed", "mode": effective.as_str()}),
+                to_json(&AcpOnlyUpdate::ModeChanged {
+                    mode: effective.as_str().into(),
+                }),
             )
             .await;
         }
@@ -768,11 +782,11 @@ async fn handle_request(
             // ask, so what is requested is always what takes effect.
             state.handle.set_plan(plan).await;
             let session_id = state.id.clone();
-            reply_ok(writer, id, json!({"ok": true, "plan": plan})).await;
+            reply_ok(writer, id, to_json(&PlanAck { ok: true, plan })).await;
             notify(
                 writer,
                 &session_id,
-                json!({"type": "plan_changed", "plan": plan}),
+                to_json(&AcpOnlyUpdate::PlanChanged { plan }),
             )
             .await;
         }
@@ -810,13 +824,23 @@ async fn handle_request(
             state.handle.set_effort(effort).await;
             let session_id = state.id.clone();
             let wire = effort.map(|e| e.as_str());
-            reply_ok(writer, id, json!({"ok": true, "effort": wire})).await;
+            reply_ok(
+                writer,
+                id,
+                to_json(&EffortAck {
+                    ok: true,
+                    effort: wire.map(String::from),
+                }),
+            )
+            .await;
             // Broadcast for the same reason as `mode_changed`: a change made
             // by any client must reach every attached surface.
             notify(
                 writer,
                 &session_id,
-                json!({"type": "effort_changed", "effort": wire}),
+                to_json(&AcpOnlyUpdate::EffortChanged {
+                    effort: wire.map(String::from),
+                }),
             )
             .await;
         }
@@ -849,12 +873,19 @@ async fn handle_request(
             };
             let spec = switch.spec.clone();
             match state.handle.set_model(switch).await {
-                Ok(applied) => reply_ok(
-                    writer,
-                    id,
-                    json!({"ok": true, "model": spec, "applied": applied, "warnings": warnings}),
-                )
-                .await,
+                Ok(applied) => {
+                    reply_ok(
+                        writer,
+                        id,
+                        to_json(&ModelAck {
+                            ok: true,
+                            model: spec,
+                            applied,
+                            warnings,
+                        }),
+                    )
+                    .await
+                }
                 Err(e) => reply_err(writer, id, &format!("session/set_model: {e}")).await,
             }
         }
@@ -893,7 +924,7 @@ async fn handle_request(
                 }
             };
             state.handle.set_goal(goal.clone()).await;
-            reply_ok(writer, id, json!({"ok": true, "goal": goal})).await;
+            reply_ok(writer, id, to_json(&GoalAck { ok: true, goal })).await;
         }
         // `/remember` (0069). With `params.note`: the engine asks the owner
         // through the ordinary `session/request_permission` while this request
@@ -915,19 +946,23 @@ async fn handle_request(
                 let Some(report) = state.handle.memory_report().await else {
                     return reply_err(writer, id, "session/remember: memory is off").await;
                 };
-                reply_ok(writer, id, json!({"ok": true})).await;
+                reply_ok(writer, id, to_json(&Ack { ok: true })).await;
                 notify(
                     writer,
                     &state.id,
-                    json!({
-                        "type": "memory_report",
-                        "mode": report.mode.as_str(),
-                        "path": report.path.display().to_string(),
-                        "bytes": report.bytes,
-                        "cap": report.cap,
-                        "entries": report.entries.iter().map(|e| {
-                            json!({"date": e.date, "note": e.note})
-                        }).collect::<Vec<_>>(),
+                    to_json(&AcpOnlyUpdate::MemoryReport {
+                        mode: report.mode.as_str().into(),
+                        path: report.path.display().to_string(),
+                        bytes: report.bytes,
+                        cap: report.cap,
+                        entries: report
+                            .entries
+                            .iter()
+                            .map(|e| MemoryEntryRow {
+                                date: e.date.clone(),
+                                note: e.note.clone(),
+                            })
+                            .collect(),
                     }),
                 )
                 .await;
@@ -950,7 +985,7 @@ async fn handle_request(
             let writer = writer.clone();
             tokio::spawn(async move {
                 match pending.await {
-                    Ok(()) => reply_ok(&writer, id, json!({"ok": true})).await,
+                    Ok(()) => reply_ok(&writer, id, to_json(&Ack { ok: true })).await,
                     Err(why) => reply_err(&writer, id, &format!("session/remember: {why}")).await,
                 }
             });
@@ -968,7 +1003,7 @@ async fn handle_request(
                     Err(e) => return reply_err(writer, id, &format!("session/steer: {e}")).await,
                 };
             state.handle.steer_with(text.to_string(), images).await;
-            reply_ok(writer, id, json!({"queued": true})).await;
+            reply_ok(writer, id, to_json(&Queued { queued: true })).await;
         }
         // `/compact [focus]` (0066): ack with whether it ran now or waits for
         // the turn boundary; the fold's own frames ride `session/update`.
@@ -1000,10 +1035,10 @@ async fn handle_request(
             };
             match state.handle.fold(focus).await {
                 Some(hotl_engine::FoldAdmission::Started) => {
-                    reply_ok(writer, id, json!({"queued": false})).await
+                    reply_ok(writer, id, to_json(&Queued { queued: false })).await
                 }
                 Some(hotl_engine::FoldAdmission::Queued) => {
-                    reply_ok(writer, id, json!({"queued": true})).await
+                    reply_ok(writer, id, to_json(&Queued { queued: true })).await
                 }
                 None => reply_err(writer, id, "session/fold: the session is gone").await,
             }
@@ -1012,7 +1047,7 @@ async fn handle_request(
             if let Some(state) = session.as_ref() {
                 state.handle.interrupt();
             }
-            reply_ok(writer, id, json!({"cancelled": true})).await;
+            reply_ok(writer, id, to_json(&Cancelled { cancelled: true })).await;
         }
         // Re-read `config.toml` and rebuild the engine behind this connection,
         // then re-open the live session through the ordinary resume path so its
@@ -1040,7 +1075,9 @@ async fn handle_request(
                         notify(
                             writer,
                             &sid,
-                            json!({"type": "config_reload_failed", "reason": e}),
+                            to_json(&AcpOnlyUpdate::ConfigReloadFailed {
+                                reason: e.to_string(),
+                            }),
                         )
                         .await;
                     }
@@ -1055,7 +1092,11 @@ async fn handle_request(
                 return reply_ok(
                     writer,
                     id,
-                    json!({"ok": true, "model": info.model, "warnings": warnings}),
+                    to_json(&ReloadAck {
+                        ok: true,
+                        model: info.model.clone(),
+                        warnings,
+                    }),
                 )
                 .await;
             };
@@ -1093,14 +1134,14 @@ async fn handle_request(
                     reply_ok(
                         writer,
                         id,
-                        json!({
-                            "ok": true,
-                            "sessionId": sid,
-                            "model": info.model,
-                            "mode": mode,
-                            "plan": plan,
-                            "contextWindow": info.context_window,
-                            "warnings": warnings,
+                        to_json(&ReloadSessionAck {
+                            ok: true,
+                            session_id: sid.clone(),
+                            model: info.model.clone(),
+                            mode: mode.clone(),
+                            plan,
+                            context_window: info.context_window,
+                            warnings: warnings.clone(),
                         }),
                     )
                     .await;
@@ -1111,15 +1152,14 @@ async fn handle_request(
                     notify(
                         writer,
                         &sid,
-                        json!({
-                            "type": "config_reloaded",
-                            "model": info.model,
-                            "mode": mode,
-                            "plan": plan,
-                            "context_window": info.context_window,
-                            "skills": skills,
-                            "workflows": workflows,
-                            "warnings": warnings,
+                        to_json(&AcpOnlyUpdate::ConfigReloaded {
+                            model: info.model.clone(),
+                            mode,
+                            plan,
+                            context_window: info.context_window,
+                            skills,
+                            workflows,
+                            warnings,
                         }),
                     )
                     .await;
@@ -1155,7 +1195,7 @@ async fn handle_request(
                 return reply_err(writer, id, "session/aside requires params.question").await;
             };
             state.handle.aside(question.to_string()).await;
-            reply_ok(writer, id, json!({"ok": true})).await;
+            reply_ok(writer, id, to_json(&Ack { ok: true })).await;
         }
         "session/context" => {
             let Some(state) = session.as_ref() else {
@@ -1168,14 +1208,13 @@ async fn handle_request(
                     // shape, for the same reason: a client's loop needs no
                     // id-plumbing to get it. Additive, so
                     // `UPDATE_SCHEMA_VERSION` stands.
-                    reply_ok(writer, id, json!({"ok": true})).await;
+                    reply_ok(writer, id, to_json(&Ack { ok: true })).await;
                     notify(
                         writer,
                         &sid,
-                        json!({
-                            "type": "context_report",
-                            "window": b.window,
-                            "rows": b.rows,
+                        to_json(&AcpOnlyUpdate::ContextReport {
+                            window: b.window,
+                            rows: b.rows,
                         }),
                     )
                     .await;
@@ -1191,7 +1230,7 @@ async fn handle_request(
                 return reply_err(writer, id, "session/workflows requires an open session").await;
             };
             let sid = state.id.clone();
-            reply_ok(writer, id, json!({"ok": true})).await;
+            reply_ok(writer, id, to_json(&Ack { ok: true })).await;
             let mut payload = (info.workflows_report)();
             payload["type"] = json!("workflows_report");
             notify(writer, &sid, payload).await;
@@ -1207,28 +1246,32 @@ async fn handle_request(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let rows: Vec<Value> = jobs
+            let rows: Vec<JobRow> = jobs
                 .iter()
                 .map(|j| {
                     let (state_word, rc, ended) = match &j.state {
-                        hotl_tools::jobs::JobState::Running => ("running", Value::Null, now),
+                        hotl_tools::jobs::JobState::Running => ("running", None, now),
                         hotl_tools::jobs::JobState::Done { rc, ended_ms } => {
-                            ("done", json!(rc.to_string()), *ended_ms)
+                            ("done", Some(rc.to_string()), *ended_ms)
                         }
                     };
-                    json!({
-                        "id": j.id, "pid": j.pid, "command": j.command,
-                        "started_ms": j.started_ms, "detached": j.detached,
-                        "state": state_word, "rc": rc,
-                        "secs": ended.saturating_sub(j.started_ms) / 1000,
-                    })
+                    JobRow {
+                        id: j.id.clone(),
+                        pid: j.pid,
+                        command: j.command.clone(),
+                        started_ms: j.started_ms,
+                        detached: j.detached,
+                        state: state_word.into(),
+                        rc,
+                        secs: ended.saturating_sub(j.started_ms) / 1000,
+                    }
                 })
                 .collect();
-            reply_ok(writer, id, json!({"ok": true})).await;
+            reply_ok(writer, id, to_json(&Ack { ok: true })).await;
             notify(
                 writer,
                 &state.id,
-                json!({"type": "jobs_report", "jobs": rows}),
+                to_json(&AcpOnlyUpdate::JobsReport { jobs: rows }),
             )
             .await;
         }
@@ -1243,29 +1286,34 @@ async fn handle_request(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let rows: Vec<Value> = children
+            let rows: Vec<ChildRow> = children
                 .iter()
                 .map(|c| {
                     use hotl_tools::children::ChildState;
                     let (state_word, ok) = match &c.state {
-                        ChildState::Running => ("running", Value::Null),
-                        ChildState::Finishing => ("running", Value::Null),
-                        ChildState::Done { ok, .. } => ("done", json!(ok)),
-                        ChildState::Closed => ("closed", Value::Null),
+                        ChildState::Running | ChildState::Finishing => ("running", None),
+                        ChildState::Done { ok, .. } => ("done", Some(*ok)),
+                        ChildState::Closed => ("closed", None),
                     };
-                    json!({
-                        "id": c.id, "call_id": c.call_id, "agent_type": c.agent_type,
-                        "summary": c.summary, "started_ms": c.started_ms,
-                        "background": c.background, "isolated": c.isolated,
-                        "state": state_word, "ok": ok, "secs": c.secs(now),
-                    })
+                    ChildRow {
+                        id: c.id.clone(),
+                        call_id: c.call_id.clone(),
+                        agent_type: c.agent_type.clone(),
+                        summary: c.summary.clone(),
+                        started_ms: c.started_ms,
+                        background: c.background,
+                        isolated: c.isolated,
+                        state: state_word.into(),
+                        ok,
+                        secs: c.secs(now),
+                    }
                 })
                 .collect();
-            reply_ok(writer, id, json!({"ok": true})).await;
+            reply_ok(writer, id, to_json(&Ack { ok: true })).await;
             notify(
                 writer,
                 &state.id,
-                json!({"type": "children_report", "children": rows}),
+                to_json(&AcpOnlyUpdate::ChildrenReport { children: rows }),
             )
             .await;
         }
@@ -1285,7 +1333,7 @@ async fn handle_request(
                 return reply_err(writer, id, "session/children/stop requires params.child").await;
             };
             let stopped = state.handle.stop_child(child).await;
-            reply_ok(writer, id, json!({"ok": true, "stopped": stopped})).await;
+            reply_ok(writer, id, to_json(&StoppedAck { ok: true, stopped })).await;
         }
         // `/jobs stop <id>` (0064): kills the tree; the `job_done` frame that
         // follows is the outcome.
@@ -1302,7 +1350,7 @@ async fn handle_request(
                 return reply_err(writer, id, "session/jobs/stop requires params.job").await;
             };
             let stopped = state.handle.stop_job(job).await;
-            reply_ok(writer, id, json!({"ok": true, "stopped": stopped})).await;
+            reply_ok(writer, id, to_json(&StoppedAck { ok: true, stopped })).await;
         }
         other => reply_err(writer, id, &format!("unknown method `{other}`")).await,
     }
@@ -1534,10 +1582,17 @@ async fn drain_events(
                 //     let diff = crate::diffgen::for_tool(tool, input);
                 // plus `"diff": diff.map(|d| d.iter().map(DiffLine::to_json)…)`
                 // in the params below.
-                send(&writer, &json!({
-                    "jsonrpc": "2.0", "id": req_id, "method": "session/request_permission",
-                    "params": {"sessionId": session_id, "summary": summary, "protectedWhy": protected_why},
-                }))
+                send(
+                    &writer,
+                    &json!({
+                        "jsonrpc": "2.0", "id": req_id, "method": "session/request_permission",
+                        "params": to_json(&RequestPermissionParams {
+                            session_id: session_id.clone(),
+                            summary,
+                            protected_why,
+                        }),
+                    }),
+                )
                 .await;
             }
             EngineEvent::Question {
@@ -1554,13 +1609,13 @@ async fn drain_events(
                     &writer,
                     &json!({
                         "jsonrpc": "2.0", "id": req_id, "method": "session/request_question",
-                        "params": {
-                            "sessionId": session_id,
-                            "header": question.header,
-                            "prompt": question.prompt,
-                            "options": question.options,
-                            "multi": question.multi,
-                        },
+                        "params": to_json(&RequestQuestionParams {
+                            session_id: session_id.clone(),
+                            header: question.header,
+                            prompt: question.prompt,
+                            options: question.options,
+                            multi: question.multi,
+                        }),
                     }),
                 )
                 .await;
@@ -1579,7 +1634,10 @@ async fn drain_events(
                     &writer,
                     &json!({
                         "jsonrpc": "2.0", "id": req_id, "method": "session/request_egress",
-                        "params": {"sessionId": session_id, "host": host},
+                        "params": to_json(&RequestEgressParams {
+                            session_id: session_id.clone(),
+                            host,
+                        }),
                     }),
                 )
                 .await;
@@ -1604,13 +1662,14 @@ async fn drain_events(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .retain(|_, tx| !tx.is_closed());
-                let mut done = json!({"type": "turn_done", "outcome": outcome_tag(&outcome)});
-                // Additive and omitted at zero, exactly as the JSON stream
-                // renders it (0050 T5).
-                if mispredictions > 0 {
-                    done["mispredictions"] = json!(mispredictions);
-                }
-                notify(&writer, &session_id, done).await;
+                // `mispredictions` is omitted at zero, exactly as the JSON
+                // stream renders it (0050 T5).
+                let misses = (mispredictions > 0).then_some(mispredictions);
+                let done = AcpOnlyUpdate::TurnDone {
+                    outcome: crate::wire::OutcomeFrame::of(&outcome),
+                    mispredictions: misses,
+                };
+                notify(&writer, &session_id, to_json(&done)).await;
                 // Take the id and drop the guard *before* awaiting (a
                 // std::sync guard held across .await would make this non-Send).
                 let prompt_id = pending_prompt
@@ -1618,15 +1677,13 @@ async fn drain_events(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .pop_front();
                 if let Some(id) = prompt_id {
-                    let mut reply = json!({
-                        "schemaVersion": UPDATE_SCHEMA_VERSION,
-                        "outcome": outcome_tag(&outcome),
-                        "usage": crate::wire::usage_frame(&model, &usage),
-                    });
-                    if mispredictions > 0 {
-                        reply["mispredictions"] = json!(mispredictions);
-                    }
-                    reply_ok(&writer, id, reply).await;
+                    let reply = PromptResult {
+                        schema_version: UPDATE_SCHEMA_VERSION,
+                        outcome: crate::wire::OutcomeFrame::of(&outcome),
+                        usage: crate::wire::UsageFrame::of(&model, &usage),
+                        mispredictions: misses,
+                    };
+                    reply_ok(&writer, id, to_json(&reply)).await;
                 }
             }
             other => {
@@ -1814,6 +1871,62 @@ mod drain_tests {
 mod ask_reply_tests {
     use super::*;
 
+    /// 0076 D5: every reply shape the schema documents parses, through the
+    /// real lenient parser, to the answer the schema says it means — and
+    /// validates against the published reply defs.
+    #[test]
+    fn documented_client_replies_parse_as_the_schema_says() {
+        use hotl_types::QuestionAnswer;
+        let ask = |v: Value| ask_reply_from_result(Some(&v));
+        assert!(
+            matches!(ask(json!({"respond": "use main"})), AskReply::Respond { content } if content == "use main")
+        );
+        assert!(matches!(
+            ask(json!({"input": {"path": "a"}})),
+            AskReply::AllowEdited { .. }
+        ));
+        assert!(matches!(ask(json!({"allow": true})), AskReply::Allow));
+        assert!(matches!(
+            ask(json!({"allow": true, "secretReads": true})),
+            AskReply::AllowWithSecretReads
+        ));
+        assert!(
+            matches!(ask(json!({"allow": false, "message": "no"})), AskReply::Deny { message: Some(m) } if m == "no")
+        );
+        let q = |v: Value| question_answer_from_result(Some(&v));
+        assert_eq!(
+            q(json!({"selected": ["MVP"]})),
+            QuestionAnswer::Selected(vec!["MVP".into()])
+        );
+        assert_eq!(
+            q(json!({"freeText": "later"})),
+            QuestionAnswer::FreeText("later".into())
+        );
+        assert!(matches!(
+            egress_decision_from_result(Some(&json!({"allow": true}))),
+            hotl_tools::net::EgressDecision::Allow
+        ));
+        let schema = acp_schema();
+        let defs = &schema["$defs"];
+        for (def, example) in [
+            ("PermissionReply", json!({"respond": "use main"})),
+            ("PermissionReply", json!({"input": {"path": "a"}})),
+            (
+                "PermissionReply",
+                json!({"allow": true, "secretReads": true}),
+            ),
+            ("PermissionReply", json!({"allow": false, "message": "no"})),
+            ("QuestionReply", json!({"selected": ["MVP"]})),
+            ("QuestionReply", json!({"freeText": "later"})),
+            ("EgressReply", json!({"allow": true})),
+        ] {
+            let mut sub = defs[def].clone();
+            sub["$defs"] = defs.clone();
+            let v = jsonschema::validator_for(&sub).expect("a valid schema");
+            assert!(v.is_valid(&example), "{def} rejects {example}");
+        }
+    }
+
     /// Plan 0022: the credential-read grant rides the same permission result
     /// the TUI already sends. A client that never heard of it gets `Allow`,
     /// which is the fail-closed direction.
@@ -1870,4 +1983,383 @@ mod ask_reply_tests {
         ));
         assert!(matches!(ask_reply_from_result(None), AskReply::Deny { .. }));
     }
+}
+
+// --- Typed payloads (0076 D2) -------------------------------------------------
+//
+// Every result and notification body this server writes, as types, so the
+// published schema (`acp_schema`) is generated from what is actually sent.
+// Field order is the wire order (`preserve_order` serializes declaration order).
+
+/// `{name, description}` — a skill or workflow in a roster.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RosterEntry {
+    pub name: String,
+    pub description: String,
+}
+
+/// The `initialize` result.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InitializeResult {
+    /// hotl's own dialect string — not upstream ACP's integer version.
+    pub protocol_version: String,
+    pub schema_version: u32,
+    pub skills: Vec<RosterEntry>,
+    pub workflows: Vec<RosterEntry>,
+    pub default_mode: String,
+    pub default_plan: bool,
+    pub context_window: u64,
+    pub stream_idle_secs: u64,
+}
+
+/// `{path, branch}` of a session's worktree.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct WorktreeInfo {
+    pub path: String,
+    pub branch: String,
+}
+
+/// The `session/new` / `session/load` / fork result. Absent keys mean
+/// something different from `null` (probe failed / never set / same model).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionOpenResult {
+    pub session_id: String,
+    pub name: Option<String>,
+    pub mode: String,
+    pub plan: bool,
+    pub default_effort: Option<String>,
+    pub goal: Option<String>,
+    /// Feature detection: an old server never sends it.
+    pub images: bool,
+    pub todos: Vec<hotl_types::Todo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
+    /// Absent = never set; `null` = explicitly cleared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort_schedule: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeInfo>,
+}
+
+/// The `session/prompt` result, sent when the turn ends.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptResult {
+    pub schema_version: u32,
+    pub outcome: crate::wire::OutcomeFrame,
+    pub usage: crate::wire::UsageFrame,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mispredictions: Option<u32>,
+}
+
+/// `{"ok": true}`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct Ack {
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PlanAck {
+    pub ok: bool,
+    pub plan: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ModeAck {
+    pub ok: bool,
+    pub mode: String,
+}
+
+/// `effort` is `null` when reset to the provider default.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct EffortAck {
+    pub ok: bool,
+    pub effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ModelAck {
+    pub ok: bool,
+    pub model: String,
+    /// `false` = parked until the running turn ends.
+    pub applied: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct GoalAck {
+    pub ok: bool,
+    pub goal: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct StoppedAck {
+    pub ok: bool,
+    pub stopped: bool,
+}
+
+/// `session/reload_config` with no open session.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ReloadAck {
+    pub ok: bool,
+    pub model: String,
+    pub warnings: Vec<String>,
+}
+
+/// `session/reload_config` with an open session (it is re-opened).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReloadSessionAck {
+    pub ok: bool,
+    pub session_id: String,
+    pub model: String,
+    pub mode: String,
+    pub plan: bool,
+    pub context_window: u64,
+    pub warnings: Vec<String>,
+}
+
+/// `session/steer` and `session/aside`: `false` = there was no turn to queue on.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct Queued {
+    pub queued: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct Cancelled {
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct MemoryEntryRow {
+    pub date: String,
+    pub note: String,
+}
+
+/// One background job in a `jobs_report`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct JobRow {
+    pub id: String,
+    pub pid: u32,
+    pub command: String,
+    pub started_ms: u64,
+    pub detached: bool,
+    /// `running` | `done`.
+    pub state: String,
+    /// The exit status once `done`; `null` while running.
+    pub rc: Option<String>,
+    pub secs: u64,
+}
+
+/// One sub-agent in a `children_report`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ChildRow {
+    pub id: String,
+    pub call_id: Option<String>,
+    pub agent_type: String,
+    pub summary: String,
+    pub started_ms: u64,
+    pub background: bool,
+    pub isolated: bool,
+    /// `running` | `done` | `closed`.
+    pub state: String,
+    /// Set once `done`.
+    pub ok: Option<bool>,
+    pub secs: u64,
+}
+
+/// `session/update` bodies only the ACP surface sends.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AcpOnlyUpdate {
+    /// The turn ended; the usage rides the prompt result instead.
+    TurnDone {
+        outcome: crate::wire::OutcomeFrame,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mispredictions: Option<u32>,
+    },
+    ModeChanged {
+        mode: String,
+    },
+    PlanChanged {
+        plan: bool,
+    },
+    EffortChanged {
+        effort: Option<String>,
+    },
+    MemoryReport {
+        mode: String,
+        path: String,
+        bytes: usize,
+        cap: usize,
+        entries: Vec<MemoryEntryRow>,
+    },
+    ConfigReloaded {
+        model: String,
+        mode: String,
+        plan: bool,
+        context_window: u64,
+        skills: Vec<RosterEntry>,
+        workflows: Vec<RosterEntry>,
+        warnings: Vec<String>,
+    },
+    ConfigReloadFailed {
+        reason: String,
+    },
+    ContextReport {
+        window: u64,
+        rows: Vec<hotl_types::ContextRow>,
+    },
+    JobsReport {
+        jobs: Vec<JobRow>,
+    },
+    ChildrenReport {
+        children: Vec<ChildRow>,
+    },
+}
+
+/// Any `session/update` body: a stream frame or an ACP-only kind. The
+/// `workflows_report` body is the workflow registry's own JSON (untyped here).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)] // schema-only: `notify` sends the two halves as values
+pub enum AcpUpdate {
+    Frame(crate::wire::Frame),
+    Acp(AcpOnlyUpdate),
+}
+
+/// `session/update` params.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionUpdateParams {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub update: AcpUpdate,
+}
+
+/// Server → client `session/request_permission` params.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestPermissionParams {
+    pub session_id: String,
+    pub summary: String,
+    /// Why a protected path is involved, when one is.
+    pub protected_why: Option<String>,
+}
+
+/// Server → client `session/request_question` params.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestQuestionParams {
+    pub session_id: String,
+    pub header: String,
+    pub prompt: String,
+    pub options: Vec<hotl_types::QuestionOption>,
+    pub multi: bool,
+}
+
+/// Server → client `session/request_egress` params.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestEgressParams {
+    pub session_id: String,
+    pub host: String,
+}
+
+/// What a client answers `session/request_permission` with. Schema only:
+/// `ask_reply_from_result` reads these spellings in this priority (0076 D5).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)] // schema-only
+pub enum PermissionReply {
+    /// A typed answer for an ask that wants one.
+    Respond { respond: String },
+    /// Allow with edited tool input.
+    Input { input: Value },
+    Allow {
+        allow: bool,
+        #[serde(rename = "secretReads", skip_serializing_if = "Option::is_none")]
+        secret_reads: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+}
+
+/// What a client answers `session/request_question` with. Schema only.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)] // schema-only
+pub enum QuestionReply {
+    /// Option labels, as shown.
+    Selected { selected: Vec<String> },
+    FreeText {
+        #[serde(rename = "freeText")]
+        free_text: String,
+    },
+}
+
+/// What a client answers `session/request_egress` with. Schema only.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[allow(dead_code)] // schema-only
+pub struct EgressReply {
+    pub allow: bool,
+}
+
+/// Index type: exists so `schema_for!` puts every payload in `$defs`.
+#[derive(JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // schema-only
+pub struct AcpPayloads {
+    initialize: InitializeResult,
+    session_open: SessionOpenResult,
+    prompt_result: PromptResult,
+    session_update: SessionUpdateParams,
+    ack: Ack,
+    plan_ack: PlanAck,
+    mode_ack: ModeAck,
+    effort_ack: EffortAck,
+    model_ack: ModelAck,
+    goal_ack: GoalAck,
+    stopped_ack: StoppedAck,
+    reload_ack: ReloadAck,
+    reload_session_ack: ReloadSessionAck,
+    queued: Queued,
+    cancelled: Cancelled,
+    request_permission: RequestPermissionParams,
+    request_question: RequestQuestionParams,
+    request_egress: RequestEgressParams,
+    permission_reply: PermissionReply,
+    question_reply: QuestionReply,
+    egress_reply: EgressReply,
+}
+
+/// Where the ACP schema is published (0076 D3).
+#[allow(dead_code)] // read by `hotl schema` and the drift test (0076 task 4)
+pub const ACP_SCHEMA_ID: &str = "https://nrakochy.github.io/hotl/schema/acp-v1.schema.json";
+
+/// The published schema of every ACP payload, `$id` set to its URL.
+#[allow(dead_code)]
+pub fn acp_schema() -> Value {
+    let mut v = serde_json::to_value(schemars::schema_for!(AcpPayloads))
+        .expect("a schema always serializes");
+    v["$id"] = json!(ACP_SCHEMA_ID);
+    v["title"] = json!("hotl ACP-dialect payloads");
+    v
+}
+
+fn to_json<T: Serialize>(payload: &T) -> Value {
+    serde_json::to_value(payload).expect("an ACP payload always serializes")
 }
