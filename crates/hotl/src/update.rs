@@ -311,14 +311,26 @@ fn copy_mode(from: &Path, to: &Path) -> std::io::Result<()> {
 /// probe): a truncated or wrong-arch download is caught here, while the
 /// original binary is still in place.
 async fn probe(staged: &Path, expect: &str) -> Result<(), String> {
-    let run = tokio::process::Command::new(staged)
-        .arg("--version")
-        .kill_on_drop(true)
-        .output();
-    let out = tokio::time::timeout(std::time::Duration::from_secs(10), run)
-        .await
-        .map_err(|_| "the downloaded binary did not respond to `--version`".to_string())?
-        .map_err(|e| format!("the downloaded binary would not run: {e}"))?;
+    let mut attempt = 0;
+    let out = loop {
+        let run = tokio::process::Command::new(staged)
+            .arg("--version")
+            .kill_on_drop(true)
+            .output();
+        let res = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .map_err(|_| "the downloaded binary did not respond to `--version`".to_string())?;
+        match res {
+            Ok(out) => break out,
+            // A child forked elsewhere in this process can briefly hold the
+            // staged file's write handle (ETXTBSY); it clears once that exec runs.
+            Err(e) if text_busy(&e) && attempt < 10 => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(20 * attempt)).await;
+            }
+            Err(e) => return Err(format!("the downloaded binary would not run: {e}")),
+        }
+    };
 
     if !out.status.success() {
         return Err(format!(
@@ -334,6 +346,16 @@ async fn probe(staged: &Path, expect: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn text_busy(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ETXTBSY)
+}
+
+#[cfg(not(unix))]
+fn text_busy(_: &std::io::Error) -> bool {
+    false
 }
 
 /// Errors-as-prompts: name the directory that needs to be writable, and never
