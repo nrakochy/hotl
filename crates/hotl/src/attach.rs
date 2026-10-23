@@ -375,6 +375,13 @@ fn update_line(update: &Value) -> Option<String> {
                 None => "· goal cleared".to_string(),
             },
             "memory_changed" => format!("· remembered ({} B): {}", n("bytes"), s("note")),
+            "job_started" => format!(
+                "· job {} started (pid {}): {}",
+                s("job"),
+                n("pid"),
+                s("command")
+            ),
+            "job_done" => format!("· job {} ended · rc {} · {}s", s("job"), s("rc"), n("secs")),
             "memory_report" => {
                 let entries = update
                     .get("entries")

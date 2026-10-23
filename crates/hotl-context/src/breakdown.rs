@@ -67,6 +67,7 @@ pub fn classify(item: &Item) -> ContextKind {
                 | SyntheticReason::GoalGuidance
                 | SyntheticReason::Misprediction
                 | SyntheticReason::SkillHint
+                | SyntheticReason::BackgroundJob
                 | SyntheticReason::Unknown,
             ) => ContextKind::HarnessInjections,
         },
@@ -163,7 +164,7 @@ mod tests {
             .tokens
     }
 
-    const ALL_REASONS: [SyntheticReason; 16] = [
+    const ALL_REASONS: [SyntheticReason; 17] = [
         SyntheticReason::ProjectInstructions,
         SyntheticReason::SystemReminder,
         SyntheticReason::Steer,
@@ -179,8 +180,29 @@ mod tests {
         SyntheticReason::GoalGuidance,
         SyntheticReason::Misprediction,
         SyntheticReason::SkillHint,
+        SyntheticReason::BackgroundJob,
         SyntheticReason::Unknown,
     ];
+
+    /// 0064: a job's completion is harness text, billed with the other
+    /// injections.
+    #[test]
+    fn background_job_bills_to_harness_injections() {
+        let items = vec![user(
+            "<background-job id=\"x\" exit=\"0\" secs=\"1\" trust=\"untrusted\">done</background-job>",
+            Some(SyntheticReason::BackgroundJob),
+        )];
+        let b = breakdown(
+            "",
+            ToolTokens::default(),
+            &items,
+            &[],
+            200_000,
+            &TokenProfile::CONSERVATIVE,
+        );
+        assert!(row(&b, ContextKind::HarnessInjections) > 0);
+        assert_eq!(row(&b, ContextKind::Messages), 0);
+    }
 
     /// Every `Item` variant and every `SyntheticReason`, plus images.
     fn kitchen_sink() -> Vec<Item> {

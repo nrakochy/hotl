@@ -90,6 +90,7 @@ fn label(reason: &SyntheticReason) -> &'static str {
         SyntheticReason::GoalGuidance => "goal guidance",
         SyntheticReason::Misprediction => "misprediction",
         SyntheticReason::SkillHint => "skill hint",
+        SyntheticReason::BackgroundJob => "background job",
         SyntheticReason::Unknown => "synthetic",
     }
 }

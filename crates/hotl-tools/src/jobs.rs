@@ -57,6 +57,8 @@ pub struct JobRecord {
     pub state: JobState,
     /// `<session>.jobs/<id>`.
     pub dir: PathBuf,
+    /// The `tool_use` id of the call that started it, for the surfaces.
+    pub call_id: Option<String>,
 }
 
 impl JobRecord {
@@ -97,12 +99,14 @@ pub struct JobSpec {
 pub enum JobEvent {
     Started {
         id: String,
+        call_id: Option<String>,
         pid: u32,
         command: String,
         detached: bool,
     },
     Done {
         id: String,
+        call_id: Option<String>,
         command: String,
         rc: JobRc,
         secs: u64,
@@ -349,6 +353,7 @@ impl JobContext {
         crate::builtins::adopt(&reaper, &child);
         let pid = child.id().unwrap_or(0);
         write_private(&dir.join("pid"), &pid.to_string()).map_err(|e| io_err("write `pid`", e))?;
+        let call_id = crate::current_call_id();
         let record = JobRecord {
             id: id.clone(),
             pid,
@@ -357,6 +362,7 @@ impl JobContext {
             detached: spec.detach,
             state: JobState::Running,
             dir: dir.clone(),
+            call_id: call_id.clone(),
         };
         let stop = CancellationToken::new();
         self.jobs.lock().push(Slot {
@@ -365,6 +371,7 @@ impl JobContext {
         });
         (self.notify)(JobEvent::Started {
             id: id.clone(),
+            call_id,
             pid,
             command: spec.command.clone(),
             detached: spec.detach,
@@ -437,6 +444,7 @@ async fn waiter(
     let tail = read_tail(&log);
     notify(JobEvent::Done {
         id: record.id,
+        call_id: record.call_id,
         command: record.command,
         rc,
         secs: ended_ms.saturating_sub(record.started_ms) / 1000,

@@ -2122,13 +2122,20 @@ impl Turn {
         // no other. A later call in the same turn re-enters with `false`.
         // 0039: the call id rides the same shape, so `spawn` can stamp
         // forwarded child events with its own card's id.
+        // 0064: the job registry rides the same shape, so `bash
+        // {background}` reaches this session's jobs and no other's.
         let mut outcome = hotl_tools::PROGRESS_SINK
             .scope(
                 sink,
                 hotl_tools::CURRENT_CALL_ID.scope(
                     tu.id.clone(),
-                    hotl_tools::sandbox::SECRET_READS
-                        .scope(secret_reads, tool.run(input, self.cancel.clone())),
+                    hotl_tools::sandbox::SECRET_READS.scope(
+                        secret_reads,
+                        hotl_tools::jobs::JOBS.scope(
+                            Arc::clone(&self.shared.jobs),
+                            tool.run(input, self.cancel.clone()),
+                        ),
+                    ),
                 ),
             )
             .await;

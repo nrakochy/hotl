@@ -3465,6 +3465,23 @@ impl Surface {
             EngineEvent::MemoryChanged { note, bytes, .. } => {
                 eprintln!("· remembered ({bytes} B): {note}")
             }
+            // Jobs (0064): the start result is an ordinary tool result; these
+            // two are the harness's own lines around it.
+            EngineEvent::JobStarted {
+                job, pid, command, ..
+            } => eprintln!("· job {job} started (pid {pid}): {command}"),
+            EngineEvent::JobDone {
+                job,
+                rc,
+                secs,
+                stopped_by,
+                ..
+            } => {
+                let by = stopped_by
+                    .map(|b| format!(" · stopped by {b}"))
+                    .unwrap_or_default();
+                eprintln!("· job {job} ended · rc {rc} · {secs}s{by}")
+            }
             // `-p` never titles (0071 T4); the arm exists for the match.
             EngineEvent::SessionTitled { title, .. } => {
                 if let Some(t) = title {

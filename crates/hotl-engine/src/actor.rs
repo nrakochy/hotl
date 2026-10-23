@@ -732,6 +732,9 @@ pub(crate) struct SharedDeps {
     rules_epoch: std::sync::atomic::AtomicU32,
     /// Where this session files its plan artifact, if anywhere (0056 T2).
     plan_files: Option<crate::PlanFiles>,
+    /// The background job registry (0064): scoped into every tool call,
+    /// read by `/jobs`, killed at session end.
+    pub jobs: Arc<hotl_tools::jobs::JobContext>,
     /// What the harness observed commands do (0056 T4). Session-scoped, not
     /// turn-scoped: a goal loop spans turns, and "has this run since the last
     /// edit" is exactly the question a per-turn ledger could not answer.
@@ -791,6 +794,7 @@ impl SharedDeps {
         deps: SessionDeps,
         notifications: crate::hooks::NotificationDrain,
         head_rx: tokio::sync::watch::Receiver<Arc<ProjectionHead>>,
+        jobs: Arc<hotl_tools::jobs::JobContext>,
     ) -> (Self, SessionLog) {
         let mode = AtomicU8::new(mode_to_u8(deps.rules.mode()));
         let plan = AtomicBool::new(deps.rules.plan());
@@ -858,6 +862,7 @@ impl SharedDeps {
             rules_epoch: std::sync::atomic::AtomicU32::new(0),
             head_rx,
             plan_files: deps.plan_files,
+            jobs,
             command_ledger: std::sync::Mutex::new(hotl_context::goal::CommandLedger::default()),
         };
         (shared, deps.log)
@@ -1241,7 +1246,68 @@ pub(crate) async fn run(
     // Steers that arrived while a turn was live (or a tool batch open),
     // waiting for a boundary before they can be appended.
     let mut held_steers: Vec<HeldSteer> = Vec::new();
-    let (shared, mut log) = SharedDeps::new(deps, notifications, head_rx);
+    // The job registry (0064): `<session>.jobs` beside the log. Its notify
+    // closure reaches this very actor — a weak sender, like every sink the
+    // actor's own state holds — and a completion rides `send` on a spawned
+    // task, never `try_send`: a full channel must not drop it.
+    let jobs = {
+        let cmd_tx = cmd_tx.clone();
+        let events = events.clone();
+        hotl_tools::jobs::JobContext::new(
+            deps.log.path().with_extension("jobs"),
+            deps.config.max_jobs,
+            Arc::new(move |event| match event {
+                hotl_tools::jobs::JobEvent::Started {
+                    id,
+                    call_id,
+                    pid,
+                    command,
+                    detached,
+                } => {
+                    let _ = events.try_send(EngineEvent::JobStarted {
+                        id: call_id,
+                        job: id,
+                        pid,
+                        command,
+                        detached,
+                    });
+                }
+                hotl_tools::jobs::JobEvent::Done {
+                    id,
+                    call_id,
+                    command,
+                    rc,
+                    secs,
+                    tail,
+                    stopped_by,
+                    log,
+                } => {
+                    let rc = rc.to_string();
+                    let _ = events.try_send(EngineEvent::JobDone {
+                        id: call_id,
+                        job: id.clone(),
+                        rc: rc.clone(),
+                        secs,
+                        stopped_by: stopped_by.map(str::to_string),
+                    });
+                    let text =
+                        crate::job_notification(&id, &command, &rc, secs, &tail, stopped_by, &log);
+                    let cmd_tx = cmd_tx.clone();
+                    tokio::spawn(async move {
+                        if let Some(tx) = cmd_tx.upgrade() {
+                            let _ = tx
+                                .send(SessionCmd::Notify {
+                                    text,
+                                    synthetic: SyntheticReason::BackgroundJob,
+                                })
+                                .await;
+                        }
+                    });
+                }
+            }),
+        )
+    };
+    let (shared, mut log) = SharedDeps::new(deps, notifications, head_rx, jobs);
     let shared = Arc::new(shared);
     // Usage carried across compaction respawns within one logical turn.
     let mut carry_usage = TokenUsage::default();
@@ -1366,9 +1432,53 @@ pub(crate) async fn run(
                     &mut pipeline,
                     &mut held_steers,
                     running,
-                    HeldSteer { text, images },
+                    HeldSteer {
+                        text,
+                        images,
+                        synthetic: SyntheticReason::Steer,
+                    },
                 )
                 .await
+            }
+            SessionCmd::Notify { text, synthetic } => {
+                // D3: idle → a tagged turn starts; running → held like a
+                // steer, so it can never split a tool batch or precede the
+                // assistant item the model is still producing.
+                if running || awaiting_tool_results(head.items()) {
+                    push_or_fold_steer(
+                        &mut held_steers,
+                        HeldSteer {
+                            text,
+                            images: Vec::new(),
+                            synthetic,
+                        },
+                    );
+                } else {
+                    running = admit_prompt(
+                        &shared,
+                        &mut log,
+                        &mut head,
+                        &mut pipeline,
+                        &mut queue,
+                        running,
+                        QueuedPrompt {
+                            text,
+                            images: Vec::new(),
+                            synthetic: Some(synthetic),
+                        },
+                        &cmd_tx,
+                        &events,
+                        &current_turn,
+                        !held_steers.is_empty(),
+                    )
+                    .await;
+                }
+            }
+            SessionCmd::Jobs { reply } => {
+                let _ = reply.send(shared.jobs.jobs.list());
+            }
+            SessionCmd::StopJob { id, reply } => {
+                let _ = reply.send(shared.jobs.jobs.stop(&id));
             }
             SessionCmd::Rename(name) => {
                 title.renamed = true;
@@ -1794,7 +1904,7 @@ pub(crate) async fn run(
                 // starts the next turn behind them.
                 // A turn that died mid-sample must not strand its steers.
                 close_open_batch(&shared, &mut log, &mut head, &mut pipeline).await;
-                release_steers(
+                let notified = release_steers(
                     &shared,
                     &mut log,
                     &mut head,
@@ -1855,12 +1965,24 @@ pub(crate) async fn run(
                     unrecoverable,
                 )
                 .await;
+                // A notification released at turn end has nobody to answer
+                // it: ask for a continuation (D3). A queued prompt that just
+                // started a turn makes it a no-op; a closing session drops it.
+                if notified {
+                    if let Some(tx) = cmd_tx.upgrade() {
+                        tokio::spawn(async move {
+                            let _ = tx.send(SessionCmd::Continue).await;
+                        });
+                    }
+                }
             }
             SessionCmd::BumpRulesEpoch => {
                 shared.rules_epoch.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
+    // Jobs die with the session (0064 D5), before the hook sees the end.
+    shared.jobs.jobs.kill_all();
     // SessionEnd (Finding 1 fix): AWAITED, not fire-and-forget — the command
     // channel closed (every `SessionHandle`/turn task dropped its sender), so
     // this actor is shutting down for good and nothing needs it responsive
@@ -2393,7 +2515,12 @@ async fn on_turn_finished(
         // active goal + empty queue — a user-queued prompt outranks the
         // continuation (the goal re-evaluates after it), and a non-Done
         // outcome (interrupt, error) returns control with the goal intact.
-        if matches!(outcome, Outcome::Done { .. }) && ctx.queue.is_empty() {
+        // D8 (0064): a running job of this session is work in flight; its
+        // completion turn re-enters the gate.
+        if matches!(outcome, Outcome::Done { .. })
+            && ctx.queue.is_empty()
+            && ctx.shared.jobs.jobs.running_attached() == 0
+        {
             if let Some(state) = ctx.goal.as_mut() {
                 state.turns += 1;
                 let turns = state.turns;
@@ -3026,10 +3153,12 @@ fn push_or_fold_steer(held: &mut Vec<HeldSteer>, steer: HeldSteer) {
 }
 
 /// A steer waiting for a between-samples boundary, with the images its
-/// committed `Item::User` will carry.
+/// committed `Item::User` will carry. A harness notification (0064) rides the
+/// same hold with its own reason.
 struct HeldSteer {
     text: String,
     images: Vec<hotl_types::UserImage>,
+    synthetic: SyntheticReason,
 }
 
 async fn append_steer(
@@ -3054,7 +3183,7 @@ async fn append_steer(
             EntryPayload::Item {
                 item: Item::User {
                     text: steer.text,
-                    synthetic: Some(SyntheticReason::Steer),
+                    synthetic: Some(steer.synthetic),
                     images: steer.images,
                 },
             },
@@ -3075,6 +3204,9 @@ async fn append_steer(
 ///   pipelining, which would otherwise reintroduce 72a6f1b silently.
 /// - **mid-batch** — `awaiting_tool_results`: a steer that split an open
 ///   tool batch would strand the results from the calls they answer.
+///
+/// Returns whether any released item was a harness notification rather than a
+/// steer — at turn end that is what earns a `Continue` (0064 D3).
 async fn release_steers(
     shared: &SharedDeps,
     log: &mut SessionLog,
@@ -3082,7 +3214,7 @@ async fn release_steers(
     pipeline: &mut Pipeline,
     held: &mut Vec<HeldSteer>,
     at: Boundary,
-) {
+) -> bool {
     debug_assert!(
         at.is_between_samples(),
         "a held steer may only land between samples: releasing behind an in-sample \
@@ -3090,11 +3222,14 @@ async fn release_steers(
          producing — the inversion 72a6f1b fixed ({at:?})"
     );
     if held.is_empty() || awaiting_tool_results(head.items()) {
-        return;
+        return false;
     }
+    let mut notified = false;
     for steer in std::mem::take(held) {
+        notified |= steer.synthetic != SyntheticReason::Steer;
         append_steer(shared, log, head, pipeline, steer).await;
     }
+    notified
 }
 
 /// The error results a batch nothing will ever answer gets, so the request
@@ -4378,6 +4513,7 @@ mod tests {
                 HeldSteer {
                     text: "go".into(),
                     images: vec![big()],
+                    synthetic: SyntheticReason::Steer,
                 },
             );
         }
@@ -4408,6 +4544,7 @@ mod tests {
             HeldSteer {
                 text: "seed".into(),
                 images: vec![img(HELD_IMAGE_B64_MAX)],
+                synthetic: SyntheticReason::Steer,
             },
         );
         // Second push both truncates (text alone is over HELD_BYTES_MAX) and
@@ -4417,6 +4554,7 @@ mod tests {
             HeldSteer {
                 text: "y".repeat(HELD_BYTES_MAX + 4_096),
                 images: vec![img(1)],
+                synthetic: SyntheticReason::Steer,
             },
         );
         let text = &held[0].text;
@@ -4591,6 +4729,7 @@ mod tests {
             test_deps(dir, log),
             crate::hooks::NotificationDrain::new(),
             head_rx,
+            hotl_tools::jobs::JobContext::new(dir.join("s.jobs"), 8, Arc::new(|_| {})),
         );
         (Arc::new(shared), log, head)
     }
@@ -4975,6 +5114,7 @@ mod tests {
         let mut held = vec![super::HeldSteer {
             text: "hold me".to_string(),
             images: Vec::new(),
+            synthetic: SyntheticReason::Steer,
         }];
         release_steers(
             &shared,
@@ -4997,6 +5137,7 @@ mod tests {
         let mut held = vec![super::HeldSteer {
             text: "hold me".to_string(),
             images: Vec::new(),
+            synthetic: SyntheticReason::Steer,
         }];
         release_steers(
             &shared,

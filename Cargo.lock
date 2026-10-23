@@ -1196,6 +1196,7 @@ dependencies = [
  "hotl-store",
  "hotl-tools",
  "hotl-types",
+ "libc",
  "serde_json",
  "tempfile",
  "tokio",

@@ -248,6 +248,26 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
         } => json!({
             "type": "memory_changed", "note": note, "date": date, "bytes": bytes, "path": path
         }),
+        EngineEvent::JobStarted {
+            id,
+            job,
+            pid,
+            command,
+            detached,
+        } => json!({
+            "type": "job_started", "id": id, "job": job, "pid": pid, "command": command,
+            "detached": detached
+        }),
+        EngineEvent::JobDone {
+            id,
+            job,
+            rc,
+            secs,
+            stopped_by,
+        } => json!({
+            "type": "job_done", "id": id, "job": job, "rc": rc, "secs": secs,
+            "stopped_by": stopped_by
+        }),
         // `title` is omitted, not null, when the call produced nothing usable;
         // the spend still rides so a surface's totals stay true.
         EngineEvent::SessionTitled { title, usage } => {

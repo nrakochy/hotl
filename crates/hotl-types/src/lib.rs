@@ -47,6 +47,9 @@ pub enum SyntheticReason {
     /// A tool touched a path one skill's `paths:` globs cover (0068 D3):
     /// harness text naming the skill, once per skill per session.
     SkillHint,
+    /// A background job ended (0064 D3): exit status, wall time, the command
+    /// and the log's tail, delivered through the steer inbox.
+    BackgroundJob,
     #[serde(other)]
     Unknown,
 }
@@ -1350,6 +1353,20 @@ mod tests {
         assert_eq!(normalize_goal(&long), None);
         let max = "é".repeat(GOAL_MAX_CHARS); // chars, not bytes
         assert_eq!(normalize_goal(&max), Some(max.clone()));
+    }
+
+    #[test]
+    fn background_job_round_trips_and_older_readers_see_unknown() {
+        let item = Item::User {
+            text: "<background-job id=\"a1b2c3\" exit=\"0\"/>".into(),
+            synthetic: Some(SyntheticReason::BackgroundJob),
+            images: Vec::new(),
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains("\"synthetic\":\"background_job\""), "{json}");
+        assert_eq!(serde_json::from_str::<Item>(&json).unwrap(), item);
+        let future: SyntheticReason = serde_json::from_str("\"job_resumed\"").unwrap();
+        assert_eq!(future, SyntheticReason::Unknown);
     }
 
     #[test]

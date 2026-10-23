@@ -722,6 +722,24 @@ pub enum EngineEvent {
         bytes: usize,
         path: String,
     },
+    /// A background job started (0064). `id` is the starting call's
+    /// `tool_use` id, `job` the short job id.
+    JobStarted {
+        id: Option<String>,
+        job: String,
+        pid: u32,
+        command: String,
+        detached: bool,
+    },
+    /// A background job ended (0064). `rc` is the `rc` file's text;
+    /// `stopped_by` is `timeout` or `/jobs` when hotl killed it.
+    JobDone {
+        id: Option<String>,
+        job: String,
+        rc: String,
+        secs: u64,
+        stopped_by: Option<String>,
+    },
     /// The session was titled by the utility model (0071 T4), or the call
     /// came back unusable (`title: None`) and only the spend is reported.
     /// `usage` is the title call's own cost — housekeeping the session pays
@@ -817,6 +835,8 @@ impl std::fmt::Debug for EngineEvent {
                 write!(f, "GoalChanged(set={})", condition.is_some())
             }
             Self::MemoryChanged { bytes, .. } => write!(f, "MemoryChanged(bytes={bytes})"),
+            Self::JobStarted { job, pid, .. } => write!(f, "JobStarted({job}, pid={pid})"),
+            Self::JobDone { job, rc, .. } => write!(f, "JobDone({job}, rc={rc})"),
             Self::SessionTitled { title, .. } => {
                 write!(f, "SessionTitled(set={})", title.is_some())
             }
@@ -1138,6 +1158,23 @@ pub enum SessionCmd {
     Steer {
         text: String,
         images: Vec<hotl_types::UserImage>,
+    },
+    /// A harness notification for the model (0064 D3: a background job
+    /// ended): idle → a tagged turn starts; running → held like a steer and
+    /// released at the next boundary, with a `Continue` at turn end so the
+    /// model answers it.
+    Notify {
+        text: String,
+        synthetic: hotl_types::SyntheticReason,
+    },
+    /// The job registry, read (`/jobs`). Safe mid-turn.
+    Jobs {
+        reply: oneshot::Sender<Vec<hotl_tools::jobs::JobRecord>>,
+    },
+    /// Kill one job's tree by id (`/jobs stop`); `false` = no such running job.
+    StopJob {
+        id: String,
+        reply: oneshot::Sender<bool>,
     },
     /// Set the session's display name (durable: appended to the log).
     Rename(String),
@@ -1505,6 +1542,32 @@ impl SessionHandle {
                 .unwrap_or_else(|_| Err("the session is gone".into()))
         })
     }
+    /// The session's background jobs (0064), running and finished. Safe
+    /// mid-turn. Empty when the session is gone.
+    pub async fn jobs(&self) -> Vec<hotl_tools::jobs::JobRecord> {
+        let (tx, rx) = oneshot::channel();
+        if self.cmd.send(SessionCmd::Jobs { reply: tx }).await.is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+    /// Kill one background job's tree (0064). `false` when no running job
+    /// has that id.
+    pub async fn stop_job(&self, id: &str) -> bool {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd
+            .send(SessionCmd::StopJob {
+                id: id.to_string(),
+                reply: tx,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.unwrap_or(false)
+    }
     /// Bare `/remember`: the dial, the file and its entries. `None` when
     /// memory is off or the session is gone. Safe mid-turn.
     pub async fn memory_report(&self) -> Option<MemoryReport> {
@@ -1806,6 +1869,35 @@ pub fn question_sink(
             answer
         })
     })
+}
+
+/// What the model reads when a job ends (0064 D4): exit, wall time, the
+/// command and the log's tail inside an untrusted envelope, with the `read`
+/// line for the full file. The tail is process output, so `</` is defanged
+/// the way `spawn.rs::envelope_tagged` does it.
+pub fn job_notification(
+    job: &str,
+    command: &str,
+    rc: &str,
+    secs: u64,
+    tail: &str,
+    stopped_by: Option<&str>,
+    log: &std::path::Path,
+) -> String {
+    let log = log.display();
+    let defanged = tail.replace("</", "<\u{200b}/");
+    let stopped = match stopped_by {
+        Some(by) => format!("\n[job stopped: {by}]"),
+        None => String::new(),
+    };
+    format!(
+        "<background-job id=\"{job}\" exit=\"{rc}\" secs=\"{secs}\" trust=\"untrusted\">\n\
+         {command}\n\
+         --- last {} KiB of {log} (full log: read {log}) ---\n\
+         {defanged}\n\
+         </background-job>{stopped}",
+        hotl_tools::jobs::JOB_TAIL_BYTES / 1024
+    )
 }
 
 /// The `remember` tool's sink (0069): straight to the actor's one writer —
