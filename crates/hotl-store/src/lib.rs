@@ -242,6 +242,196 @@ impl PreparedPayload {
 /// proposal build. A single linear serde pass, no per-pair scan, so unlike
 /// masking it stays inline regardless of payload size (T3-16 names masking,
 /// not serialization, as the O(pairs × len) cost).
+/// Blank common credential shapes to `«masked:<shape>»` (0075 D6): a prefix
+/// list (`sk-ant-`, `sk-`, GitHub `gh?_`, AWS `AKIA`, Slack `xox?-`) each
+/// followed by a run of at least 16 token characters, plus JWTs (`eyJ….….…`),
+/// `Bearer <run>` and PEM private-key blocks. Scanned by hand — no regex crate
+/// in the tree — and idempotent: the marker is not a shape. Honest about its
+/// limit: an unprefixed secret is not a shape this knows.
+pub fn mask_token_shapes(text: &str) -> Cow<'_, str> {
+    const PREFIXES: [(&str, &str); 13] = [
+        ("sk-ant-", "sk-ant"),
+        ("sk-", "sk"),
+        ("ghp_", "github"),
+        ("gho_", "github"),
+        ("ghu_", "github"),
+        ("ghs_", "github"),
+        ("ghr_", "github"),
+        ("AKIA", "aws"),
+        ("xoxb-", "slack"),
+        ("xoxa-", "slack"),
+        ("xoxp-", "slack"),
+        ("xoxr-", "slack"),
+        ("xoxs-", "slack"),
+    ];
+    const RUN_MIN: usize = 16;
+    let bytes = text.as_bytes();
+    let is_run = |b: u8| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-';
+    // A token never ends in punctuation: `ghp_…nop.` keeps its period.
+    let run_end = |from: usize| {
+        let mut j = from;
+        while j < bytes.len() && is_run(bytes[j]) {
+            j += 1;
+        }
+        while j > from && matches!(bytes[j - 1], b'.' | b'-' | b'_') {
+            j -= 1;
+        }
+        j
+    };
+    let seg_end = |from: usize| {
+        let mut j = from;
+        while j < bytes.len()
+            && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
+        {
+            j += 1;
+        }
+        j
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &text[i..];
+        let boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        if boundary {
+            if rest.starts_with("-----BEGIN") {
+                let end = rest
+                    .find("-----END")
+                    .and_then(|e| rest[e + 8..].find("-----").map(|k| e + 8 + k + 5))
+                    .unwrap_or(rest.len());
+                out.push_str("«masked:pem»");
+                i += end;
+                changed = true;
+                continue;
+            }
+            if rest.starts_with("Bearer ") {
+                let j = run_end(i + 7);
+                if j - (i + 7) >= RUN_MIN {
+                    out.push_str("Bearer «masked:bearer»");
+                    i = j;
+                    changed = true;
+                    continue;
+                }
+            }
+            if rest.starts_with("eyJ") {
+                // Three base64url segments; a real header is 20+ chars and
+                // the payload and signature are never a word long.
+                let a = seg_end(i);
+                if a >= i + 10 && a < bytes.len() && bytes[a] == b'.' {
+                    let b = seg_end(a + 1);
+                    if b >= a + 1 + 8 && b < bytes.len() && bytes[b] == b'.' {
+                        let c = seg_end(b + 1);
+                        if c >= b + 1 + 8 {
+                            out.push_str("«masked:jwt»");
+                            i = c;
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+            if let Some((prefix, shape)) = PREFIXES.iter().find(|(p, _)| rest.starts_with(p)) {
+                let j = run_end(i + prefix.len());
+                if j - (i + prefix.len()) >= RUN_MIN {
+                    out.push_str("«masked:");
+                    out.push_str(shape);
+                    out.push('»');
+                    i = j;
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        let ch = rest.chars().next().expect("in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    if changed {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+#[cfg(test)]
+mod token_shape_tests {
+    use super::mask_token_shapes;
+
+    #[test]
+    fn token_shapes_mask_known_prefixes_and_jwt_and_pem() {
+        let cases = [
+            (
+                concat!("key sk-", "ant-api03-ABCDEFGHIJKLMNOPQRSTUV end"),
+                "key «masked:sk-ant» end",
+            ),
+            (concat!("sk-", "proj-ABCDEFGHIJKLMNOPQRSTUV"), "«masked:sk»"),
+            (
+                concat!("token gh", "p_0123456789abcdefghijklmnop."),
+                "token «masked:github».",
+            ),
+            (concat!("AK", "IAIOSFODNN7EXAMPLE1234"), "«masked:aws»"),
+            (
+                concat!("xo", "xb-1234567890-abcdefghijklmnop"),
+                "«masked:slack»",
+            ),
+            (
+                concat!("jwt ey", "JhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc_def-ghi!"),
+                "jwt «masked:jwt»!",
+            ),
+            (
+                "Authorization: Bearer abcdefghijklmnopqrstuvwxyz\n",
+                "Authorization: Bearer «masked:bearer»\n",
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(mask_token_shapes(input), want, "{input}");
+        }
+        let pem = "before\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\n-----END RSA PRIVATE KEY-----\nafter";
+        let out = mask_token_shapes(pem);
+        assert_eq!(out, "before\n«masked:pem»\nafter");
+        // Unterminated: masked to the end rather than leaked.
+        assert_eq!(
+            mask_token_shapes("x -----BEGIN KEY-----\nabc"),
+            "x «masked:pem»"
+        );
+    }
+
+    #[test]
+    fn token_shapes_leave_short_runs_and_prose_alone() {
+        for s in [
+            "sk-short",
+            "the task-manager restarted",
+            "ghp_abc",
+            "the AKIA budget line",
+            "Bearer token",
+            "eyJ.only.two",
+            "plain prose with no secrets at all",
+            "«masked:github» already",
+        ] {
+            assert!(
+                matches!(mask_token_shapes(s), std::borrow::Cow::Borrowed(_)),
+                "{s}"
+            );
+        }
+        // A prefix inside a word is not a token (`task-...` is not `sk-...`).
+        assert_eq!(
+            mask_token_shapes("tasks-abcdefghijklmnopqrstuv"),
+            "tasks-abcdefghijklmnopqrstuv"
+        );
+    }
+
+    #[test]
+    fn token_shapes_are_idempotent() {
+        let once = mask_token_shapes(concat!(
+            "gh",
+            "p_0123456789abcdefghijklmnop and Bearer abcdefghijklmnopqrstuvwxyz"
+        ))
+        .into_owned();
+        let twice = mask_token_shapes(&once).into_owned();
+        assert_eq!(once, twice);
+    }
+}
+
 pub fn serialize_payload(payload: &EntryPayload) -> serde_json::Result<String> {
     serde_json::to_string(payload)
 }

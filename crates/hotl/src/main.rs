@@ -43,6 +43,7 @@ mod plugins_cli;
 mod session_server;
 mod setup;
 mod shell_hooks;
+mod shell_trace;
 mod signals;
 mod skills_cli;
 mod spawn;
@@ -323,6 +324,7 @@ fn help_text() -> &'static str {
          \x20                   --keep <items> / --keep-turns <n> fork at a prefix instead of the head\n  \
          hotl -p \"prompt\"     headless one-shot (--json for events; --json-schema <f> for validated JSON)\n  \
          \x20                   --goal <condition> keeps the turn going until a fast evaluator judges it met\n  \
+         \x20                   --shell-trace <file> attaches the zsh plugin's record of the last command (masked, untrusted)\n  \
          \x20                   --ephemeral keeps no session: the log lives in a temp dir and is removed at exit\n  \
          \x20                   --resume <id|name|@last> continues a session from a script (hotl resume <s> -p works too)\n  \
          hotl --goal \"<cond>\"   headless goal loop with the condition as the prompt (no -p needed)\n  \

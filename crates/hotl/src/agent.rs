@@ -501,6 +501,7 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
                     parsed.ephemeral,
                     parsed.worktree,
                     parsed.no_worktree,
+                    parsed.shell_trace,
                 )
                 .await
             }
@@ -1952,6 +1953,7 @@ async fn run_session(
     ephemeral: bool,
     worktree: Option<crate::tui::WorktreeArg>,
     no_worktree: bool,
+    shell_trace: Option<PathBuf>,
 ) -> i32 {
     // The worktree's cheap refusals (0065) before a provider is even selected.
     if let Some(arg) = &worktree {
@@ -2186,10 +2188,14 @@ async fn run_session(
     if scaffold.rules.plan() {
         surface = surface.in_plan_mode(scaffold.cwd.clone());
     }
-    surface
-        .handle
-        .prompt(crate::setup::expand_file_refs(&prompt))
-        .await;
+    // 0075 T4: the shell trace rides after the expanded prompt, masked and
+    // enveloped untrusted. `-p` only — the `: ` plugin never produces more.
+    let text = crate::shell_trace::append_trace(
+        crate::setup::expand_file_refs(&prompt),
+        shell_trace.as_deref(),
+        &scaffold.masker(),
+    );
+    surface.handle.prompt(text).await;
     let code = surface.run_until_idle().await;
     // Finding 1 fix: this is a one-shot CLI exit path — `main.rs::block_on`
     // drops its `current_thread` runtime the instant this function returns,
@@ -4198,6 +4204,9 @@ struct Args {
     prompt: Option<Prompt>,
     json_events: bool,
     schema: Option<PathBuf>,
+    /// `--shell-trace FILE` (0075 T4): the zsh plugin's record of the last
+    /// command, appended to the prompt masked and enveloped untrusted.
+    shell_trace: Option<PathBuf>,
     name: Option<String>,
     /// `--plan`: start with the plan overlay on, whatever the mode resolves to.
     plan: bool,
@@ -4225,6 +4234,7 @@ struct Args {
 fn parse_args(args: Vec<String>) -> Result<Args, i32> {
     let mut prompt: Option<Prompt> = None;
     let mut json_events = false;
+    let mut shell_trace: Option<PathBuf> = None;
     let mut schema: Option<PathBuf> = None;
     let mut name: Option<String> = None;
     let mut plan = false;
@@ -4278,6 +4288,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
                 }
             },
             "--json-schema" => schema = iter.next().map(PathBuf::from),
+            "--shell-trace" => shell_trace = iter.next().map(PathBuf::from),
             "--fork-from" | "--keep" | "--keep-turns" => {
                 let Some(v) = iter.next() else {
                     eprintln!("hotl: {arg} needs a value");
@@ -4372,6 +4383,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
         prompt,
         json_events,
         schema,
+        shell_trace,
         name,
         plan,
         fork_from,
@@ -7441,6 +7453,38 @@ mod tests {
             !engine_config("m", &junk, &off).0.cache_warming,
             "unparseable env is unset"
         );
+    }
+
+    /// 0075 T4: `--shell-trace FILE` parses beside `-p`; absent, nothing is
+    /// attached (the `--json`/ACP goldens are the proof the prompt bytes stand).
+    #[test]
+    fn shell_trace_flag_parses_and_rides_after_the_expanded_prompt() {
+        let strs = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let parsed = parse_args(strs(&["-p", "hi", "--shell-trace", "/tmp/t.trace"])).unwrap();
+        assert_eq!(parsed.shell_trace, Some(PathBuf::from("/tmp/t.trace")));
+        assert_eq!(parse_args(strs(&["-p", "hi"])).unwrap().shell_trace, None);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, "body").unwrap();
+        let trace = dir.path().join("t.trace");
+        std::fs::write(
+            &trace,
+            "cmd=false\nexit=1\nms=3\ncwd=/\ncaptured=none\n---\n",
+        )
+        .unwrap();
+        let expanded = crate::setup::expand_file_refs(&format!("why @[{}]", file.display()));
+        let text = crate::shell_trace::append_trace(
+            expanded.clone(),
+            Some(&trace),
+            &hotl_store::Masker::empty(),
+        );
+        assert!(
+            text.starts_with(&format!(
+                "{expanded}\n\n<shell_trace trust=\"untrusted\" exit=\"1\""
+            )),
+            "{text}"
+        );
+        assert!(!trace.exists(), "read once, then deleted");
     }
 
     #[test]
