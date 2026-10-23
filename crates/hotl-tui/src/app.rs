@@ -3585,7 +3585,13 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
             let text = if expanded_arg.is_empty() {
                 format!("Load the skill `{other}` and follow it for this task.")
             } else {
-                let call = serde_json::json!({"name": other, "arguments": expanded_arg});
+                // Keys in a fixed order: a `json!` map's order follows serde_json's
+                // `preserve_order`, which a dependency can switch on.
+                let call = format!(
+                    "{{\"arguments\":{},\"name\":{}}}",
+                    serde_json::Value::from(expanded_arg),
+                    serde_json::Value::String(other.to_string())
+                );
                 format!(
                     "Load the skill `{other}` by calling the skill tool with `{call}` and \
                      follow it for this task.\n\nARGUMENTS: {expanded_arg}"
