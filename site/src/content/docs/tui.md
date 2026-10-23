@@ -105,7 +105,9 @@ Top to bottom:
 
 3. **Input** — a bordered editor sitting on the gutter, its text aligned with your `❯` prompts; on terminals of 30 rows or more a blank row separates it from the strip. The draft grows to a third of the screen before it scrolls. With vim mode on, the title shows `-- INSERT --` / `-- NORMAL --`.
 4. **Agent band** — appears below the input while the turn has sub-agents
-   *running*: `● main` plus one summary row per running spawn — `●` marks
+   *running* (background `bash` jobs are not band rows: they have no stream,
+   only a log file and the `⚙ N` chip — see `/jobs`): `● main` plus one
+   summary row per running spawn — `●` marks
    the stream you are watching. A spawn drops off the band the moment it
    settles (the one you are viewing or pointing at stays until you leave
    it), and the band disappears when nothing runs. It is navigated in place:
@@ -315,6 +317,7 @@ own.
 | `/context` | What is *filling* the window, by source (see [The context report](#the-context-report)). Safe to run mid-turn. |
 | `/remember [note]` | Keep one note for every future session in this project. With a note: only while idle and only under `[memory] mode = "read-write"`; the same y/n modal a tool ask uses confirms it, then the line is appended to the project's `MEMORY.md` in the data dir and the notice says `remembered — loads next session`. Bare `/remember` lists the notes, the file, its size against the 16 KiB cap and the dial — any time. See [configuration.md](../configuration/#memory-memory). |
 | `/compact [focus]` | Fold earlier history into the typed summary now, instead of waiting for the 80% rung. With a focus, the summary keeps everything about it in full. Runs when the current turn ends if one is running; the strip reads `folding history…` while it works and the notice says what it cost. See [Folding on purpose](#folding-on-purpose). |
+| `/jobs [stop <id>]` | Background `bash` jobs in this session: id, state, elapsed time and command, one row each; `/jobs stop <id>` kills a job's whole process tree (the `rc` file then reads `killed:SIGKILL`). While jobs run the strip shows `⚙ N`; when one ends a notice says `job <id> ended · exit 0 · 4m12s`. Jobs are not agent-band rows — a job has no stream to drill into; its log is a file (`read` it, or `tail -n 50`). |
 | `/workflows` | Every run of the `workflow` tool this process has started, with per-phase progress, tokens and elapsed time — live, so safe mid-run. See [workflows.md](../workflows/#watching-it). |
 | `/cost` | Session token totals and, when the provider reports one, cost. |
 | `/btw <question>` | A side question the model answers but will not remember: one extra sample over the same cached prefix the turn uses (cache-read prices for the whole history), the answer as a muted `?` card, nothing in the transcript or the log beyond the spend. Works mid-turn. A tool call the aside wanted is reported, never run. |

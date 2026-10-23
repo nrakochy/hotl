@@ -8,6 +8,20 @@ semver promise of their own.
 
 ### Added
 
+- **`bash` can run a command in the background.** `background: true` starts
+  it as a job under the same sandbox and the same permission decision as a
+  foreground call and returns at once with the job's files — `log`, `rc`,
+  `pid` under `<session>.jobs/<id>/` — and the literal line that stops it. No
+  timeout once backgrounded unless you set one; `[behavior] max_jobs` (8)
+  caps how many run. When the job ends the model is told through a small
+  notification (exit, wall time, the last 8 KiB of the log) that never
+  interrupts a tool batch; if the session is idle it starts a turn. Esc leaves
+  jobs running; quitting kills them, unless the call said `detach: true` (a
+  server that must outlive hotl — asks like a protected write). The strip
+  shows `⚙ N`, `/jobs` lists, `/jobs stop <id>` kills; `--json` gains
+  `job_started`/`job_done`; `hotl acp` gains `session/jobs` and
+  `session/jobs/stop`. The goal loop waits for a running job before it judges.
+  `hotl gc` prunes a session's job files with it.
 - **Remote MCP servers over HTTP.** A `[[mcp]]` entry may name a `url`
   instead of a program, with a bearer token read from an environment
   variable you name (`bearer_token_env`) — never from the config file. The
@@ -146,6 +160,12 @@ semver promise of their own.
   120 s while the socket keeps pinging is dropped and the sample retried
   (same ceiling as a mid-stream disconnect); the reasoning that streamed
   stays on screen. `[provider] thinking_stall_secs` changes the number.
+
+### Fixed
+
+- **A shell command that needs longer than one call has an honest shape.**
+  0.17.0 recorded the limit that a `cmd &` is reaped with the call; `bash
+  {background: true}` is the way to keep it running.
 
 ### Changed
 

@@ -5,6 +5,17 @@ description: Run a hotl agent detached from your terminal with hotl bg, then rec
 
 Run a `hotl` agent detached from your terminal, then reconnect to it later — without tmux. Assumes a working agent ([quickstart.md](../quickstart/)).
 
+## Background jobs are not background sessions
+
+Two different things share the word:
+
+| | What it is | Verb |
+|---|---|---|
+| **Background job** | One shell command the *agent* started with `bash {background: true}` — a test suite, a build, a dev server — that keeps running while the session goes on. The agent is told when it ends; you see `⚙ N` on the strip and list them with `/jobs`. Jobs die with their session unless started with `detach: true`. See [configuration.md](../configuration/#built-in-tools) and [tui.md](../tui/). | `bash` tool, `/jobs` |
+| **Background session** | The whole *hotl process* detached from your terminal, driven over a socket from any shell you attach from. This page. | `hotl bg`, `hotl attach` |
+
+A background session can of course run background jobs; they end with it like any other session's.
+
 ## The model
 
 `hotl bg` starts the session as its **own background process** that listens on a unix socket and outlives the shell you launched it from. You `hotl attach` to drive it, disconnect whenever you like, and reattach later — from any terminal. It is not a tmux session and not a `&` job; it's a real detached process you connect to on demand.

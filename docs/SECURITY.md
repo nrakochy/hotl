@@ -328,10 +328,11 @@ Two lanes, both owner-authored in `~/.config/hotl/config.toml` — hotl does not
 |---|---|---|
 | session log (append-only JSONL, permanent by design) | `~/.local/share/hotl/sessions/` | secret masking at ingestion: values of secret-named env vars (`KEY`/`TOKEN`/`SECRET`/`PASSWORD`/`CREDENTIAL`/`AUTH`…, ≥ 8 chars) are replaced with `«masked:NAME»` — including their JSON-escaped forms — before bytes land |
 | evicted oversized tool results | `<session>.blobs/` | same masking; files written `0600`; blob filenames sanitized against path injection |
+| background job files (`cmd`, `pid`, `started`, `log`, `rc`) | `<session>.jobs/<id>/` | dir `0700`, files `0600`; `log` is written by the child process and is **not masked** — the completion notification's 8 KiB excerpt is masked like any log entry |
 
 The log carries a hash chain: replay verifies each entry chains to its parent and warns if a log was edited or truncated after being written. A secrets audit flags older logs that still contain a *current* secret value (append-only means they can't be scrubbed — the remedy is rotation, and the tool says so).
 
-Retention is explicit: `hotl gc` (with `--dry-run`) and a `[retention]` policy (`max_age_days` / `max_sessions`) prune whole sessions — log and blobs together (plus any legacy shadow repo from before 0.26). The default is keep-everything; a configured policy also runs automatically at startup.
+Retention is explicit: `hotl gc` (with `--dry-run`) and a `[retention]` policy (`max_age_days` / `max_sessions`) prune whole sessions — log, blobs and job files together (plus any legacy shadow repo from before 0.26). The default is keep-everything; a configured policy also runs automatically at startup.
 
 ## `hotl watch`
 
@@ -348,6 +349,7 @@ Installs owned by a package manager (cargo, Nix, Homebrew) and source builds are
 ## Known gaps (planned, not shipped)
 
 - **`egress = "off"` has no ask, and will not get one.** The confinement is at the kernel, with no proxy in the path to intercept a connection, so there is nothing to ask about. Documented as a limitation, not deferred as debt. (The `allowlist` ask shipped in 0.10 — see "Network egress" above.)
+- **A detached job keeps the session's egress proxy settings in its environment and loses network when the session's proxy exits.** Under `[network] egress = "allowlist"` the shell is built with the proxy env; a `detach: true` job that outlives hotl keeps pointing at a proxy that is gone. Start long-lived servers with egress open, or restart them.
 - **The egress ask does not cover stdio MCP servers.** They are spawned outside the floor, so the proxy never sees their traffic. Same non-goal as the read carve's. URL servers are covered: their connector makes the same checks `web_fetch` does, in-process.
 - **The prompt cannot make a grant permanent.** By design (a durable grant reachable by one keypress inverts the threat model), but if the paste-a-line flow proves annoying in practice this is the thing to revisit.
 - **Egress restriction is still opt-in.** The remaining blocker to flipping the default is evidence, not machinery; the gate is recorded in OPEN.md.
