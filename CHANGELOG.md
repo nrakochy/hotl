@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-10-23
+
 ### Fixed
 
 - **0.29.0 shipped no binaries and nothing to crates.io.** Its release page

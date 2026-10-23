@@ -1,7 +1,7 @@
 {
   "id": "hotl",
   "name": "hotl",
-  "version": "0.29.0",
+  "version": "0.30.0",
   "description": "Human-on-the-loop terminal AI agent: steering console + headless mode, gated tools under a kernel sandbox floor, session resume.",
   "repository": "https://github.com/nrakochy/hotl",
   "website": "https://nrakochy.github.io/hotl/",
@@ -13,7 +13,7 @@
   "distribution": {
     "binary": {
       "darwin-aarch64": {
-        "archive": "https://github.com/nrakochy/hotl/releases/download/v0.29.0/hotl-aarch64-apple-darwin.tar.gz",
+        "archive": "https://github.com/nrakochy/hotl/releases/download/v0.30.0/hotl-aarch64-apple-darwin.tar.gz",
         "cmd": "./hotl",
         "args": [
           "acp"
@@ -21,7 +21,7 @@
         "sha256": "FILL-AT-RELEASE-FROM-THE-.sha256-ASSET"
       },
       "darwin-x86_64": {
-        "archive": "https://github.com/nrakochy/hotl/releases/download/v0.29.0/hotl-x86_64-apple-darwin.tar.gz",
+        "archive": "https://github.com/nrakochy/hotl/releases/download/v0.30.0/hotl-x86_64-apple-darwin.tar.gz",
         "cmd": "./hotl",
         "args": [
           "acp"
@@ -29,7 +29,7 @@
         "sha256": "FILL-AT-RELEASE-FROM-THE-.sha256-ASSET"
       },
       "linux-aarch64": {
-        "archive": "https://github.com/nrakochy/hotl/releases/download/v0.29.0/hotl-aarch64-unknown-linux-gnu.tar.gz",
+        "archive": "https://github.com/nrakochy/hotl/releases/download/v0.30.0/hotl-aarch64-unknown-linux-gnu.tar.gz",
         "cmd": "./hotl",
         "args": [
           "acp"
@@ -37,7 +37,7 @@
         "sha256": "FILL-AT-RELEASE-FROM-THE-.sha256-ASSET"
       },
       "linux-x86_64": {
-        "archive": "https://github.com/nrakochy/hotl/releases/download/v0.29.0/hotl-x86_64-unknown-linux-gnu.tar.gz",
+        "archive": "https://github.com/nrakochy/hotl/releases/download/v0.30.0/hotl-x86_64-unknown-linux-gnu.tar.gz",
         "cmd": "./hotl",
         "args": [
           "acp"
@@ -45,7 +45,7 @@
         "sha256": "FILL-AT-RELEASE-FROM-THE-.sha256-ASSET"
       },
       "windows-x86_64": {
-        "archive": "https://github.com/nrakochy/hotl/releases/download/v0.29.0/hotl-x86_64-pc-windows-msvc.tar.gz",
+        "archive": "https://github.com/nrakochy/hotl/releases/download/v0.30.0/hotl-x86_64-pc-windows-msvc.tar.gz",
         "cmd": "./hotl.exe",
         "args": [
           "acp"
