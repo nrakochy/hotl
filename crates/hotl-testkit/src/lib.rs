@@ -633,6 +633,9 @@ fn is_subsequence(needles: &[&str], haystack: &[String]) -> bool {
 /// cross-session version of exactly what `assert_stable_cache_prefix` says
 /// within one. Asserting that from a second hand-rolled comparison would let
 /// the two definitions of "unchanged prefix" drift.
+pub mod fake_anthropic;
+pub mod tmux;
+
 pub mod wire {
     use std::sync::Arc;
 

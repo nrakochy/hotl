@@ -35,6 +35,8 @@ hotl-provider-anthropic = { path = "../hotl-provider-anthropic", version = "0.28
 # The Responses dialect's structural-prefix twin (0046) states the same claim
 # over that dialect's bytes, so the kit serializes with it too.
 hotl-provider-openai-responses = { path = "../hotl-provider-openai-responses", version = "0.28.0" }
+# The tmux smoke driver (0074) reuses the dashboard's pure argv builders.
+watch_tmux = { package = "hotl-watch-tmux", path = "../watch-tmux", version = "0.28.0" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

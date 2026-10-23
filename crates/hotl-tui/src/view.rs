@@ -24,7 +24,7 @@ use crate::wrap;
 const SETTLED_OK_GLYPH: &str = "→";
 
 // Twin of watch-tui's WORKING_FRAMES — keep in sync.
-const WORKING_FRAMES: [&str; 16] = [
+pub const WORKING_FRAMES: [&str; 16] = [
     "⠑", "⠔", "⣄", "⣠", "⡠", "⠢", "⠚", "⠜", "⠔", "⠤", "⣠", "⣄", "⢄", "⠆", "⠃", "⠑",
 ];
 
