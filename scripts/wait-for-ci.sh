@@ -23,7 +23,9 @@ set -euo pipefail
 # harness-windows runs on every push and is the only leg that exercises the
 # platform's real syscalls, so a red Windows suite must block a release — it was
 # missing here, which is how v0.12.0 shipped with it failing.
-REQUIRED=(fmt watch harness harness-windows msrv docs audit)
+# `changes` is required because the jobs after it skip when it says nothing
+# they test changed — and they skip just the same when it fails.
+REQUIRED=(fmt changes watch harness harness-windows msrv docs audit)
 
 timeout="${HOTL_CI_WAIT_TIMEOUT:-1800}"
 interval="${HOTL_CI_POLL_INTERVAL:-15}"
@@ -102,7 +104,8 @@ while :; do
     IFS=$'\t' read -r _ status conclusion url <<<"$row"
     if [ "$status" != completed ]; then
       pending="$pending $name($status)"
-    elif [ "$conclusion" = success ]; then
+    elif [ "$conclusion" = success ] || [ "$conclusion" = skipped ]; then
+      # skipped: `changes` found nothing this job tests since the last green run.
       green=$((green + 1))
     else
       # `cancelled` lands here deliberately: ci.yml runs cancel-in-progress, and

@@ -7,9 +7,12 @@ name: CI
 # Watch and harness run as separate jobs: a red
 # harness must never block a `hotl watch` hotfix, and vice versa. The binary
 # crate depends on both, so it builds in the harness job (the bigger tree).
+#
+# Pushes run on master only; a branch gets CI by opening a PR, so a PR branch
+# no longer runs every job twice (once per event).
 on:
   push:
-    branches: ["**"]
+    branches: [master]
     tags-ignore: ["**"] # tag pushes are handled by publish.yml
   pull_request:
 
@@ -19,6 +22,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read # `changes` looks up the last green run
 
 env:
   # No debuginfo beyond line tables: faster links (PDBs on Windows) and a
@@ -41,6 +45,8 @@ jobs:
         run: cargo fmt --all --check
 
   watch:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -62,6 +68,8 @@ jobs:
         run: cargo test -p hotl-theme --locked
 
   harness:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -139,6 +147,8 @@ jobs:
   # The feature variants (security-enforced, no-minify) run on Linux only:
   # neither has Windows-specific behavior, and they cost this leg ~4 minutes.
   harness-windows:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: windows-latest
     defaults:
       run:
@@ -208,6 +218,8 @@ jobs:
   # `--locked` also catches a Cargo.lock drifted from Cargo.toml, which would
   # break the nix build: buildRustPackage vendors strictly from the lockfile.
   msrv:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -238,6 +250,8 @@ jobs:
   # Docs-site build guard: catches a broken page, link, or config in site/
   # before release day (docs.yml deploys the site on `release: published`).
   docs:
+    needs: changes
+    if: needs.changes.outputs.site == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -250,33 +264,68 @@ jobs:
         run: npm ci && npm run build
         working-directory: site
 
-  # Detects whether a push touched anything the nix legs actually build, so a
-  # docs/site/changelog-only push skips two ~8-minute cold builds that could
-  # not have turned out differently. First-party only (checkout + git).
-  # Fail-open: any doubt — force push, branch creation, unreachable `before`,
-  # a non-push event — counts as a build-input change.
+  # Decides which jobs a push needs. Fail-open: any doubt — a non-push event,
+  # a base that cannot be found — runs everything. First-party only
+  # (checkout + git + gh).
+  #
+  # `rust` and `site` diff against the last green CI run on master, not the
+  # previous push: `cancel-in-progress` can kill a code push's run, and a
+  # docs push landing on top must not then skip the tests that never ran.
+  # A skipped job is green to scripts/wait-for-ci.sh, which also requires
+  # this job, so a broken `changes` cannot pass the release gate by skipping
+  # everything after it.
+  #
+  # `build-inputs` gates the nix legs and keeps its original rule (the
+  # previous push), so a docs/site/changelog-only push skips two ~13-minute
+  # cold builds that could not have turned out differently.
   changes:
     runs-on: ubuntu-latest
     outputs:
       build-inputs: ${{ steps.diff.outputs.build-inputs }}
+      rust: ${{ steps.diff.outputs.rust }}
+      site: ${{ steps.diff.outputs.site }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          sha="${{ github.sha }}"
+          usable() { [ -n "$1" ] && ! printf '%s' "$1" | grep -q '^0*$' && git cat-file -e "$1" 2>/dev/null; }
+
           before="${{ github.event.before }}"
           verdict=true
-          if [ "${{ github.event_name }}" = "push" ] && [ -n "$before" ] \
-            && ! printf '%s' "$before" | grep -q '^0*$' \
-            && git cat-file -e "$before" 2>/dev/null; then
-            if ! git diff --name-only "$before" "${{ github.sha }}" | grep -qE \
+          if [ "${{ github.event_name }}" = "push" ] && usable "$before"; then
+            if ! git diff --name-only "$before" "$sha" | grep -qE \
               '^crates/|^Cargo\.(toml|lock)$|^flake\.(nix|lock)$|^\.github/workflows/ci\.yml$'; then
               verdict=false
             fi
           fi
           echo "build-inputs=$verdict" >> "$GITHUB_OUTPUT"
+
+          rust=true
+          site=true
+          if [ "${{ github.event_name }}" = "push" ]; then
+            green="$(gh run list -R "${{ github.repository }}" --workflow ci.yml --branch master \
+              --status success --limit 1 --json headSha -q '.[0].headSha' 2>/dev/null || true)"
+            if usable "$green" && git merge-base --is-ancestor "$green" "$sha"; then
+              files="$(git diff --name-only "$green" "$sha")"
+              # Rust runs unless every changed file is prose or site content.
+              if ! printf '%s\n' "$files" | grep -qvE \
+                '^$|^site/|^docs/|^specs/|^[A-Z]+\.md$|^\.github/ISSUE_TEMPLATE/|^\.github/workflows/(docs|release|publish|nix-tag|update-flake-lock)\.yml$'; then
+                rust=false
+              fi
+              if ! printf '%s\n' "$files" | grep -qE '^site/|^\.github/workflows/ci\.yml$'; then
+                site=false
+              fi
+            fi
+          fi
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "site=$site" >> "$GITHUB_OUTPUT"
+          echo "build-inputs=$verdict rust=$rust site=$site"
 
   # Flake evaluation + build gate. `nix flake check` builds checks.package,
   # which is the package derivation with the test suite re-enabled — so this
