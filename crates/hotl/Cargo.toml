@@ -94,6 +94,9 @@ ulid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The tmux smoke (tests/tmux_smoke.rs) drives the real binary against the
+# testkit's scripted Anthropic server under a private tmux.
+hotl-testkit = { path = "../hotl-testkit", version = "0.28.0", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
