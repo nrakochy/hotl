@@ -190,12 +190,17 @@ fn usage() -> i32 {
     2
 }
 
-/// The roster with a source column, then config warnings, then a warning
-/// per registered git marketplace whose managed checkout is missing.
-fn render_list(config_dir: &Path, data_dir: &Path, cwd: &Path) -> String {
+/// The skill tool loaded the way `build_registry` loads it — same roots,
+/// same budget, same warnings — for `hotl skills list` and `hotl doctor`.
+/// The one other "loads it the way the session does" site; keep them equal.
+/// The third value is the number of roots walked.
+pub(crate) fn discover_for_cli(
+    config_dir: &Path,
+    data_dir: &Path,
+    cwd: &Path,
+) -> (Option<hotl_tools::skills::SkillTool>, Vec<String>, usize) {
     let cfg = crate::config::Config::load(config_dir);
     let (marketplaces, mut warnings) = cfg.skills.marketplace_roots(config_dir);
-    // The plugin tier, loaded exactly as `build_registry` loads it.
     let (plugins, plugin_warnings) = cfg.plugins.load(config_dir, data_dir);
     warnings.extend(plugin_warnings);
     let plugin_skills: Vec<(String, Vec<std::path::PathBuf>)> = plugins
@@ -226,6 +231,28 @@ fn render_list(config_dir: &Path, data_dir: &Path, cwd: &Path) -> String {
     };
     let (tool, skill_warnings) = hotl_tools::skills::SkillTool::with_roots(&roots);
     warnings.extend(skill_warnings);
+    let walked = roots.project_dirs.len()
+        + roots.marketplaces.len()
+        + roots.plugins.len()
+        + [
+            &roots.flat,
+            &roots.agents_user,
+            &roots.claude_user,
+            &roots.plugin_cache,
+        ]
+        .iter()
+        .filter(|r| r.is_some())
+        .count();
+    (tool, warnings, walked)
+}
+
+/// The roster with a source and flags column, the `paths:` globs, the
+/// catalog budget line, then every warning (collisions, bad frontmatter,
+/// config), then a warning per registered git marketplace whose managed
+/// checkout is missing.
+fn render_list(config_dir: &Path, data_dir: &Path, cwd: &Path) -> String {
+    let cfg = crate::config::Config::load(config_dir);
+    let (tool, warnings, _) = discover_for_cli(config_dir, data_dir, cwd);
     let mut out = String::new();
     if let Some(tool) = &tool {
         let width = tool

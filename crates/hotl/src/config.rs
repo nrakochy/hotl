@@ -2619,6 +2619,18 @@ path_prefix = "/Volumes/secrets"
     }
 
     #[test]
+    fn skills_cfg_new_keys_parse_with_defaults() {
+        let cfg = cfg_with("");
+        assert_eq!(cfg.skills.project, None);
+        assert_eq!(cfg.skills.agents, None);
+        assert_eq!(cfg.skills.catalog_tokens, None);
+        let cfg = cfg_with("[skills]\nproject = false\nagents = false\ncatalog_tokens = 800\n");
+        assert_eq!(cfg.skills.project, Some(false));
+        assert_eq!(cfg.skills.agents, Some(false));
+        assert_eq!(cfg.skills.catalog_tokens, Some(800));
+    }
+
+    #[test]
     fn skills_marketplaces_parse_and_resolve() {
         let cfg = cfg_with(
             "[skills.marketplaces]\n\

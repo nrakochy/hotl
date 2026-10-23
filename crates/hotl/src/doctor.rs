@@ -63,6 +63,10 @@ pub fn doctor_main() -> i32 {
     checks.extend(rules_check(&config_dir, rule_warnings));
     checks.push(sessions_check(&sessions_dir));
     checks.extend(mcp_check(&config_dir));
+    checks.extend(skills_check(
+        &config_dir,
+        &std::env::current_dir().unwrap_or_default(),
+    ));
     checks.extend([
         memory_check(&config_dir),
         audit_check(&sessions_dir),
@@ -524,6 +528,36 @@ fn mcp_check(config_dir: &Path) -> Vec<Check> {
     checks
 }
 
+/// The skill roster as the next session will see it (0068 T8): one `ok`
+/// line, or a `warn` per collision, unreachable skill, bad glob and budget
+/// step. Built by `skills_cli::discover_for_cli`, which loads it the way
+/// `build_registry` does.
+fn skills_check(config_dir: &Path, cwd: &Path) -> Vec<Check> {
+    let (tool, warnings, roots) =
+        crate::skills_cli::discover_for_cli(config_dir, &crate::agent::data_dir(), cwd);
+    let mut checks: Vec<Check> = warnings
+        .into_iter()
+        .map(|w| warn(format!("skills: {w}")))
+        .collect();
+    let Some(tool) = tool else {
+        checks.push(ok("skills: none discovered".into()));
+        return checks;
+    };
+    let report = tool.catalog_report();
+    checks.push(ok(format!(
+        "skills: {} discovered from {roots} roots, catalog {} bytes of {}",
+        tool.roster().count(),
+        report.bytes,
+        report.budget_bytes.unwrap_or(0)
+    )));
+    for step in &report.steps {
+        checks.push(warn(format!(
+            "skills: the roster was over its budget — {step} (raise [skills] catalog_tokens or trim a source)"
+        )));
+    }
+    checks
+}
+
 /// Grants whose server has left the config. Harmless — the fingerprint must
 /// still match — but they are the residue nothing else reports.
 fn stale_grant_checks(
@@ -607,6 +641,68 @@ mod tests {
                 format!("{tag} {}\n", c.line)
             })
             .collect()
+    }
+
+    #[test]
+    fn skills_check_warns_on_collisions_unreachable_skills_and_an_over_budget_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("repo");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        let skill = |root: &str, name: &str, extra: &str| {
+            let d = cwd.join(root).join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: d\n{extra}---\nbody\n"),
+            )
+            .unwrap();
+        };
+        skill(".agents/skills", "deploy", "");
+        skill(".claude/skills", "deploy", "");
+        skill(
+            ".agents/skills",
+            "ghost",
+            "user-invocable: false\ndisable-model-invocation: true\n",
+        );
+        skill(".agents/skills", "broken", "paths: [\"src/[**\"]\n");
+        for i in 0..20 {
+            skill(".agents/skills", &format!("filler-{i:02}"), "");
+        }
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[skills]\nclaude = false\nagents = false\ncatalog_tokens = 100\n",
+        )
+        .unwrap();
+        let out = lines(&skills_check(dir.path(), &cwd));
+        assert!(out.contains("warn skills: skill `project:deploy`"), "{out}");
+        assert!(
+            out.contains("warn skills: skill `ghost`") && out.contains("nothing can reach it"),
+            "{out}"
+        );
+        assert!(
+            out.contains("warn skills: skill `broken`: bad `paths:` glob"),
+            "{out}"
+        );
+        assert!(
+            out.contains("warn skills: the roster was over its budget — project:"),
+            "{out}"
+        );
+        assert!(
+            out.contains("ok skills: 23 discovered from 3 roots"),
+            "{out}"
+        );
+
+        // Nothing configured, nothing found: one ok line.
+        let empty = tempfile::tempdir().unwrap();
+        std::fs::write(
+            empty.path().join("config.toml"),
+            "[skills]\nclaude = false\nagents = false\nproject = false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            lines(&skills_check(empty.path(), empty.path())),
+            "ok skills: none discovered\n"
+        );
     }
 
     #[test]
