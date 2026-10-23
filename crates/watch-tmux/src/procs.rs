@@ -49,6 +49,7 @@ const HOTL_NON_AGENT_SUBCOMMANDS: &[&str] = &[
     "subscribe",
     "update",
     "schema",
+    "features",
 ];
 
 fn matched_agent_name(command: &str, agent_names: &[String]) -> Option<String> {

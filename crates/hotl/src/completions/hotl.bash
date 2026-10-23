@@ -1,5 +1,5 @@
 # hotl completion for bash — the ':' prefix plugin is zsh-only today (hotl init zsh)
-# Subcommands: watch fleet doctor resume acp bg attach approve serve setup gc mcp plugins skills workflows update init export stats schema help version
+# Subcommands: watch fleet doctor resume acp bg attach approve serve setup gc mcp plugins skills workflows update init export stats schema features help version
 _hotl_sessions() {
   hotl __sessions 2>/dev/null | cut -f1
 }
@@ -9,7 +9,7 @@ _hotl() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  local subcommands="watch doctor resume acp bg attach approve setup gc mcp plugins skills workflows update init export stats schema help version"
+  local subcommands="watch doctor resume acp bg attach approve setup gc mcp plugins skills workflows update init export stats schema features help version"
   local globals="-p --print --json --json-schema --goal --plan --ephemeral --search -r --resume --fork-from --keep --keep-turns -n --name --version --help"
   case "$prev" in
     -r|--resume|--fork-from|resume|attach|export)
@@ -27,6 +27,7 @@ _hotl() {
     export) COMPREPLY=( $(compgen -W "--md --html $(_hotl_sessions)" -- "$cur") ); return ;;
     stats) COMPREPLY=( $(compgen -W "--days --json" -- "$cur") ); return ;;
     schema) COMPREPLY=( $(compgen -W "json-stream acp" -- "$cur") ); return ;;
+    features) COMPREPLY=( $(compgen -W "--md" -- "$cur") ); return ;;
     update) COMPREPLY=( $(compgen -W "--check -y --yes --version" -- "$cur") ); return ;;
     workflows) COMPREPLY=( $(compgen -W "--mermaid" -- "$cur") ); return ;;
   esac

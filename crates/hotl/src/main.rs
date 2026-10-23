@@ -34,6 +34,8 @@ mod config;
 mod diffgen;
 mod doctor;
 mod export;
+mod features;
+mod features_cli;
 mod gc;
 mod history;
 mod images;
@@ -163,7 +165,7 @@ add-zsh-hook preexec hotl-preexec
 /// tie both to the completion scripts, so a new verb cannot land in one place
 /// only. `__sessions` is the completions' session source, hidden from help.
 #[allow(dead_code)] // read by the drift tests
-const SUBCOMMANDS: [(&str, &str); 23] = [
+const SUBCOMMANDS: [(&str, &str); 24] = [
     ("watch", "tmux agent dashboard"),
     ("fleet", "reserved (orchestrate)"),
     (
@@ -190,6 +192,7 @@ const SUBCOMMANDS: [(&str, &str); 23] = [
     ("export", "print a session transcript"),
     ("stats", "sessions, turns, tokens and cost"),
     ("schema", "print a published wire schema (json-stream, acp)"),
+    ("features", "list feature switches and their stages"),
     ("help", "show help"),
     ("version", "print the version"),
     ("__sessions", "id<TAB>name lines for completion (internal)"),
@@ -270,6 +273,7 @@ fn main() {
         Some("export") => std::process::exit(export::export_main(&args[1..])),
         Some("stats") => std::process::exit(stats::stats_main(&args[1..])),
         Some("schema") => std::process::exit(schema_cli::schema_main(&args[1..])),
+        Some("features") => std::process::exit(features_cli::features_main(&args[1..])),
         Some("mcp") => std::process::exit(mcp_cli::mcp_main(&args)),
         Some("plugins") => std::process::exit(plugins_cli::plugins_main(&args)),
         Some("skills") => std::process::exit(skills_cli::skills_main(&args)),
@@ -344,6 +348,7 @@ fn help_text() -> &'static str {
          hotl export <s>      print a session's transcript as Markdown (--html for a page); s = id, name, @last\n  \
          hotl stats           sessions, turns, tool calls, tokens and cost by model and by day (--days N, --json)\n  \
          hotl schema <w>      print a published wire schema: json-stream | acp\n  \
+         hotl features        feature switches and their stages (experimental, beta, stable, deprecated); --md\n  \
          hotl plugins         list Agent Plugins (skills + MCP); add/update/remove packages\n  \
          hotl mcp             list MCP servers and trust state; show/add/add --url/untrust/test\n  \
          hotl skills          list skills; add/update/remove marketplaces (skill sources)\n  \

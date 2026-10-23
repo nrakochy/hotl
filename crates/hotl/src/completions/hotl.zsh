@@ -1,5 +1,5 @@
 # hotl completion for zsh — printed by `hotl init zsh` after the `:` plugin.
-# Subcommands: watch fleet doctor resume acp bg attach approve serve setup gc mcp plugins skills workflows update init export stats schema help version
+# Subcommands: watch fleet doctor resume acp bg attach approve serve setup gc mcp plugins skills workflows update init export stats schema features help version
 _hotl_sessions() {
   local -a rows
   rows=(${(f)"$(hotl __sessions 2>/dev/null)"})
@@ -32,6 +32,7 @@ _hotl() {
     'export:print a session transcript'
     'stats:sessions, turns, tokens and cost'
     'schema:print a published wire schema (json-stream, acp)'
+    'features:list feature switches and their stages'
     'help:show help'
     'version:print the version'
   )
@@ -65,6 +66,7 @@ _hotl() {
         export) _arguments '1:session:_hotl_sessions' '--md[Markdown]' '--html[HTML page]' ;;
         stats) _arguments '--days[only the last N days]:days:' '--json[JSON output]' ;;
         schema) _values 'schema' json-stream acp ;;
+        features) _arguments '--md[markdown table]' ;;
         update) _arguments '--check[only look]' '(-y --yes)'{-y,--yes}'[do not ask]' '--version[install a version]:version:' ;;
         init) _arguments '1:shell:(zsh bash fish)' ;;
         mcp) _arguments '1:verb:(list show add untrust test)' ;;

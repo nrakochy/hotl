@@ -1,10 +1,10 @@
 # hotl completion for fish — the ':' prefix plugin is zsh-only today (hotl init zsh)
-# Subcommands: watch fleet doctor resume acp bg attach approve serve setup gc mcp plugins skills workflows update init export stats schema help version
+# Subcommands: watch fleet doctor resume acp bg attach approve serve setup gc mcp plugins skills workflows update init export stats schema features help version
 function __hotl_sessions
   hotl __sessions 2>/dev/null | string replace -r '\t' '\t'
 end
 function __hotl_no_subcommand
-  not __fish_seen_subcommand_from watch doctor resume acp bg attach approve setup gc mcp plugins skills workflows update init export stats schema help version
+  not __fish_seen_subcommand_from watch doctor resume acp bg attach approve setup gc mcp plugins skills workflows update init export stats schema features help version
 end
 
 complete -c hotl -f
@@ -27,6 +27,8 @@ complete -c hotl -n __hotl_no_subcommand -a export -d 'print a session transcrip
 complete -c hotl -n __hotl_no_subcommand -a stats -d 'sessions, turns, tokens and cost'
 complete -c hotl -n __hotl_no_subcommand -a schema -d 'print a published wire schema (json-stream, acp)'
 complete -c hotl -n '__fish_seen_subcommand_from schema' -a 'json-stream acp'
+complete -c hotl -n __hotl_no_subcommand -a features -d 'list feature switches and their stages'
+complete -c hotl -n '__fish_seen_subcommand_from features' -l md -d 'markdown table'
 complete -c hotl -n __hotl_no_subcommand -a help -d 'show help'
 complete -c hotl -n __hotl_no_subcommand -a version -d 'print the version'
 

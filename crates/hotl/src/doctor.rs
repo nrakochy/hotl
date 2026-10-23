@@ -93,6 +93,7 @@ pub fn doctor_main() -> i32 {
         key_helper,
         gateway,
     ]);
+    checks.extend(features_check(&config_dir));
     println!("hotl {} — doctor", env!("CARGO_PKG_VERSION"));
     let mut failed = false;
     for check in &checks {
@@ -888,5 +889,129 @@ mod tests {
         let line = probe_line("http://127.0.0.1:3456/v1", Ok(200), AuthMode::Subscription);
         assert!(!line.contains("key accepted"), "{line}");
         assert!(line.contains("reachable"), "{line}");
+    }
+}
+
+/// One `warn` per experimental, beta or deprecated switch that is on, else
+/// one `ok` line (0076 D8): the full table is `hotl features`.
+fn features_check(config_dir: &Path) -> Vec<Check> {
+    let raw = std::fs::read_to_string(config_dir.join("config.toml")).unwrap_or_default();
+    let table: toml::Table = raw.parse().unwrap_or_default();
+    feature_lines(
+        crate::features::FEATURES,
+        |k| std::env::var(k).ok(),
+        |key| config_has(&table, key),
+    )
+}
+
+/// `table.key` present in a parsed config.
+fn config_has(table: &toml::Table, key: &str) -> bool {
+    let (section, field) = key.split_once('.').unwrap_or(("", key));
+    table
+        .get(section)
+        .and_then(toml::Value::as_table)
+        .is_some_and(|t| t.contains_key(field))
+}
+
+fn feature_lines(
+    features: &[crate::features::Feature],
+    env_get: impl Fn(&str) -> Option<String>,
+    config_has: impl Fn(&str) -> bool,
+) -> Vec<Check> {
+    use crate::features::Stage;
+    let on = crate::features::set_switches(features, env_get, config_has);
+    if on.is_empty() {
+        return vec![ok(format!(
+            "features: no experimental or deprecated switches set ({} registered; \
+             `hotl features` lists them)",
+            features.len()
+        ))];
+    }
+    on.into_iter()
+        .map(|(f, set)| match (f.stage, f.replacement) {
+            (Stage::Deprecated, Some(r)) => warn(format!("feature: {set} is deprecated — use {r}")),
+            (stage, _) => warn(format!(
+                "feature: {set} is {} (since {}) — {}",
+                stage.as_str(),
+                f.since,
+                f.doc
+            )),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod feature_check_tests {
+    use super::*;
+
+    fn lines(env: &[(&str, &str)], config: &[&str]) -> Vec<(bool, String)> {
+        let env: Vec<(String, String)> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        feature_lines(
+            crate::features::FEATURES,
+            |k| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()),
+            |c| config.contains(&c),
+        )
+        .into_iter()
+        .map(|c| (matches!(c.status, Status::Warn), c.line))
+        .collect()
+    }
+
+    #[test]
+    fn features_check_warns_only_for_set_non_stable_switches() {
+        let out = lines(
+            &[
+                ("HOTL_MACOS_AUTOMATION", "allow"),
+                ("HOTL_MODEL", "claude-opus-5"),
+            ],
+            &["agents.max_depth"],
+        );
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out.iter().all(|(warned, _)| *warned));
+        assert!(
+            out[0]
+                .1
+                .contains("HOTL_MACOS_AUTOMATION=allow is experimental (since 0.5.2)"),
+            "{}",
+            out[0].1
+        );
+        assert!(
+            out[1].1.contains("[agents.max_depth] is experimental"),
+            "{}",
+            out[1].1
+        );
+    }
+
+    #[test]
+    fn features_check_is_one_ok_line_when_nothing_is_set() {
+        let out = lines(&[("HOTL_MODEL", "m")], &[]);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].0);
+        assert!(
+            out[0]
+                .1
+                .starts_with("features: no experimental or deprecated switches set"),
+            "{}",
+            out[0].1
+        );
+    }
+
+    #[test]
+    fn a_deprecated_switch_names_its_replacement() {
+        let out = lines(&[("HOTL_OPENAI_BASE_URL", "http://x")], &[]);
+        assert_eq!(
+            out[0].1,
+            "feature: HOTL_OPENAI_BASE_URL=http://x is deprecated — use HOTL_PROVIDER_BASE_URL"
+        );
+    }
+
+    #[test]
+    fn config_has_reads_a_dotted_key() {
+        let t: toml::Table = "[agents]\nmax_depth = 2\n".parse().unwrap();
+        assert!(config_has(&t, "agents.max_depth"));
+        assert!(!config_has(&t, "agents.max_children"));
+        assert!(!config_has(&t, "provider.cache_warming"));
     }
 }
