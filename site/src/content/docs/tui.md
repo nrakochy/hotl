@@ -320,7 +320,7 @@ own.
 | `/review [target]` | Spawn the built-in read-only reviewer on a file, a diff, a commit range, or (bare) the working tree, and relay its findings. A built-in, so a skill named `review` is shadowed — rename the skill. See [agents.md](../agents/#reviewing-with-review). |
 | `/clear` | Clear the **transcript view**. The session log and the model's context are untouched. |
 | `/quit` | Leave the console (the session log is already on disk). |
-| `/<skill> [args]` | Load one of your skills by name and follow it, with the rest of the line passed as arguments — any attached images ride along too. |
+| `/<skill> [args]` | Load one of your skills by name and follow it, with the rest of the line passed as arguments — they fill the body's `$ARGUMENTS` / `$1` placeholders at load ([skills.md](../skills/#forcing-one-yourself)) — and any attached images ride along too. |
 | `/<workflow> [args]` | Run a saved workflow recipe (`~/.config/hotl/workflows/<name>.toml`) with the rest of the line as its arguments. Names resolve builtin → skill → workflow, so a recipe named like a skill is unreachable here (and hidden from completion); rename it. |
 
 Typing `/` opens a menu of every command and skill, filtered as you keep

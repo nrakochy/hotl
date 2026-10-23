@@ -11,27 +11,76 @@ text enters the conversation only at the moment the agent loads it.
 
 ## Where skills come from
 
-Five kinds of root, read in place:
+Eight roots, read in place and in this order:
 
-| Root | What it is |
-|---|---|
-| `~/.config/hotl/skills/*.md` | Your own flat files — one procedure per file. |
-| `[plugins.sources]` entries | [Agent Plugins](../plugins/) — each plugin's `skills/*/SKILL.md`, the primary package lane. |
-| `[skills.marketplaces]` entries | Registered git checkouts or local dirs, walked for `SKILL.md` (see [marketplaces](#skill-marketplaces)). |
-| `~/.claude/skills/<name>/SKILL.md` | Your Claude Code skills. |
-| `~/.claude/plugins/cache/…/skills/<name>/SKILL.md` | Claude Code plugin skills — highest installed version per plugin. |
+| # | Root | Shown as | Also addressable as |
+|---|---|---|---|
+| 0 | `~/.config/hotl/skills/*.md` | `hotl` | — |
+| 1 | `<dir>/.agents/skills/<name>/SKILL.md` for each `dir` from the working directory up to the repo root, nearest first | `project` | `project:<name>` |
+| 2 | `<dir>/.claude/skills/<name>/SKILL.md`, the same walk | `project` | `project:<name>` |
+| 3 | `[plugins.sources]` entries — [Agent Plugins](../plugins/), each plugin's `skills/*/SKILL.md` | `<plugin>` | `<plugin>:<name>` |
+| 4 | `[skills.marketplaces]` entries — registered git checkouts or local dirs, walked for `SKILL.md` (see [marketplaces](#skill-marketplaces)) | `<marketplace>` | `<marketplace>:<name>` |
+| 5 | `~/.agents/skills/<name>/SKILL.md` — the directory Codex, Gemini, Goose, Pi, OpenCode and Copilot also read | `agents` | — |
+| 6 | `~/.claude/skills/<name>/SKILL.md` — your Claude Code skills | `claude` | — |
+| 7 | `~/.claude/plugins/cache/…/skills/<name>/SKILL.md` — Claude Code plugin skills, highest installed version per plugin | `claude:<plugin>` | `<plugin>:<name>` |
+
+A repo carries its own skills under `.agents/skills` or `.claude/skills`. The
+walk starts at the working directory and stops at the repo root (the nearest
+directory holding `.git`; with no `.git` anywhere, the working directory
+alone), so a skill in a parent checkout never loads. The nearest directory
+wins a name inside the project tier.
 
 Claude-format skills load **in place** — no porting, no copying. The body
 loads on demand prefixed with its base directory so `references/` and
 `scripts/` paths resolve (scripts still run through the normal bash gate and
-sandbox). Bare names resolve by precedence — hotl's own skills, then your
-plugins, then your marketplaces, then your Claude skills, then Claude
-plugins — and a plugin or marketplace skill is always *also* addressable as
-`source:skill`, which is the only form when its bare name is taken. Opt out
-of the Claude roots with:
+sandbox). A bare name goes to the first root in the table that has it; your
+own flat files always win, so a cloned repo cannot redirect `/deploy`. Every
+root below the first keeps its `source:skill` alias, which is the only form
+when the bare name is taken. Two roots that can only claim bare names
+(`agents`, `claude`) lose a taken name outright. Either way the loser is
+reported, never dropped in silence: `hotl skills list`, `hotl doctor` and the
+startup warnings all print
+`skill \`deploy\`: project …/.claude/skills/deploy shadowed by project …/.agents/skills/deploy`.
+
+Switch roots off in `[skills]`:
 
     [skills]
-    claude = false
+    project = false   # no .agents/skills or .claude/skills from the repo
+    agents = false    # no ~/.agents/skills
+    claude = false    # no ~/.claude/skills, no Claude plugin skills
+
+## Frontmatter hotl reads
+
+A `SKILL.md` starts with a `---` fence. hotl reads these keys and ignores
+the rest; a flat `~/.config/hotl/skills/*.md` file has no frontmatter and
+takes its description from its first line.
+
+| Key | Effect |
+|---|---|
+| `name` | The skill's name. Letters, digits, `.`, `_`, `-`, alphanumeric first, at most 64 characters; anything else falls back to the directory name with a warning. |
+| `description` | What the skill is for — what `{"query"}` searches and what the `/` menu shows. |
+| `paths` | Globs (`src/**`, `*.toml`, `crates/*/src/**`) the skill applies to: an inline list, a comma-separated string, or `- item` lines. See [Skills that follow the path](#skills-that-follow-the-path). |
+| `disable-model-invocation` | `true` hides the skill from the model's index, the full listing, `{"query"}` and `{"source"}`. It still loads by exact name, which is what `/<skill>` does. |
+| `user-invocable` | `false` takes the skill out of the `/` menu and the editor's skill list. The model still sees and loads it. Both flags set is a skill nothing can reach — `hotl doctor` says so. |
+| `argument-hint` | Opts a `SKILL.md` into [`$ARGUMENTS` substitution](#forcing-one-yourself). Flat files substitute without it. |
+
+Booleans are `true` or `false`; anything else keeps the default and warns.
+
+## Skills that follow the path
+
+A skill with `paths:` stays out of the always-sent index for the whole
+session — showing it after the first touch would change the cached prefix
+mid-session. Instead, the first time a tool reads or edits a file one of its
+globs covers, one short harness-written line enters the transcript:
+
+    Skill `rusty` applies to `src/lib.rs`. Load it with skill{"name":"rusty"} if it fits the task.
+
+Once per skill per session, counted under harness injections in `/context`.
+The line never quotes the skill's own text, so a repo skill cannot inject
+through it. Globs are relative to the working directory; a path outside it
+never matches. The skill is still reachable by exact name, `{"query"}` and
+`{"source"}`, and in the `/` menu. A glob that does not parse is a warning,
+and the skill behaves as a plain one.
 
 ## The design: three stages of disclosure
 
@@ -49,6 +98,16 @@ roster of names and descriptions took 980. More important than today's
 number is the shape: the index grows per **source**, not per skill, so
 registering a 300-skill marketplace adds one line to every request, not 300
 names.
+
+**The catalog budget.** The index also has a ceiling: `[skills]
+catalog_tokens`, by default 2 % of the session model's context window
+(never below 400 tokens, never above 10,000). When the index would be
+larger, it is squeezed one rung at a time, lowest root in the table first,
+until it fits: a source collapses to three names and a count, then to a
+bare count, then leaves the index with a trailer saying how many sources
+`{"query"}` still reaches. Your own flat root never moves. `hotl skills
+list` prints the budget and every rung taken (`catalog: 812 bytes of 1200
+(0 steps)`), and `hotl doctor` warns when any was.
 
 **Stage 2 — descriptions on request.** From the index the agent has three
 moves:
@@ -99,6 +158,11 @@ same provenance-tagged envelope as every other untrusted input —
 `<skill name="…" trust="untrusted">`, with closing-tag sequences
 neutralized so content cannot break out of it — and carry a reminder that
 a skill cannot authorize tool use or override what you say in the session.
+A project skill is no different: a cloned repo's `.agents/skills` is text
+under the same envelope, and the one line a `paths:` skill can place on its
+own is written by hotl, not by the skill. The write side is covered too — a
+write under `.agents/` or `.claude/` is an execute-later path, so the model
+cannot plant a project skill under `bypass` without the ⚑ notice.
 Everything a skill asks for still passes the ordinary
 [permission gate and sandbox](../permissions-and-sandbox/). A body past the
 eviction threshold is moved to a file like any oversized tool result, with
@@ -116,6 +180,22 @@ skill, with the rest of the line passed along as arguments. An unrecognised
 name stays an unknown-command notice and never reaches the model. This is
 the manual override for the times the agent doesn't think to search — see
 [tui.md](../tui/) for the `/` menu.
+
+The arguments reach the skill body. The prompt tells the model to call
+`skill{"name":"brainstorming","arguments":"redesign the skill system"}`, and
+at load the body's placeholders are filled:
+
+| Placeholder | Becomes |
+|---|---|
+| `$ARGUMENTS`, `$@` | The whole argument string. |
+| `$1` … `$9` | One word each — split on whitespace, with `"quoted words"` kept together. A missing word is empty. |
+| `${2:-staging}` | Word 2, or `staging` when there is none. |
+
+Any other `$` is left alone. Your flat `~/.config/hotl/skills/*.md` files
+always substitute; a `SKILL.md` substitutes only when its frontmatter has
+`argument-hint:`, because a shared skill may carry a literal `$1` inside a
+shell snippet. With no arguments the body is served as written, placeholders
+and all, so the model sees what the skill expects.
 
 ## Skill marketplaces
 
@@ -140,7 +220,7 @@ layouts both work. A skill whose bare name is taken stays addressable as
 
 | Command | What it does |
 |---|---|
-| `hotl skills` | List every discovered skill with its source and full description — the human view never collapses. |
+| `hotl skills` | List every discovered skill with its source, its flags (`model-hidden`, `user-hidden`, `paths`, `args`) and full description — the human view never collapses — then its `paths:` globs, the catalog budget line, and every warning (name collisions, bad frontmatter, unreachable skills). |
 | `hotl skills add <name> <url\|path>` | Register a marketplace (clones a git URL; a local path is read in place). |
 | `hotl skills update [name]` | Refresh one git marketplace, or all of them. |
 | `hotl skills remove <name>` | Unregister a marketplace. |

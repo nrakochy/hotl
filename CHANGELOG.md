@@ -8,6 +8,30 @@ semver promise of their own.
 
 ### Added
 
+- **A repo can carry its own skills.** `.agents/skills/<name>/SKILL.md` and
+  `.claude/skills/<name>/SKILL.md` load from the working directory up to the
+  repo root, nearest first, shown as `project` and always addressable as
+  `project:<name>`; `~/.agents/skills` — the directory Codex, Gemini, Goose
+  and friends read — loads too. Your own `~/.config/hotl/skills` still wins
+  every bare name, so a cloned repo cannot redirect `/deploy`. `[skills]
+  project = false` and `agents = false` switch the new roots off.
+- **A skill with `paths:` follows the files.** It stays out of the always-sent
+  index; the first time a tool touches a matching path, one harness-written
+  line names it (`Skill \`rusty\` applies to \`src/lib.rs\` …`), once per
+  skill per session. Globs are relative to the working directory.
+- **`disable-model-invocation` and `user-invocable` are honored.** The first
+  hides a skill from the model's index, listing and search (it still loads
+  by exact name, so `/<skill>` works); the second takes it out of the `/`
+  menu. `argument-hint` is read too.
+- **`/<skill> args` fills the body's `$ARGUMENTS`.** `$ARGUMENTS`/`$@`, `$1`…`$9`
+  and `${N:-default}` are substituted at load — always for your flat files,
+  for a `SKILL.md` only when it declares `argument-hint`. The `skill` tool
+  gained an `arguments` input.
+- **The skill index has a budget.** `[skills] catalog_tokens` (default 2 % of
+  the window, 400..10,000) caps the always-sent index; over it, sources
+  collapse one rung at a time, lowest root first, and your own flat root
+  never moves. `hotl skills list` prints the budget and each rung taken;
+  `hotl doctor` warns when any was.
 - **`/model <provider/model>` switches the session model.** Also
   `session/set_model` under `hotl acp`. The switch lands on the turn
   boundary — queued while a turn runs, never mid-turn — and is written to the
@@ -104,6 +128,12 @@ semver promise of their own.
 
 ### Changed
 
+- **A skill name collision is warned, not silent.** Two roots offering the
+  same name used to drop the loser without a word; now `hotl skills list`,
+  `hotl doctor` and the startup warnings name both paths. A frontmatter
+  `name:` that fails the name grammar falls back to the directory name with
+  a warning, and a write under `.agents/` is an execute-later path like
+  `.claude/`.
 - **The stream idle watchdog is 90 s, not 300 s.** Anthropic pings every
   10–15 s, so 90 s of silence is a dead socket, not a thinking model.
   `[provider] stream_idle_secs` overrides it (floor 15 s).

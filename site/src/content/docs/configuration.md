@@ -119,7 +119,10 @@ api_key_env = "SEARCH_KEY"      # name of an env var holding the key (never the 
 result_cap = 8                  # max results per search (default 8)
 
 [skills]                    # skill roots (see skills.md)
+project = true              # false: skip the repo's .agents/skills and .claude/skills
+agents = true               # false: skip ~/.agents/skills
 claude = true               # false: skip ~/.claude/skills and Claude plugin skills
+catalog_tokens = 800        # ceiling for the always-sent skill index; absent = 2% of the window (400..10000)
 
 [skills.marketplaces]       # extra skill sources — managed by `hotl skills`
 acme = "https://github.com/acme/skills.git"   # managed checkout
@@ -238,13 +241,16 @@ These are fixed for the life of the process; restart to change them:
 
 ### Skills (`[skills]`)
 
-Two keys. Everything else about skills — the grouped index the agent sees,
+Five keys. Everything else about skills — the grouped index the agent sees,
 search over collapsed sources, bodies read on demand, marketplaces, and the
 `/` dispatch — lives in [skills.md](../skills/).
 
 | Key | Effect |
 |---|---|
+| `project` | `false` stops the project walk — `.agents/skills` and `.claude/skills` from the working directory up to the repo root (default `true`). |
+| `agents` | `false` stops reading `~/.agents/skills` (default `true`). |
 | `claude` | `false` stops reading `~/.claude/skills` and Claude plugin skills (default `true`). |
+| `catalog_tokens` | Token ceiling for the always-sent skill index; absent = 2 % of the model's context window, floor 400, cap 10,000. See [the catalog budget](../skills/#the-design-three-stages-of-disclosure). |
 | `[skills.marketplaces]` | One `name = "<git url or local path>"` per extra skill source; managed by `hotl skills add` / `update` / `remove`. |
 
 ### Built-in tools
