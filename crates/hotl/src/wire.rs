@@ -17,7 +17,9 @@
 
 use hotl_engine::{EngineEvent, Outcome};
 use hotl_provider::catalog;
-use hotl_types::TokenUsage;
+use hotl_types::{Todo, TokenUsage};
+use schemars::JsonSchema;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 /// Stable schema version of the `-p --json` event stream (an MD Tier-1
@@ -32,339 +34,609 @@ use serde_json::{json, Value};
 /// carries an `Item`, so nothing in this vocabulary changed.
 pub const JSON_STREAM_SCHEMA_VERSION: u32 = 2;
 
+/// One `-p --json` frame (and, via `update_frame`, every ACP update body that
+/// mirrors one). Field order is the wire order: under `serde_json`'s
+/// `preserve_order` (on in the default build) a struct serializes in
+/// declaration order, so each variant lists its keys as the old literals did
+/// (0076 D2). Omitted-not-null fields are `Option` + `skip_serializing_if`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Frame {
+    /// Streamed answer text.
+    TextDelta { text: String },
+    /// Streamed reasoning text.
+    ThinkingDelta { text: String },
+    /// A tool call started; `id` is the provider's `tool_use` id.
+    ToolStart {
+        id: String,
+        name: String,
+        summary: String,
+    },
+    /// A tool call finished; `lines`/`bytes` count the result the model got.
+    ToolDone {
+        id: String,
+        name: String,
+        ok: bool,
+        lines: u64,
+        bytes: u64,
+    },
+    /// The goal evaluator is judging the turn just finished.
+    GoalEvaluating { turn: u32 },
+    /// A call waits for a concurrency permit behind `ahead` others.
+    ToolQueued {
+        id: String,
+        name: String,
+        summary: String,
+        ahead: usize,
+    },
+    /// A fold of `items` history items is starting.
+    Compacting { items: usize },
+    /// Liveness of a running tool: the tail of its output so far.
+    ToolProgress {
+        id: String,
+        name: String,
+        tail: String,
+        lines: u64,
+        bytes: u64,
+    },
+    /// The model is writing tool-call input: `calls` calls, `bytes` so far.
+    ToolInputProgress { calls: u32, bytes: u64 },
+    /// A call was denied before it ran.
+    ToolDenied { id: String, name: String },
+    /// A call ran without an ask because an allow rule matched.
+    ToolAutoAllowed {
+        id: String,
+        name: String,
+        rule: String,
+    },
+    /// A protected-class call ran or was refused under bypass, with a notice.
+    ToolFlagged {
+        id: String,
+        name: String,
+        summary: String,
+        why: String,
+        denied: bool,
+    },
+    /// A sub-agent's tool activity; `ok` only on the done phase.
+    ChildTool {
+        parent_id: String,
+        id: String,
+        name: String,
+        summary: String,
+        phase: ChildPhase,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ok: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tokens: Option<u64>,
+    },
+    /// A sub-agent's own words.
+    ChildText { parent_id: String, text: String },
+    /// One turn's delegation summary.
+    Delegation {
+        subagent_runs: u32,
+        duplicate_work_paths: u32,
+        false_completions: u32,
+        usage: TokenUsage,
+        tool_calls: u64,
+    },
+    /// A cache keep-alive ping was billed.
+    CacheWarm {
+        usage: TokenUsage,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+    },
+    /// A request is being retried after `delay_ms`.
+    Retrying {
+        attempt: u32,
+        max: u32,
+        reason: String,
+        delay_ms: u64,
+        scope: RetryScopeTag,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        #[schemars(default)]
+        discarded_partial: bool,
+    },
+    /// The turn moved to a fallback model.
+    FallbackModel { model: String },
+    /// A prompt was queued behind the running turn.
+    PromptQueued,
+    /// Session spend crossed `pct` of `max_cost_usd`.
+    BudgetNotice {
+        pct: u8,
+        used_usd: f64,
+        cap_usd: f64,
+    },
+    /// A fold finished.
+    Compacted {
+        degraded: bool,
+        usage: TokenUsage,
+        estimate: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        focus: Option<String>,
+    },
+    /// A requested fold had nothing to fold.
+    FoldSkipped { reason: String },
+    /// The session's model changed; `context_tokens` is the cold-cache rebuild.
+    ModelChanged {
+        model: String,
+        previous: String,
+        context_tokens: u64,
+        context_window: u64,
+    },
+    /// The context ladder cleared `count` old tool results.
+    Cleared { count: usize },
+    /// The todo list changed.
+    TodosChanged { items: Vec<Todo> },
+    /// The model presented a plan.
+    PlanPresented {
+        summary: String,
+        nodes: Vec<Todo>,
+        path: Option<String>,
+    },
+    /// The goal was set (or cleared: `null`).
+    GoalChanged { goal: Option<String> },
+    /// A memory note was written.
+    MemoryChanged {
+        note: String,
+        date: String,
+        bytes: usize,
+        path: String,
+    },
+    /// A background job started.
+    JobStarted {
+        id: Option<String>,
+        job: String,
+        pid: u32,
+        command: String,
+        detached: bool,
+    },
+    /// A background job ended.
+    JobDone {
+        id: Option<String>,
+        job: String,
+        rc: String,
+        secs: u64,
+        stopped_by: Option<String>,
+    },
+    /// The session got a generated title (omitted when none was usable).
+    SessionTitled {
+        usage: TokenUsage,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    /// A `/btw` side question was answered.
+    AsideResult {
+        question: String,
+        text: String,
+        usage: TokenUsage,
+    },
+    /// A `/btw` side question failed.
+    AsideFailed { question: String, reason: String },
+    /// The goal evaluator's verdict; `usage` is the goal loop's spend.
+    GoalVerdict {
+        verdict: GoalVerdictTag,
+        reason: String,
+        turns: u32,
+        usage: TokenUsage,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        evidence: Option<Vec<String>>,
+    },
+    /// The loop ledger's per-turn profile.
+    LedgerReport {
+        sample_count: usize,
+        overhead_p50_ns: u64,
+        overhead_p99_ns: u64,
+        max_rss_bytes: u64,
+        phase_deltas: Vec<hotl_engine::PhaseDeltaSummary>,
+    },
+    /// The turn ended (`-p --json` only; ACP carries it as the prompt result).
+    TurnDone {
+        outcome: OutcomeFrame,
+        usage: UsageFrame,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mispredictions: Option<u32>,
+    },
+    /// Headless has no human: an ask was denied.
+    AskDenied { summary: String },
+    /// Headless has no human: a question went unanswered.
+    QuestionNoHuman {
+        header: String,
+        prompt: String,
+        options: Vec<hotl_types::QuestionOption>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildPhase {
+    Start,
+    Done,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryScopeTag {
+    Sample,
+    Summarize,
+    GoalEval,
+    Title,
+    Aside,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalVerdictTag {
+    NotYet,
+    Met,
+    Impossible,
+    EvalFailed,
+    Stalled,
+    #[serde(rename = "error")]
+    Errored,
+}
+
+/// A turn outcome, tagged by `kind`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OutcomeFrame {
+    Done {
+        text: String,
+    },
+    Cancelled,
+    TurnLimit,
+    Refused,
+    DoomLoop {
+        pattern: String,
+    },
+    ToolFailureBudget {
+        tool: String,
+    },
+    /// `message` names the knob, for clients that show an outcome's text.
+    DenialSpiral {
+        consecutive: u32,
+        total: u32,
+        message: String,
+    },
+    Budget {
+        budget: String,
+        used: f64,
+        cap: f64,
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// `TokenUsage` plus the derived `hit_ratio` and `cost_usd`, each omitted
+/// when there is nothing to report.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct UsageFrame {
+    #[serde(flatten)]
+    pub usage: TokenUsage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hit_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+/// One `-p --json` line: a frame plus the stream's schema version. The
+/// version is last, as the old renderer appended it.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct JsonStreamLine {
+    #[serde(flatten)]
+    pub frame: Frame,
+    /// Always the current `JSON_STREAM_SCHEMA_VERSION`.
+    pub schema_version: u32,
+}
+
 /// Streamable events, as clients see them. `None` = not a stream frame
 /// (`Ask`/`Question` are round-trips; `TurnDone` is a result) — those callers
 /// build their own envelope.
 pub fn update_frame(event: &EngineEvent) -> Option<Value> {
-    Some(match event {
-        EngineEvent::TextDelta(t) => json!({"type": "text_delta", "text": t}),
-        EngineEvent::ThinkingDelta(t) => json!({"type": "thinking_delta", "text": t}),
-        // `id` is the provider's `tool_use` id (0037) — additive, so
-        // `JSON_STREAM_SCHEMA_VERSION` stands (same ruling as the goal
-        // frames). It is what lets a client pair a `tool_done` with its own
-        // `tool_start` when N same-name calls run concurrently.
-        EngineEvent::ToolStart { id, name, summary } => {
-            json!({"type": "tool_start", "id": id, "name": name, "summary": summary})
-        }
-        // 0061 T1: `lines`/`bytes` count the result the model receives.
-        // Always present — a surface reads "no counts" as an older peer.
-        EngineEvent::ToolDone {
-            id,
-            name,
-            ok,
-            lines,
-            bytes,
-        } => {
-            json!({"type": "tool_done", "id": id, "name": name, "ok": ok, "lines": lines, "bytes": bytes})
-        }
-        EngineEvent::GoalEvaluating { turn } => {
-            json!({"type": "goal_evaluating", "turn": turn})
-        }
-        EngineEvent::ToolQueued {
-            id,
-            name,
-            summary,
-            ahead,
-        } => {
-            json!({"type": "tool_queued", "id": id, "name": name, "summary": summary, "ahead": ahead})
-        }
-        EngineEvent::Compacting { items } => {
-            json!({"type": "compacting", "items": items})
-        }
-        // Liveness only (0061 T13): never persisted, additive — the
-        // `child_tool` ruling, for the same reason.
-        EngineEvent::ToolProgress {
-            id,
-            name,
-            tail,
-            lines,
-            bytes,
-        } => {
-            json!({"type": "tool_progress", "id": id, "name": name, "tail": tail, "lines": lines, "bytes": bytes})
-        }
-        // 0062 T3. Additive — `JSON_STREAM_SCHEMA_VERSION` stands (0037 ruling).
-        EngineEvent::ToolInputProgress { calls, bytes } => {
-            json!({"type": "tool_input_progress", "calls": calls, "bytes": bytes})
-        }
-        EngineEvent::ToolDenied { id, name } => {
-            json!({"type": "tool_denied", "id": id, "name": name})
-        }
-        EngineEvent::ToolAutoAllowed { id, name, rule } => {
-            json!({"type": "tool_auto_allowed", "id": id, "name": name, "rule": rule})
-        }
-        EngineEvent::ToolFlagged {
-            id,
-            name,
-            summary,
-            why,
-            denied,
-        } => {
-            json!({"type": "tool_flagged", "id": id, "name": name, "summary": summary, "why": why, "denied": denied})
-        }
-        // Forwarded sub-agent tool activity (0039 D1). `phase` is explicit and
-        // `ok` rides only the done frame (omitted-not-null, the `hit_ratio`
-        // precedent) so later phases (text/thinking) fit without reshaping.
-        // Additive — `JSON_STREAM_SCHEMA_VERSION` stands (0037 ruling).
-        EngineEvent::ChildTool {
-            parent_id,
-            id,
-            name,
-            summary,
-            ok,
-            tokens,
-        } => {
-            let mut v = json!({
-                "type": "child_tool",
-                "parent_id": parent_id,
-                "id": id,
-                "name": name,
-                "summary": summary,
-                "phase": if ok.is_some() { "done" } else { "start" },
-            });
-            if let Some(ok) = ok {
-                v["ok"] = json!(ok);
-            }
-            if let Some(tokens) = tokens {
-                v["tokens"] = json!(tokens);
-            }
-            v
-        }
-        // A child's own words on the parent stream (0058 T2). Additive, so
-        // `JSON_STREAM_SCHEMA_VERSION` stands (the 0037 ruling).
-        EngineEvent::ChildText { parent_id, text } => {
-            json!({"type": "child_text", "parent_id": parent_id, "text": text})
-        }
-        EngineEvent::Delegation {
-            subagent_runs,
-            duplicate_work_paths,
-            false_completions,
-            usage,
-            tool_calls,
-        } => json!({
-            "type": "delegation",
-            "subagent_runs": subagent_runs,
-            "duplicate_work_paths": duplicate_work_paths,
-            "false_completions": false_completions,
-            "usage": usage,
-            "tool_calls": tool_calls,
-        }),
-        // A cache keep-alive ping (0073 D6). Additive: the version stands;
-        // `cost_usd` omitted when the model has no price.
-        EngineEvent::CacheWarmed { usage, cost_usd } => {
-            let mut v = json!({"type": "cache_warm", "usage": usage});
-            if let Some(c) = cost_usd {
-                v["cost_usd"] = json!(c);
-            }
-            v
-        }
-        EngineEvent::Retrying {
-            attempt,
-            max,
-            reason,
-            delay_ms,
-            status,
-            request_id,
-            scope,
-            discarded_partial,
-        } => {
-            let mut v = json!({
-                "type": "retrying",
-                "attempt": attempt,
-                "max": max,
-                "reason": reason,
-                "delay_ms": delay_ms,
-                "scope": retry_scope_tag(*scope),
-            });
-            // Omitted, not `null`, when the error carried no status.
-            if let Some(status) = status {
-                v["status"] = json!(status);
-            }
-            // Same rule: the id is there when the provider sent one.
-            if let Some(id) = request_id {
-                v["request_id"] = json!(id);
-            }
-            // Omitted, not `null`, when there is nothing to take back — the
-            // same additive rule `usage_frame` follows.
-            if *discarded_partial {
-                v["discarded_partial"] = json!(true);
-            }
-            v
-        }
-        EngineEvent::FallbackModel { model } => {
-            json!({"type": "fallback_model", "model": model})
-        }
-        EngineEvent::PromptQueued => json!({"type": "prompt_queued"}),
-        // Additive (0037 ruling): `JSON_STREAM_SCHEMA_VERSION` stands.
-        EngineEvent::BudgetNotice {
-            pct,
-            used_usd,
-            cap_usd,
-        } => {
-            json!({"type": "budget_notice", "pct": pct, "used_usd": used_usd, "cap_usd": cap_usd})
-        }
-        // `focus` omitted when none (the `hit_ratio` rule); `usage` is the
-        // raw `TokenUsage`, `estimate` the post-fold projection size (0066).
-        EngineEvent::Compacted {
-            degraded,
-            focus,
-            usage,
-            estimate,
-        } => {
-            let mut v = json!({
-                "type": "compacted",
-                "degraded": degraded,
-                "usage": usage,
-                "estimate": estimate,
-            });
-            if let Some(f) = focus {
-                v["focus"] = json!(f);
-            }
-            v
-        }
-        EngineEvent::FoldSkipped { reason } => json!({"type": "fold_skipped", "reason": reason}),
-        // Additive (0067): the next request runs `model`; `context_tokens` is
-        // what the cold prompt cache rebuilds.
-        EngineEvent::ModelChanged {
-            model,
-            previous,
-            context_tokens,
-            context_window,
-        } => json!({
-            "type": "model_changed",
-            "model": model,
-            "previous": previous,
-            "context_tokens": context_tokens,
-            "context_window": context_window,
-        }),
-        EngineEvent::Cleared { count } => json!({"type": "cleared", "count": count}),
-        EngineEvent::TodosChanged { items } => json!({"type": "todos_changed", "items": items}),
-        // 0056 T3. `nodes` carries the same `Todo` shape `todos_changed`
-        // does — a client that renders one renders the other.
-        EngineEvent::PlanPresented {
-            summary,
-            nodes,
-            path,
-        } => json!({
-            "type": "plan_presented",
-            "summary": summary,
-            "nodes": nodes,
-            "path": path,
-        }),
-        EngineEvent::GoalChanged { condition } => {
-            json!({"type": "goal_changed", "goal": condition})
-        }
-        EngineEvent::MemoryChanged {
-            note,
-            date,
-            bytes,
-            path,
-        } => json!({
-            "type": "memory_changed", "note": note, "date": date, "bytes": bytes, "path": path
-        }),
-        EngineEvent::JobStarted {
-            id,
-            job,
-            pid,
-            command,
-            detached,
-        } => json!({
-            "type": "job_started", "id": id, "job": job, "pid": pid, "command": command,
-            "detached": detached
-        }),
-        EngineEvent::JobDone {
-            id,
-            job,
-            rc,
-            secs,
-            stopped_by,
-        } => json!({
-            "type": "job_done", "id": id, "job": job, "rc": rc, "secs": secs,
-            "stopped_by": stopped_by
-        }),
-        // `title` is omitted, not null, when the call produced nothing usable;
-        // the spend still rides so a surface's totals stay true.
-        EngineEvent::SessionTitled { title, usage } => {
-            let mut v = json!({"type": "session_titled", "usage": usage});
-            if let Some(t) = title {
-                v["title"] = json!(t);
-            }
-            v
-        }
-        EngineEvent::AsideDone {
-            question,
-            text,
-            usage,
-        } => json!({"type": "aside_result", "question": question, "text": text, "usage": usage}),
-        EngineEvent::AsideFailed { question, reason } => {
-            json!({"type": "aside_failed", "question": question, "reason": reason})
-        }
-        // `usage` is the goal loop's cumulative spend, the evaluator's own
-        // calls included — the raw `TokenUsage` shape, not `usage_frame`'s:
-        // `update_frame` has no session model to price it with, and the
-        // surfaces that render this line show tokens, not dollars.
-        EngineEvent::GoalVerdict {
-            verdict,
-            reason,
-            turns,
-            usage,
-            evidence,
-        } => {
-            let mut v = json!({
-                "type": "goal_verdict",
-                "verdict": goal_verdict_tag(*verdict),
-                "reason": reason,
-                "turns": turns,
-                "usage": usage,
-            });
-            // Omitted, not `[]`, when nothing was observed — the same
-            // additive rule the rest of this module follows.
-            if !evidence.is_empty() {
-                v["evidence"] = json!(evidence);
-            }
-            v
-        }
-        // §S1 telemetry: a normal tagged frame (not a round-trip/result like
-        // `Ask`/`Question`/`TurnDone`) — headline numbers plus the per-phase
-        // deltas (9 small rows, the point of a wall-clock profiler). Only the
-        // raw `samples` array stays in-process.
-        EngineEvent::LedgerReport(summary) => json!({
-            "type": "ledger_report",
-            "sample_count": summary.sample_count,
-            "overhead_p50_ns": summary.overhead_p50_ns,
-            "overhead_p99_ns": summary.overhead_p99_ns,
-            "max_rss_bytes": summary.max_rss_bytes,
-            "phase_deltas": summary.phase_deltas,
-        }),
-        EngineEvent::Ask { .. }
-        | EngineEvent::Question { .. }
-        // `EgressAsk` is a round-trip like `Ask`, and the JSON stream is the
-        // headless surface, which has no human to answer it — see
-        // `render_json`, where it default-denies.
-        | EngineEvent::EgressAsk { .. }
-        | EngineEvent::TurnDone { .. } => return None,
-    })
+    Frame::stream(event).map(|f| serde_json::to_value(f).expect("a frame always serializes"))
+}
+
+impl Frame {
+    /// The stream frame for an event; `None` for the round-trips and the
+    /// turn result (see [`json_frame`]).
+    pub fn stream(event: &EngineEvent) -> Option<Frame> {
+        Some(match event {
+            EngineEvent::TextDelta(t) => Frame::TextDelta { text: t.clone() },
+            EngineEvent::ThinkingDelta(t) => Frame::ThinkingDelta { text: t.clone() },
+            EngineEvent::ToolStart { id, name, summary } => Frame::ToolStart {
+                id: id.clone(),
+                name: name.clone(),
+                summary: summary.clone(),
+            },
+            EngineEvent::ToolDone {
+                id,
+                name,
+                ok,
+                lines,
+                bytes,
+            } => Frame::ToolDone {
+                id: id.clone(),
+                name: name.clone(),
+                ok: *ok,
+                lines: *lines,
+                bytes: *bytes,
+            },
+            EngineEvent::GoalEvaluating { turn } => Frame::GoalEvaluating { turn: *turn },
+            EngineEvent::ToolQueued {
+                id,
+                name,
+                summary,
+                ahead,
+            } => Frame::ToolQueued {
+                id: id.clone(),
+                name: name.clone(),
+                summary: summary.clone(),
+                ahead: *ahead,
+            },
+            EngineEvent::Compacting { items } => Frame::Compacting { items: *items },
+            EngineEvent::ToolProgress {
+                id,
+                name,
+                tail,
+                lines,
+                bytes,
+            } => Frame::ToolProgress {
+                id: id.clone(),
+                name: name.clone(),
+                tail: tail.clone(),
+                lines: *lines,
+                bytes: *bytes,
+            },
+            EngineEvent::ToolInputProgress { calls, bytes } => Frame::ToolInputProgress {
+                calls: *calls,
+                bytes: *bytes,
+            },
+            EngineEvent::ToolDenied { id, name } => Frame::ToolDenied {
+                id: id.clone(),
+                name: name.clone(),
+            },
+            EngineEvent::ToolAutoAllowed { id, name, rule } => Frame::ToolAutoAllowed {
+                id: id.clone(),
+                name: name.clone(),
+                rule: rule.clone(),
+            },
+            EngineEvent::ToolFlagged {
+                id,
+                name,
+                summary,
+                why,
+                denied,
+            } => Frame::ToolFlagged {
+                id: id.clone(),
+                name: name.clone(),
+                summary: summary.clone(),
+                why: why.clone(),
+                denied: *denied,
+            },
+            EngineEvent::ChildTool {
+                parent_id,
+                id,
+                name,
+                summary,
+                ok,
+                tokens,
+            } => Frame::ChildTool {
+                parent_id: parent_id.clone(),
+                id: id.clone(),
+                name: name.clone(),
+                summary: summary.clone(),
+                phase: if ok.is_some() {
+                    ChildPhase::Done
+                } else {
+                    ChildPhase::Start
+                },
+                ok: *ok,
+                tokens: *tokens,
+            },
+            EngineEvent::ChildText { parent_id, text } => Frame::ChildText {
+                parent_id: parent_id.clone(),
+                text: text.clone(),
+            },
+            EngineEvent::Delegation {
+                subagent_runs,
+                duplicate_work_paths,
+                false_completions,
+                usage,
+                tool_calls,
+            } => Frame::Delegation {
+                subagent_runs: *subagent_runs,
+                duplicate_work_paths: *duplicate_work_paths,
+                false_completions: *false_completions,
+                usage: *usage,
+                tool_calls: *tool_calls,
+            },
+            EngineEvent::CacheWarmed { usage, cost_usd } => Frame::CacheWarm {
+                usage: *usage,
+                cost_usd: *cost_usd,
+            },
+            EngineEvent::Retrying {
+                attempt,
+                max,
+                reason,
+                delay_ms,
+                status,
+                request_id,
+                scope,
+                discarded_partial,
+            } => Frame::Retrying {
+                attempt: *attempt,
+                max: *max,
+                reason: reason.clone(),
+                delay_ms: *delay_ms,
+                scope: retry_scope_tag(*scope),
+                status: *status,
+                request_id: request_id.clone(),
+                discarded_partial: *discarded_partial,
+            },
+            EngineEvent::FallbackModel { model } => Frame::FallbackModel {
+                model: model.clone(),
+            },
+            EngineEvent::PromptQueued => Frame::PromptQueued,
+            EngineEvent::BudgetNotice {
+                pct,
+                used_usd,
+                cap_usd,
+            } => Frame::BudgetNotice {
+                pct: *pct,
+                used_usd: *used_usd,
+                cap_usd: *cap_usd,
+            },
+            EngineEvent::Compacted {
+                degraded,
+                focus,
+                usage,
+                estimate,
+            } => Frame::Compacted {
+                degraded: *degraded,
+                usage: *usage,
+                estimate: *estimate,
+                focus: focus.clone(),
+            },
+            EngineEvent::FoldSkipped { reason } => Frame::FoldSkipped {
+                reason: reason.clone(),
+            },
+            EngineEvent::ModelChanged {
+                model,
+                previous,
+                context_tokens,
+                context_window,
+            } => Frame::ModelChanged {
+                model: model.clone(),
+                previous: previous.clone(),
+                context_tokens: *context_tokens,
+                context_window: *context_window,
+            },
+            EngineEvent::Cleared { count } => Frame::Cleared { count: *count },
+            EngineEvent::TodosChanged { items } => Frame::TodosChanged {
+                items: items.clone(),
+            },
+            EngineEvent::PlanPresented {
+                summary,
+                nodes,
+                path,
+            } => Frame::PlanPresented {
+                summary: summary.clone(),
+                nodes: nodes.clone(),
+                path: path.clone(),
+            },
+            EngineEvent::GoalChanged { condition } => Frame::GoalChanged {
+                goal: condition.clone(),
+            },
+            EngineEvent::MemoryChanged {
+                note,
+                date,
+                bytes,
+                path,
+            } => Frame::MemoryChanged {
+                note: note.clone(),
+                date: date.clone(),
+                bytes: *bytes,
+                path: path.clone(),
+            },
+            EngineEvent::JobStarted {
+                id,
+                job,
+                pid,
+                command,
+                detached,
+            } => Frame::JobStarted {
+                id: id.clone(),
+                job: job.clone(),
+                pid: *pid,
+                command: command.clone(),
+                detached: *detached,
+            },
+            EngineEvent::JobDone {
+                id,
+                job,
+                rc,
+                secs,
+                stopped_by,
+            } => Frame::JobDone {
+                id: id.clone(),
+                job: job.clone(),
+                rc: rc.clone(),
+                secs: *secs,
+                stopped_by: stopped_by.clone(),
+            },
+            EngineEvent::SessionTitled { title, usage } => Frame::SessionTitled {
+                usage: *usage,
+                title: title.clone(),
+            },
+            EngineEvent::AsideDone {
+                question,
+                text,
+                usage,
+            } => Frame::AsideResult {
+                question: question.clone(),
+                text: text.clone(),
+                usage: *usage,
+            },
+            EngineEvent::AsideFailed { question, reason } => Frame::AsideFailed {
+                question: question.clone(),
+                reason: reason.clone(),
+            },
+            EngineEvent::GoalVerdict {
+                verdict,
+                reason,
+                turns,
+                usage,
+                evidence,
+            } => Frame::GoalVerdict {
+                verdict: goal_verdict_tag(*verdict),
+                reason: reason.clone(),
+                turns: *turns,
+                usage: *usage,
+                // Omitted, not `[]`, when nothing was observed.
+                evidence: (!evidence.is_empty()).then(|| evidence.clone()),
+            },
+            EngineEvent::LedgerReport(summary) => Frame::LedgerReport {
+                sample_count: summary.sample_count,
+                overhead_p50_ns: summary.overhead_p50_ns,
+                overhead_p99_ns: summary.overhead_p99_ns,
+                max_rss_bytes: summary.max_rss_bytes,
+                phase_deltas: summary.phase_deltas.clone(),
+            },
+            EngineEvent::Ask { .. }
+            | EngineEvent::Question { .. }
+            // `EgressAsk` is a round-trip like `Ask`, and the JSON stream is
+            // the headless surface, which has no human to answer it.
+            | EngineEvent::EgressAsk { .. }
+            | EngineEvent::TurnDone { .. } => return None,
+        })
+    }
 }
 
 /// The `goal_verdict` frame's stable wire tag — never a `Debug` rendering.
 /// Which ladder a `retrying` frame came from (0061 T15).
-fn retry_scope_tag(scope: hotl_engine::RetryScope) -> &'static str {
+fn retry_scope_tag(scope: hotl_engine::RetryScope) -> RetryScopeTag {
     match scope {
-        hotl_engine::RetryScope::Sample => "sample",
-        hotl_engine::RetryScope::Summarize => "summarize",
-        hotl_engine::RetryScope::GoalEval => "goal_eval",
-        hotl_engine::RetryScope::Title => "title",
-        hotl_engine::RetryScope::Aside => "aside",
+        hotl_engine::RetryScope::Sample => RetryScopeTag::Sample,
+        hotl_engine::RetryScope::Summarize => RetryScopeTag::Summarize,
+        hotl_engine::RetryScope::GoalEval => RetryScopeTag::GoalEval,
+        hotl_engine::RetryScope::Title => RetryScopeTag::Title,
+        hotl_engine::RetryScope::Aside => RetryScopeTag::Aside,
     }
 }
 
-fn goal_verdict_tag(verdict: hotl_engine::GoalVerdictKind) -> &'static str {
+fn goal_verdict_tag(verdict: hotl_engine::GoalVerdictKind) -> GoalVerdictTag {
     match verdict {
-        hotl_engine::GoalVerdictKind::NotYet => "not_yet",
-        hotl_engine::GoalVerdictKind::Met => "met",
-        hotl_engine::GoalVerdictKind::Impossible => "impossible",
-        hotl_engine::GoalVerdictKind::EvalFailed => "eval_failed",
-        hotl_engine::GoalVerdictKind::Stalled => "stalled",
-        hotl_engine::GoalVerdictKind::Errored => "error",
+        hotl_engine::GoalVerdictKind::NotYet => GoalVerdictTag::NotYet,
+        hotl_engine::GoalVerdictKind::Met => GoalVerdictTag::Met,
+        hotl_engine::GoalVerdictKind::Impossible => GoalVerdictTag::Impossible,
+        hotl_engine::GoalVerdictKind::EvalFailed => GoalVerdictTag::EvalFailed,
+        hotl_engine::GoalVerdictKind::Stalled => GoalVerdictTag::Stalled,
+        hotl_engine::GoalVerdictKind::Errored => GoalVerdictTag::Errored,
     }
 }
 
@@ -372,30 +644,43 @@ fn goal_verdict_tag(verdict: hotl_engine::GoalVerdictKind) -> &'static str {
 /// `format!("{outcome:?}")` instead — unparseable, and un-versionable, since a
 /// field rename in `Outcome` would have changed the wire silently.
 pub fn outcome_frame(outcome: &Outcome) -> Value {
-    match outcome {
-        Outcome::Done { text } => json!({"kind": "done", "text": text}),
-        Outcome::Cancelled => json!({"kind": "cancelled"}),
-        Outcome::TurnLimit => json!({"kind": "turn_limit"}),
-        Outcome::Refused => json!({"kind": "refused"}),
-        Outcome::DoomLoop { pattern } => json!({"kind": "doom_loop", "pattern": pattern}),
-        Outcome::ToolFailureBudget { tool } => {
-            json!({"kind": "tool_failure_budget", "tool": tool})
+    serde_json::to_value(OutcomeFrame::of(outcome)).expect("an outcome always serializes")
+}
+
+impl OutcomeFrame {
+    pub fn of(outcome: &Outcome) -> OutcomeFrame {
+        match outcome {
+            Outcome::Done { text } => OutcomeFrame::Done { text: text.clone() },
+            Outcome::Cancelled => OutcomeFrame::Cancelled,
+            Outcome::TurnLimit => OutcomeFrame::TurnLimit,
+            Outcome::Refused => OutcomeFrame::Refused,
+            Outcome::DoomLoop { pattern } => OutcomeFrame::DoomLoop {
+                pattern: pattern.clone(),
+            },
+            Outcome::ToolFailureBudget { tool } => {
+                OutcomeFrame::ToolFailureBudget { tool: tool.clone() }
+            }
+            // Both carry a `message` as well as their numbers: every client
+            // that reads an outcome's text then shows the refusal that names
+            // the knob, not a bare kind word.
+            Outcome::DenialSpiral { consecutive, total } => OutcomeFrame::DenialSpiral {
+                consecutive: *consecutive,
+                total: *total,
+                message: format!(
+                    "{consecutive} calls denied in a row ({total} this turn) — change what \
+                     you are asking for, or relax the rule that is denying it"
+                ),
+            },
+            Outcome::Budget { kind, used, cap } => OutcomeFrame::Budget {
+                budget: kind.clone(),
+                used: *used,
+                cap: *cap,
+                message: hotl_engine::budget_refusal(kind, *used, *cap),
+            },
+            Outcome::Error { message } => OutcomeFrame::Error {
+                message: message.clone(),
+            },
         }
-        // Both carry a `message` as well as their numbers: every client that
-        // reads an outcome's text (the TUI's `prompt_result_msg`) then shows
-        // the refusal that names the knob, not a bare kind word.
-        Outcome::DenialSpiral { consecutive, total } => json!({
-            "kind": "denial_spiral", "consecutive": consecutive, "total": total,
-            "message": format!(
-                "{consecutive} calls denied in a row ({total} this turn) — change what \
-                 you are asking for, or relax the rule that is denying it"
-            ),
-        }),
-        Outcome::Budget { kind, used, cap } => json!({
-            "kind": "budget", "budget": kind, "used": used, "cap": cap,
-            "message": hotl_engine::budget_refusal(kind, *used, *cap),
-        }),
-        Outcome::Error { message } => json!({"kind": "error", "message": message}),
     }
 }
 
@@ -412,14 +697,17 @@ pub fn outcome_frame(outcome: &Outcome) -> Value {
 /// the alternative (pricing per-sample) would need usage attribution this
 /// wire shape doesn't carry.
 pub fn usage_frame(model: &str, usage: &TokenUsage) -> Value {
-    let mut v = json!(usage);
-    if let Some(ratio) = usage.hit_ratio() {
-        v["hit_ratio"] = json!(ratio);
+    serde_json::to_value(UsageFrame::of(model, usage)).expect("usage always serializes")
+}
+
+impl UsageFrame {
+    pub fn of(model: &str, usage: &TokenUsage) -> UsageFrame {
+        UsageFrame {
+            usage: *usage,
+            hit_ratio: usage.hit_ratio(),
+            cost_usd: catalog::cost_usd(model, usage),
+        }
     }
-    if let Some(cost) = catalog::cost_usd(model, usage) {
-        v["cost_usd"] = json!(cost);
-    }
-    v
 }
 
 /// One `-p --json` line: an update frame, or the turn-done/ask/question frames
@@ -433,38 +721,45 @@ pub fn usage_frame(model: &str, usage: &TokenUsage) -> Value {
 /// `model` is the session's primary model, needed only for the `TurnDone`
 /// arm's `cost_usd` — see `usage_frame`.
 pub fn json_frame(event: &EngineEvent, model: &str) -> Value {
-    let mut v = match update_frame(event) {
-        Some(v) => v,
-        None => match event {
-            EngineEvent::TurnDone {
-                outcome,
-                usage,
-                mispredictions,
-            } => {
-                let mut v = json!({
-                    "type": "turn_done",
-                    "outcome": outcome_frame(outcome),
-                    "usage": usage_frame(model, usage),
-                });
-                // Omitted at zero rather than written as `0`/`null` — the
-                // same rule `usage_frame` follows for absent fields.
-                if *mispredictions > 0 {
-                    v["mispredictions"] = json!(mispredictions);
-                }
-                v
-            }
-            EngineEvent::Ask { summary, .. } => {
-                json!({"type": "ask_denied", "summary": summary})
-            }
-            EngineEvent::Question { question, .. } => json!({
-                "type": "question_no_human",
-                "header": question.header,
-                "prompt": question.prompt,
-                "options": question.options,
-            }),
-            _ => unreachable!("update_frame covers every other variant"),
+    let frame = Frame::stream(event).unwrap_or_else(|| match event {
+        EngineEvent::TurnDone {
+            outcome,
+            usage,
+            mispredictions,
+        } => Frame::TurnDone {
+            outcome: OutcomeFrame::of(outcome),
+            usage: UsageFrame::of(model, usage),
+            // Omitted at zero rather than written as `0`/`null`.
+            mispredictions: (*mispredictions > 0).then_some(*mispredictions),
         },
-    };
-    v["schema_version"] = json!(JSON_STREAM_SCHEMA_VERSION);
+        EngineEvent::Ask { summary, .. } => Frame::AskDenied {
+            summary: summary.clone(),
+        },
+        EngineEvent::Question { question, .. } => Frame::QuestionNoHuman {
+            header: question.header.clone(),
+            prompt: question.prompt.clone(),
+            options: question.options.clone(),
+        },
+        _ => unreachable!("Frame::stream covers every other variant"),
+    });
+    serde_json::to_value(JsonStreamLine {
+        frame,
+        schema_version: JSON_STREAM_SCHEMA_VERSION,
+    })
+    .expect("a stream line always serializes")
+}
+
+/// The published schema of one `-p --json` line, `$id` set to its URL.
+#[allow(dead_code)] // read by `hotl schema` and the drift test (0076 task 4)
+pub fn json_stream_schema() -> Value {
+    let mut v = serde_json::to_value(schemars::schema_for!(JsonStreamLine))
+        .expect("a schema always serializes");
+    v["$id"] = json!(JSON_STREAM_SCHEMA_ID);
+    v["title"] = json!("hotl -p --json stream line");
     v
 }
+
+/// Where the stream schema is published (0076 D3); bump the file with the major.
+#[allow(dead_code)]
+pub const JSON_STREAM_SCHEMA_ID: &str =
+    "https://nrakochy.github.io/hotl/schema/json-stream-v2.schema.json";
