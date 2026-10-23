@@ -234,7 +234,7 @@ These are fixed for the life of the process; restart to change them:
 | File | Purpose |
 |---|---|
 | `system-prompt.md` | Replaces the built-in agent instructions (prose). |
-| `memory/MEMORY.md` | Loaded into every session's starting context (capped at 16 KB), enveloped. |
+| `memory/MEMORY.md` | Per user, hand-written; loaded into every session's starting context (capped at 16 KB), enveloped. The per-project file `/remember` writes lives in the data dir — see [Memory](#memory-memory). |
 | `skills/*.md` | One procedure per file; the `skill` tool lists and loads them by name. See [skills.md](../skills/). |
 | `agents/*.md` | One sub-agent definition per file — `tools`/`model`/`effort`/`isolation` frontmatter, body = system prompt. See [agents.md](../agents/). |
 | `trust.toml` | Written by hotl, not you: approved MCP server binary hashes. |
@@ -694,6 +694,41 @@ The `workflow` tool's own caps, separate from `[concurrency] agents` (which pace
 
 Both are floors of one. Mutating agents that are not worktree-isolated still serialise on the shared-tree lock regardless of width. See [workflows.md](../workflows/).
 
+### Memory (`[memory]`)
+
+Two files load into every session's starting context, each under its own
+16 KiB cap and the same untrusted envelope as a repo's `AGENTS.md`:
+
+| File | Who writes it |
+|---|---|
+| `~/.config/hotl/memory/MEMORY.md` | You, by hand. Per user. |
+| `<xdg-data>/hotl/memory/<project-id>/MEMORY.md` | `/remember`, after your yes. Per project — the same id the plan artifact uses, so two worktrees of one repo share it. Hand-editable. |
+
+```toml
+[memory]
+mode = "read-only"   # read-only (default) | read-write | off
+```
+
+`read-only` loads both files and writes nothing: `/remember <note>` says so,
+and the model has no `remember` tool. `read-write` turns the write path on:
+`/remember <note>` (or `session/remember` under `hotl acp`) asks you with the
+same y/n a tool ask uses, then appends `- YYYY-MM-DD: <note>` under `## Notes`
+and records a `memory_appended` entry in the session log. The model may
+*propose* a note through the `remember` tool; its permission gate is that
+same confirm, so under `bypass` the tool is refused with the ⚑ notice rather
+than auto-allowed, and no tool — not `write`, not `edit`, not `bash` — can
+reach the file any other way (it lives in hotl's own data dir, Tier A). `off`
+loads neither file. The dial is read at session start; a change takes effect
+next session.
+
+A note is one line of up to 2,000 characters — newlines become spaces so a
+note cannot forge a heading. The new line is not shown to the model until the
+next session. When the file plus the new line would pass the cap, the write
+is refused and the notice names the file and its size: prune it by hand or
+move old lines to another file. Nothing rolls, nothing is clipped. Bare
+`/remember` prints the last entries, the file path, its size against the cap
+and the dial; `hotl doctor` reports the same.
+
 ### Plan artifact (`[plan]`)
 
 The `todo_write` checklist is a durable per-project plan. Every write renders `<xdg-data>/hotl/plans/<project-id>/current.json` (machine) and `current.md` (human), temp-then-rename, alongside the decisions the model recorded. The project id is the `origin` remote's URL when there is one, else the canonical working directory — so two worktrees of the same repo share one plan, and two unrelated checkouts do not.
@@ -771,7 +806,7 @@ If you need non-interactive provisioning, register servers with a pasted `[[mcp]
 
 ## Headless (`-p` / `--json`)
 
-`hotl -p "PROMPT"` runs one turn and exits. Because no human is present, **every permission ask is auto-denied** — headless runs cannot perform gated actions unless an allow-rule covers them. Configure `[[allow]]` rules in config.toml for anything a headless run must do.
+`hotl -p "PROMPT"` runs one turn and exits. Because no human is present, **every permission ask is auto-denied** — headless runs cannot perform gated actions unless an allow-rule covers them. Configure `[[allow]]` rules in config.toml for anything a headless run must do. Memory is read-only in `-p` whatever `[memory] mode` says: there is nobody to confirm a write, so the `remember` tool is not offered.
 
 `hotl -p -` reads the prompt from stdin instead (`git log | hotl -p -`); a bare
 `-p` with something piped in does the same. A terminal with no prompt is still

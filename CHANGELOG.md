@@ -8,6 +8,17 @@ semver promise of their own.
 
 ### Added
 
+- **`/remember <note>` keeps a note for future sessions.** Off unless
+  `[memory] mode = "read-write"`; every write is confirmed with the same y/n a
+  tool ask uses, appended as one dated line to a per-project `MEMORY.md` in
+  the data dir, and recorded in the session log (`memory_appended`). The
+  line loads next session under its own 16 KiB cap, beside your per-user
+  `memory/MEMORY.md`, which is untouched. Bare `/remember` lists the notes,
+  the file and the dial. The model gets a `remember` tool under the same
+  rule — its gate *is* the confirm, and under `bypass` it is refused with the
+  ⚑ notice rather than auto-allowed. `session/remember` under `hotl acp`; a
+  `memory_changed` frame on every surface. A file at its cap refuses the
+  write and says so; nothing rolls or clips. `-p` never writes memory.
 - **A repo can carry its own skills.** `.agents/skills/<name>/SKILL.md` and
   `.claude/skills/<name>/SKILL.md` load from the working directory up to the
   repo root, nearest first, shown as `project` and always addressable as

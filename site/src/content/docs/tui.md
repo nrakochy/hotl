@@ -313,6 +313,7 @@ own.
 | `/model [provider/model\|default]` | Switch the session model. Lands on the turn boundary — queued while a turn runs, never mid-turn — and is recorded durably, so `hotl resume` keeps it. A bare name means `anthropic/`; `default` returns to the configured model. The strip changes only when the engine has switched, and the notice says the prefix cache is cold: the next turn re-writes the whole context. Effort and mode are untouched. A switch to another dialect drops the other dialect's thinking at the wire and keeps it in the log, so switching back restores it. Sub-agents keep the model they started on. A model whose window cannot hold the current context is refused — `/compact` first. Bare `/model` names the running model. See [configuration.md](../configuration/#switching-models-model-provider-fallback_models). |
 | `/status` | What this session is running: name, model, permission mode and plan state, reasoning effort, context window, todo count. |
 | `/context` | What is *filling* the window, by source (see [The context report](#the-context-report)). Safe to run mid-turn. |
+| `/remember [note]` | Keep one note for every future session in this project. With a note: only while idle and only under `[memory] mode = "read-write"`; the same y/n modal a tool ask uses confirms it, then the line is appended to the project's `MEMORY.md` in the data dir and the notice says `remembered — loads next session`. Bare `/remember` lists the notes, the file, its size against the 16 KiB cap and the dial — any time. See [configuration.md](../configuration/#memory-memory). |
 | `/compact [focus]` | Fold earlier history into the typed summary now, instead of waiting for the 80% rung. With a focus, the summary keeps everything about it in full. Runs when the current turn ends if one is running; the strip reads `folding history…` while it works and the notice says what it cost. See [Folding on purpose](#folding-on-purpose). |
 | `/workflows` | Every run of the `workflow` tool this process has started, with per-phase progress, tokens and elapsed time — live, so safe mid-run. See [workflows.md](../workflows/#watching-it). |
 | `/cost` | Session token totals and, when the provider reports one, cost. |
@@ -436,6 +437,10 @@ or orchestrator embedding hotl gets it too. Likewise `/compact` is
 turn is running. `/model` is `session/set_model` with a `model`; its reply
 carries `applied` (false while a turn runs) and the engine's `model_changed`
 notification is the only thing that moves a client's model display.
+`/remember` is `session/remember`: with a `note` the confirm arrives as the
+ordinary `session/request_permission` while the request is in flight and the
+reply is `{"ok": true}` or the refusal; without one a `memory_report`
+notification follows the ack.
 
 ### Folding on purpose
 
