@@ -7,7 +7,7 @@ name: Publish to crates.io
 # To cut a release, run `scripts/release.sh` — it pushes the release commit,
 # waits for CI to go green on it, and only then creates and pushes the tag.
 # This workflow verifies the tag, re-checks that CI was green on the commit,
-# builds, tests, then publishes every workspace crate in dependency order.
+# then publishes every workspace crate in dependency order.
 on:
   push:
     tags:
@@ -66,29 +66,22 @@ jobs:
       # ci.yml ignores tags (ci.yml:13), so the only green-CI evidence for this
       # commit is the run from its branch push. No evidence => refuse: crates.io
       # publishes are irreversible. Sits with the other cheap refusals, ahead of
-      # the build and test steps.
+      # the publish.
       - name: Require green CI for this commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash scripts/wait-for-ci.sh "$GITHUB_SHA"
 
-      # Same reason as ci.yml: the grep tool spawns `rg`, which the runner
-      # image does not ship, and the grep test dies at spawn without it. This
-      # step was missing here while ci.yml had it, so every tag from v0.5.0
-      # on built green in CI and then failed the release.
-      - name: Install ripgrep
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      # No test step: the gate above already requires this commit's ci.yml run
+      # to be green, and publishing compiles each crate as it uploads.
 
-      - name: Build and test
-        run: cargo test --workspace --locked
-
-      # Handles workspace dependency ordering, version-skip, and waiting for
-      # each crate to land on the index before publishing its dependents.
+      # `cargo publish --workspace` orders the crates and waits for each to
+      # reach the index; the script excludes crates already published at this
+      # version, so a re-run after a partial publish resumes. Replaced
+      # katyo/publish-crates, which keyed dependencies by name: hotl-tools'
+      # dev-dependency on hotl-context overwrote the normal one, the sort then
+      # ignored it, and v0.29.0 stopped after 8 of 22 crates.
       - name: Publish workspace to crates.io
-        uses: katyo/publish-crates@v2
-        with:
-          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          # Re-running the release after a partial/duplicate publish exits
-          # cleanly instead of erroring on already-published versions.
-          ignore-unpublished-changes: true
-          args: --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: bash scripts/publish-crates.sh
