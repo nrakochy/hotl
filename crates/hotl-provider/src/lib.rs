@@ -355,6 +355,10 @@ pub struct ScriptedProvider {
     scripts: ScriptQueue,
     /// Every request the engine made, for test assertions on what the model saw.
     requests: Mutex<Vec<SamplingRequest>>,
+    /// What every `max_tokens: 1` request (a cache keep-alive ping, 0073)
+    /// gets instead of the next queued script. `None` = a ping pops the
+    /// queue like any sample.
+    ping: Mutex<Option<Script>>,
 }
 
 /// One sample's worth of scripted events.
@@ -426,7 +430,24 @@ impl ScriptedProvider {
         Self {
             scripts: Arc::new(Mutex::new(scripts.into())),
             requests: Mutex::new(Vec::new()),
+            ping: Mutex::new(None),
         }
+    }
+
+    /// Answer every keep-alive ping (`max_tokens: 1`) with this script,
+    /// leaving the queue to the real samples — a ping count is timing.
+    pub fn set_ping_reply(&self, script: Vec<Result<StreamEvent, ProviderError>>) {
+        *self.ping.lock().expect("ping mutex") = Some(script);
+    }
+
+    /// Requests that were keep-alive pings.
+    pub fn ping_count(&self) -> usize {
+        self.requests
+            .lock()
+            .expect("requests mutex")
+            .iter()
+            .filter(|r| r.max_tokens == 1)
+            .count()
     }
 
     /// Every captured request. Cheap since a request's history/tools are
@@ -581,7 +602,20 @@ impl Provider for ScriptedProvider {
         &self,
         req: SamplingRequest,
     ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+        let is_ping = req.max_tokens == 1;
         self.requests.lock().expect("requests mutex").push(req);
+        if is_ping {
+            if let Some(script) = self.ping.lock().expect("ping mutex").clone() {
+                // A throwaway queue: an abandoned ping stream must not hand
+                // its script to the next real sample.
+                return Box::pin(ScriptedStream {
+                    script,
+                    pos: 0,
+                    exhausted: false,
+                    scripts: Arc::new(Mutex::new(VecDeque::new())),
+                });
+            }
+        }
         let script = self
             .scripts
             .lock()

@@ -3873,6 +3873,13 @@ impl Surface {
                     );
                 }
             }
+            EngineEvent::CacheWarmed { usage, cost_usd } => match cost_usd {
+                Some(c) => eprintln!(
+                    "· cache kept warm ({} read, ${c:.2})",
+                    usage.cache_read_input_tokens
+                ),
+                None => eprintln!("· cache kept warm ({} read)", usage.cache_read_input_tokens),
+            },
             EngineEvent::Retrying {
                 attempt, reason, ..
             } => {

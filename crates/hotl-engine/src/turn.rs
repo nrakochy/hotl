@@ -846,6 +846,13 @@ struct Turn {
     /// cross-turn dedup against the projection.
     injected_hints: HashSet<String>,
     last_snapshot: Option<crate::actor::Snapshot>,
+    /// The request the provider last saw and when it left (0073 D1): the
+    /// keep-alive re-sends exactly this, never a rebuild.
+    last_request: Option<SamplingRequest>,
+    last_dispatched: Option<tokio::time::Instant>,
+    /// The last sample's own usage, not the turn's total: what the next
+    /// sample would rewrite if the cache went cold.
+    last_usage: TokenUsage,
     /// In-flight speculative compaction digest: fired once the estimate
     /// crosses [`SPECULATE_TRIGGER`], consumed when the turn ends in
     /// `Compact`, aborted otherwise.
@@ -976,6 +983,9 @@ impl Turn {
             samples: 0,
             injected_hints: HashSet::new(),
             last_snapshot: None,
+            last_request: None,
+            last_dispatched: None,
+            last_usage: TokenUsage::default(),
             speculation: None,
             turn_extensions: cont.turn_extensions,
             mispredictions: cont.mispredictions,
@@ -1312,6 +1322,7 @@ impl Turn {
                     Ok(request) => request,
                     Err(end) => return end,
                 };
+                self.note_dispatch(&request);
                 self.active.provider.stream(request)
             }
         };
@@ -1360,6 +1371,7 @@ impl Turn {
                         Ok(request) => request,
                         Err(end) => return end,
                     };
+                    self.note_dispatch(&request);
                     stream = self.active.provider.stream(request);
                     attempt = failed + 1;
                 }
@@ -1369,6 +1381,7 @@ impl Turn {
         if stop == StopReason::MaxTokens {
             prune_unsigned_trailing_thinking(&mut blocks);
         }
+        self.last_usage = usage;
         self.usage += usage;
         // Session spend, and the one-per-threshold notice it may cross
         // (0059 T5). Priced at the model this sample actually used.
@@ -1557,6 +1570,9 @@ impl Turn {
         // belief the model already knows is wrong.
         let mut miss: Option<(usize, crate::expect::Miss)> = None;
         self.ledger.stamp(Phase::ToolsSpawned);
+        // The cache keep-alive (0073 D2): armed for as long as this batch
+        // runs, dropped (aborted) with the guard when the results are in.
+        let keepalive = self.arm_keepalive();
         // Barrier (a) again, as an assertion rather than a wait: the inline
         // path is the one the spec names explicitly, and this is what makes a
         // future proposal site between the barrier and dispatch fail loudly.
@@ -1630,6 +1646,33 @@ impl Turn {
         // result per `tool_use_id`, so every duplicate id gets its own
         // `ToolResultItem` carrying the shared outcome (0037 D6). Before the
         // backfill, which aligns against the window's per-original-call fold.
+        // The keep-alive's bill (0073 D6): into the turn's usage and the cost
+        // meter, labelled on the wire, committed with this batch's results.
+        let mut ping_entries = Vec::new();
+        for u in keepalive
+            .map(crate::keepalive::KeepAliveGuard::drain)
+            .unwrap_or_default()
+        {
+            self.usage += u;
+            let cost = hotl_provider::catalog::cost_usd(&self.models[self.model_idx], &u);
+            if let Some(pct) = self.shared.add_spend(cost.unwrap_or(0.0)) {
+                self.emit(EngineEvent::BudgetNotice {
+                    pct,
+                    used_usd: self.shared.spent_usd(),
+                    cap_usd: self.shared.config.max_cost_usd,
+                })
+                .await;
+            }
+            self.emit(EngineEvent::CacheWarmed {
+                usage: u,
+                cost_usd: cost,
+            })
+            .await;
+            ping_entries.push(EntryPayload::Usage {
+                usage: u,
+                request_id: None,
+            });
+        }
         if let Some((_, fan)) = &deduped {
             results = fan_results(uses, fan, &results);
         }
@@ -1645,6 +1688,7 @@ impl Turn {
         let mut entries = vec![EntryPayload::Item {
             item: Item::ToolResults { results },
         }];
+        entries.extend(ping_entries);
         entries.extend(
             self.subdir_hints(uses)
                 .into_iter()
@@ -2941,6 +2985,45 @@ impl Turn {
         self.dispatch_speculative(admission.predicted);
     }
 
+    /// Remember what just went on the wire (0073 D1).
+    fn note_dispatch(&mut self, request: &SamplingRequest) {
+        self.last_request = Some(request.clone());
+        self.last_dispatched = Some(tokio::time::Instant::now());
+    }
+
+    /// Arm the cache keep-alive for the tool batch about to run (0073 D2,
+    /// D3): `None` when the gate says a ping would not pay for itself.
+    fn arm_keepalive(&self) -> Option<crate::keepalive::KeepAliveGuard> {
+        use crate::keepalive;
+        let last = self.last_request.as_ref()?;
+        let dispatched = self.last_dispatched?;
+        let model = &self.models[self.model_idx];
+        let prefix = keepalive::prefix_tokens(&self.last_usage);
+        let saving = keepalive::projected_saving_usd(model, prefix);
+        let ping_cost = keepalive::ping_cost_usd(model, prefix).unwrap_or(0.0);
+        if !keepalive::should_ping(
+            last.cache,
+            self.shared.config.cache_warming,
+            self.shared
+                .keepalive_rejected
+                .load(std::sync::atomic::Ordering::Relaxed),
+            saving,
+            self.shared.spent_usd(),
+            self.shared.config.max_cost_usd,
+            ping_cost,
+        ) {
+            return None;
+        }
+        let after = self.shared.config.cache_keepalive_after;
+        Some(keepalive::KeepAlive::arm(
+            Arc::clone(&self.active.provider),
+            keepalive::ping_request(last),
+            dispatched + after,
+            after,
+            Arc::clone(&self.shared.keepalive_rejected),
+        ))
+    }
+
     /// The shared dispatch tail of [`Turn::speculate`] and the admission
     /// path: build the predicted request and put it on the wire un-adopted.
     /// `expected_leaf` is the pipeline's newest committed unit in both —
@@ -2952,6 +3035,7 @@ impl Turn {
         let Some(request) = self.speculative_request(&predicted) else {
             return;
         };
+        self.note_dispatch(&request);
         let stream = self.active.provider.stream(request);
         self.speculative = Some(Speculation {
             expected_leaf,

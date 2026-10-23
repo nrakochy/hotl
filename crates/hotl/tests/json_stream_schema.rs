@@ -113,6 +113,10 @@ fn every_frame_is_tagged_and_versioned() {
             usage: Default::default(),
             tool_calls: 0,
         },
+        EngineEvent::CacheWarmed {
+            usage: Default::default(),
+            cost_usd: Some(0.03),
+        },
         EngineEvent::Retrying {
             attempt: 1,
             max: 5,

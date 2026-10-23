@@ -148,6 +148,15 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
             "usage": usage,
             "tool_calls": tool_calls,
         }),
+        // A cache keep-alive ping (0073 D6). Additive: the version stands;
+        // `cost_usd` omitted when the model has no price.
+        EngineEvent::CacheWarmed { usage, cost_usd } => {
+            let mut v = json!({"type": "cache_warm", "usage": usage});
+            if let Some(c) = cost_usd {
+                v["cost_usd"] = json!(c);
+            }
+            v
+        }
         EngineEvent::Retrying {
             attempt,
             max,

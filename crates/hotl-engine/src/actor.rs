@@ -681,6 +681,9 @@ pub(crate) struct SharedDeps {
     /// Which budget thresholds have already been announced (bit 0 = 50%,
     /// 1 = 80%, 2 = 100%), so each fires once per session.
     budget_notices: AtomicU8,
+    /// The endpoint refused a `max_tokens: 1` keep-alive (0073 D7): the
+    /// session pings once, not forever.
+    pub(crate) keepalive_rejected: Arc<AtomicBool>,
     /// Did the most recent tool batch run a verify-class command and no edit?
     /// Written by the turn task, read at the next turn's start to pick the
     /// schedule's phase. An atomic rather than a `TurnContinuation` field:
@@ -807,6 +810,7 @@ impl SharedDeps {
         let tool_calls = AtomicU64::new(0);
         let spend_micros = AtomicU64::new(0);
         let budget_notices = AtomicU8::new(0);
+        let keepalive_rejected = Arc::new(AtomicBool::new(false));
         let last_batch_verified = AtomicBool::new(false);
         let hook_mask = deps
             .hooks
@@ -850,6 +854,7 @@ impl SharedDeps {
             tool_calls,
             spend_micros,
             budget_notices,
+            keepalive_rejected,
             last_batch_verified,
             sandbox_enforced: deps.sandbox_enforced,
             clock: deps.clock,

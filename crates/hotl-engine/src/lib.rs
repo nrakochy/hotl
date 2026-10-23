@@ -11,6 +11,7 @@ mod actor;
 pub mod clearing;
 mod expect;
 pub mod hooks;
+mod keepalive;
 mod ledger;
 mod nudge;
 pub mod plan_state;
@@ -159,6 +160,13 @@ pub struct EngineConfig {
     /// returns, and sub-agent children pin it back to `FiveMinutes`
     /// explicitly in `HotlChildBuilder::spawn_child`.
     pub cache_ttl: CacheTtl,
+    /// Keep the 5-minute cache alive while a tool batch outlives it (0073
+    /// D5, `[provider] cache_warming`). Only fires when the ping pays for
+    /// itself; never on the 1-hour TTL, never on an unpriced model.
+    pub cache_warming: bool,
+    /// When the first keep-alive ping fires after a sample was dispatched,
+    /// and how often it re-arms. Test seam — config.toml does not expose it.
+    pub cache_keepalive_after: std::time::Duration,
     /// Availability-only fallback models (≤3 total — RELIABILITY.md).
     pub fallback_models: Vec<String>,
     /// The per-project memory file and dial (0069). `None` = off: a child, a
@@ -276,6 +284,8 @@ impl Default for EngineConfig {
             verify_commands: Vec::new(),
             cache_static: true,
             cache_ttl: CacheTtl::FiveMinutes,
+            cache_warming: true,
+            cache_keepalive_after: keepalive::CACHE_TTL_5M - keepalive::KEEPALIVE_MARGIN,
             fallback_models: Vec::new(),
             memory_files: None,
             ask_expiry: std::time::Duration::from_secs(3600),
@@ -608,6 +618,12 @@ pub enum EngineEvent {
         usage: TokenUsage,
         tool_calls: u64,
     },
+    /// A cache keep-alive ping was billed (0073 D6). Its tokens are already
+    /// in the turn's usage and the cost meter; this is the label.
+    CacheWarmed {
+        usage: TokenUsage,
+        cost_usd: Option<f64>,
+    },
     Retrying {
         attempt: u32,
         /// The attempt ceiling, so a surface reads `2/5` without knowing the
@@ -825,6 +841,9 @@ impl std::fmt::Debug for EngineEvent {
             }
             Self::ChildText { text, .. } => write!(f, "ChildText(n={})", text.len()),
             Self::Delegation { subagent_runs, .. } => write!(f, "Delegation({subagent_runs})"),
+            Self::CacheWarmed { usage, .. } => {
+                write!(f, "CacheWarmed({})", usage.cache_read_input_tokens)
+            }
             Self::Retrying { attempt, scope, .. } => write!(f, "Retrying({attempt},{scope:?})"),
             Self::FallbackModel { model } => write!(f, "FallbackModel({model})"),
             Self::ModelChanged { model, .. } => write!(f, "ModelChanged({model})"),

@@ -415,6 +415,17 @@ fn update_line(update: &Value) -> Option<String> {
                 line
             }
             "mode_changed" => format!("· permission mode → {}", s("mode")),
+            "cache_warm" => {
+                let read = update
+                    .get("usage")
+                    .and_then(|u| u.get("cache_read_input_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                match update.get("cost_usd").and_then(Value::as_f64) {
+                    Some(c) => format!("· cache kept warm ({read} read, ${c:.2})"),
+                    None => format!("· cache kept warm ({read} read)"),
+                }
+            }
             _ => return None,
         },
     )
@@ -541,6 +552,10 @@ mod tests {
             },
             EngineEvent::FallbackModel { model: "m2".into() },
             EngineEvent::PromptQueued,
+            EngineEvent::CacheWarmed {
+                usage: hotl_types::TokenUsage::default(),
+                cost_usd: Some(0.03),
+            },
             EngineEvent::Compacted {
                 degraded: false,
                 focus: None,
