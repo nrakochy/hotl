@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# ACP Registry draft (0076): `.acp-registry/agent.json` names the version and
+# the archive URLs; bump them with the crate version (a test pins it) and fill
+# each `sha256` from the release's `.sha256` assets. Not filed — see its README.
+#
 # Cut a release: promote the changelog, bump the workspace version, commit,
 # tag, and push. The vX.Y.Z tag triggers the crates.io publish + prebuilt-
 # binary workflows.

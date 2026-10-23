@@ -553,6 +553,36 @@ mod tests {
             .collect()
     }
 
+    /// 0076 B2: the registry draft names this version, the dist archives and
+    /// the `acp` entry point, so a release cannot ship it stale.
+    #[test]
+    fn the_acp_registry_draft_names_this_version_and_the_dist_archives() {
+        let path = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../../.acp-registry/agent.json");
+        let d: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(d["version"], env!("CARGO_PKG_VERSION"));
+        assert!(d["license_url"].as_str().unwrap().ends_with("/LICENSE"));
+        let bins = d["distribution"]["binary"].as_object().unwrap();
+        let triples = [
+            ("darwin-aarch64", "aarch64-apple-darwin"),
+            ("darwin-x86_64", "x86_64-apple-darwin"),
+            ("linux-aarch64", "aarch64-unknown-linux-gnu"),
+            ("linux-x86_64", "x86_64-unknown-linux-gnu"),
+            ("windows-x86_64", "x86_64-pc-windows-msvc"),
+        ];
+        assert_eq!(bins.len(), triples.len());
+        for (platform, triple) in triples {
+            let b = &bins[platform];
+            let want = format!(
+                "https://github.com/nrakochy/hotl/releases/download/v{}/hotl-{triple}.tar.gz",
+                env!("CARGO_PKG_VERSION")
+            );
+            assert_eq!(b["archive"], want.as_str(), "{platform}");
+            assert_eq!(b["args"], serde_json::json!(["acp"]), "{platform}");
+        }
+    }
+
     #[test]
     fn every_dispatched_subcommand_is_in_help_and_in_all_three_completions() {
         let help = super::help_text();
