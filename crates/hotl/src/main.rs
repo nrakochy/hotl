@@ -22,6 +22,7 @@ mod agent;
 mod approve_cli;
 mod attach;
 mod bg;
+mod children_tools;
 mod clipboard;
 mod config;
 // Built and tested, not yet reachable from the ask path: `EngineEvent::Ask`

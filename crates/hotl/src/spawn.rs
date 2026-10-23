@@ -1791,7 +1791,7 @@ impl Tool for SpawnTool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use hotl_engine::{spawn_session, EngineConfig, SessionDeps};
     use hotl_platform::SystemClock;
@@ -1815,13 +1815,13 @@ mod tests {
     /// Records every `AgentDef` (and, for `build_fork`, the history) it was
     /// asked to build, so tests can assert on agent_type resolution and
     /// fork-seeding without a real provider/model.
-    pub(super) struct ScriptedChild {
-        pub(super) seen: Mutex<Vec<AgentDef>>,
+    pub(crate) struct ScriptedChild {
+        pub(crate) seen: Mutex<Vec<AgentDef>>,
         fork_history: Mutex<Vec<Vec<Item>>>,
     }
 
     impl ScriptedChild {
-        pub(super) fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 seen: Mutex::new(Vec::new()),
                 fork_history: Mutex::new(Vec::new()),
@@ -1931,7 +1931,7 @@ mod tests {
         }
     }
 
-    pub(super) fn test_concurrency() -> SessionConcurrency {
+    pub(crate) fn test_concurrency() -> SessionConcurrency {
         SessionConcurrency::new(hotl_tools::concurrency::ConcurrencyLimits::default())
     }
 
@@ -1955,6 +1955,31 @@ mod tests {
     /// ends the turn promptly and would test nothing about a clock.
     struct HangsWhenSpent(Arc<ScriptedProvider>, std::sync::atomic::AtomicUsize);
 
+    /// Every sample waits `delay` before streaming: a child that takes a
+    /// while, so a `wait` can park before it finishes (0072).
+    struct Slow(Arc<dyn hotl_provider::Provider>, std::time::Duration);
+
+    impl hotl_provider::Provider for Slow {
+        fn stream(
+            &self,
+            req: hotl_provider::SamplingRequest,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            Result<hotl_provider::StreamEvent, hotl_provider::ProviderError>,
+        > {
+            use futures_util::FutureExt;
+            let inner = self.0.clone();
+            let delay = self.1;
+            Box::pin(
+                async move {
+                    tokio::time::sleep(delay).await;
+                    inner.stream(req)
+                }
+                .flatten_stream(),
+            )
+        }
+    }
+
     impl hotl_provider::Provider for HangsWhenSpent {
         fn stream(
             &self,
@@ -1973,35 +1998,43 @@ mod tests {
         }
     }
 
-    pub(super) struct TypedChild {
+    pub(crate) struct TypedChild {
         replies: Mutex<Vec<Vec<Script>>>,
         provider: Mutex<Option<Arc<ScriptedProvider>>>,
         briefs: Mutex<Vec<String>>,
         max_turns: i64,
         /// Hang once the scripts run out, instead of erroring.
         hangs: bool,
+        /// Delay before every sample.
+        delay: std::time::Duration,
     }
 
     impl TypedChild {
-        pub(super) fn new(scripts: Vec<Script>) -> Self {
+        pub(crate) fn new(scripts: Vec<Script>) -> Self {
             Self {
                 replies: Mutex::new(vec![scripts]),
                 provider: Mutex::new(None),
                 briefs: Mutex::new(Vec::new()),
                 max_turns: 8,
                 hangs: false,
+                delay: std::time::Duration::ZERO,
             }
         }
         /// After the scripts are spent, stall forever rather than erroring.
-        pub(super) fn hanging(mut self) -> Self {
+        pub(crate) fn hanging(mut self) -> Self {
             self.hangs = true;
             self
         }
-        pub(super) fn with_max_turns(mut self, n: i64) -> Self {
+        /// Every sample takes at least `ms`.
+        pub(crate) fn slow(mut self, ms: u64) -> Self {
+            self.delay = std::time::Duration::from_millis(ms);
+            self
+        }
+        pub(crate) fn with_max_turns(mut self, n: i64) -> Self {
             self.max_turns = n;
             self
         }
-        pub(super) fn requests_seen(&self) -> Vec<hotl_provider::SamplingRequest> {
+        pub(crate) fn requests_seen(&self) -> Vec<hotl_provider::SamplingRequest> {
             self.provider
                 .lock()
                 .unwrap()
@@ -2012,7 +2045,7 @@ mod tests {
         fn last_brief(&self) -> String {
             self.briefs.lock().unwrap().last().cloned().unwrap()
         }
-        pub(super) fn requests(&self) -> usize {
+        pub(crate) fn requests(&self) -> usize {
             self.provider
                 .lock()
                 .unwrap()
@@ -2021,7 +2054,7 @@ mod tests {
         }
         /// Strong references to the child's provider: 1 once its session
         /// is gone.
-        pub(super) fn provider_refs(&self) -> usize {
+        pub(crate) fn provider_refs(&self) -> usize {
             self.provider
                 .lock()
                 .unwrap()
@@ -2048,6 +2081,10 @@ mod tests {
                     std::sync::atomic::AtomicUsize::new(n),
                 )),
                 false => provider,
+            };
+            let provider: Arc<dyn hotl_provider::Provider> = match self.delay.is_zero() {
+                true => provider,
+                false => Arc::new(Slow(provider, self.delay)),
             };
             let mut registry = Registry::builtin();
             if let Some(d) = report {
@@ -2115,7 +2152,7 @@ mod tests {
         }
     }
 
-    pub(super) fn typed_tool(builder: Arc<TypedChild>, spawn_dir: PathBuf) -> SpawnTool {
+    pub(crate) fn typed_tool(builder: Arc<TypedChild>, spawn_dir: PathBuf) -> SpawnTool {
         SpawnTool::new(
             builder,
             tempfile::tempdir().unwrap().keep(),
@@ -2125,7 +2162,7 @@ mod tests {
         )
     }
 
-    pub(super) fn reports(outcome: &str, summary: &str) -> Script {
+    pub(crate) fn reports(outcome: &str, summary: &str) -> Script {
         ScriptedProvider::tool_call(
             "r1",
             "report_result",
@@ -3251,16 +3288,16 @@ mod tests {
     /// concurrency tests below observe the parent-side guard, not just the
     /// child's internal batch semantics (already covered by
     /// `hotl-testkit`'s `OverlapProbe`).
-    pub(super) struct ProbeChild {
-        pub(super) running: Arc<std::sync::atomic::AtomicUsize>,
-        pub(super) max_seen: Arc<std::sync::atomic::AtomicUsize>,
-        pub(super) delay_ms: u64,
+    pub(crate) struct ProbeChild {
+        pub(crate) running: Arc<std::sync::atomic::AtomicUsize>,
+        pub(crate) max_seen: Arc<std::sync::atomic::AtomicUsize>,
+        pub(crate) delay_ms: u64,
         /// A scratch git repo to cut a real `Worktree` from. `None` = the
         /// pre-0024 shared-tree child.
-        pub(super) isolate_in: Option<PathBuf>,
+        pub(crate) isolate_in: Option<PathBuf>,
         /// The number of children whose overlap the test asserts; see
         /// `ConcurrencyProbe::rendezvous`.
-        pub(super) rendezvous: Option<usize>,
+        pub(crate) rendezvous: Option<usize>,
     }
 
     impl ChildBuilder for ProbeChild {
@@ -3335,7 +3372,7 @@ mod tests {
     }
 
     /// A scratch git repo with one commit, or `None` when git is missing.
-    pub(super) fn scratch_repo() -> Option<tempfile::TempDir> {
+    pub(crate) fn scratch_repo() -> Option<tempfile::TempDir> {
         if !hotl_store::worktree::git_available() {
             return None;
         }

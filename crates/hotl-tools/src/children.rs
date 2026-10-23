@@ -113,7 +113,17 @@ pub struct ChildEntry {
     pub stop_all: CancellationToken,
 }
 
-type Waiter = oneshot::Sender<(String, ChildResult)>;
+/// What a parked `wait` receives. `notified` says a `Notify` for this result
+/// was already sent (the waiter arrived while the slot was `Finishing`), so
+/// the reader must withdraw it.
+#[derive(Debug)]
+pub struct Handoff {
+    pub id: String,
+    pub result: ChildResult,
+    pub notified: bool,
+}
+
+type Waiter = oneshot::Sender<Handoff>;
 
 struct ChildSlot {
     record: ChildRecord,
@@ -127,7 +137,7 @@ struct ChildSlot {
 /// What [`Children::claim`] found.
 pub enum Claim {
     Ready(String, ChildResult),
-    Parked(oneshot::Receiver<(String, ChildResult)>),
+    Parked(oneshot::Receiver<Handoff>),
     /// Already being waited on by another call.
     Busy,
     Closed,
@@ -327,7 +337,12 @@ impl Children {
                 ended_ms: now_ms,
             };
             s.result = Some(result.clone());
-            if w.send((id.to_string(), result)).is_ok() {
+            let handoff = Handoff {
+                id: id.to_string(),
+                result,
+                notified: false,
+            };
+            if w.send(handoff).is_ok() {
                 return Deliver::ToWaiter;
             }
             // The waiter gave up (its turn was cancelled): the inbox it is.
@@ -355,7 +370,13 @@ impl Children {
         let ok = s.result.as_ref().is_some_and(|r| r.ok);
         let waiter = s.waiter.take().or_else(|| any_waiter.take());
         let claimed = match (waiter, s.result.clone()) {
-            (Some(w), Some(r)) => w.send((id.to_string(), r)).is_ok(),
+            (Some(w), Some(result)) => w
+                .send(Handoff {
+                    id: id.to_string(),
+                    result,
+                    notified: true,
+                })
+                .is_ok(),
             _ => false,
         };
         s.record.state = ChildState::Done {
@@ -459,7 +480,11 @@ impl Children {
             secs: now_ms.saturating_sub(s.record.started_ms) / 1000,
         };
         if let Some(w) = s.waiter.take().or_else(|| any_waiter.take()) {
-            let _ = w.send((id.to_string(), result.clone()));
+            let _ = w.send(Handoff {
+                id: id.to_string(),
+                result: result.clone(),
+                notified: false,
+            });
         }
         s.result = Some(result);
         s.record.state = ChildState::Closed;
@@ -577,8 +602,11 @@ mod tests {
         };
         assert!(matches!(c.claim(Some(&e.id)), Claim::Busy));
         assert_eq!(c.finish(&e.id, result("done"), 5_000), Deliver::ToWaiter);
-        let (id, got) = rx.blocking_recv().unwrap();
-        assert_eq!((id.as_str(), got.text.as_str()), (e.id.as_str(), "done"));
+        let got = rx.blocking_recv().unwrap();
+        assert_eq!(
+            (got.id.as_str(), got.result.text.as_str(), got.notified),
+            (e.id.as_str(), "done", false)
+        );
         assert_eq!(
             c.record(&e.id).unwrap().state,
             ChildState::Done {
@@ -618,7 +646,8 @@ mod tests {
             panic!("a finishing slot parks, never hands out a result the inbox may get");
         };
         assert!(c.published(&e.id, 5_001), "the waiter took it: unnotify");
-        assert_eq!(rx.blocking_recv().unwrap().1.text, "done");
+        let got = rx.blocking_recv().unwrap();
+        assert_eq!((got.result.text.as_str(), got.notified), ("done", true));
         assert!(matches!(
             c.record(&e.id).unwrap().state,
             ChildState::Done { claimed: true, .. }
@@ -670,7 +699,7 @@ mod tests {
         };
         assert!(matches!(c.claim(None), Claim::Busy));
         assert_eq!(c.finish(&r.id, result("r"), 7_000), Deliver::ToWaiter);
-        assert_eq!(rx.blocking_recv().unwrap().0, r.id);
+        assert_eq!(rx.blocking_recv().unwrap().id, r.id);
     }
 
     #[test]
@@ -772,7 +801,7 @@ mod tests {
             panic!()
         };
         c.abandoned(&e.id, "the task panicked".into(), 9_000);
-        let (_, r) = rx.blocking_recv().unwrap();
+        let r = rx.blocking_recv().unwrap().result;
         assert!(!r.ok && r.text.contains("panicked"));
         assert_eq!(c.record(&e.id).unwrap().state, ChildState::Closed);
         assert_eq!(c.running(), 0);

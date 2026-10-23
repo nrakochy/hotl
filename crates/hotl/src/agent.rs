@@ -2226,6 +2226,14 @@ fn spawn_session_inner(
             .with_events(event_tx.downgrade())
             .with_notify(cmd_tx.downgrade()),
         ));
+        // The three verbs for a background child (0072 D1), beside `spawn`.
+        registry.register(Box::new(crate::children_tools::WaitTool::new(Some(
+            cmd_tx.downgrade(),
+        ))));
+        registry.register(Box::new(crate::children_tools::SendTool));
+        registry.register(Box::new(crate::children_tools::ResumeTool::new(Some(
+            cmd_tx.downgrade(),
+        ))));
         // The workflow runner (0044) drives the same child builder; its
         // agents never see it either (`Registry::filtered`).
         registry.register(Box::new(
