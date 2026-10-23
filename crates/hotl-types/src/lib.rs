@@ -571,6 +571,13 @@ pub enum EntryPayload {
         note: String,
         date: String,
     },
+    /// The session's git worktree (0065): written at open, right after
+    /// `Rename`. Log-only, last one wins, like `Rename`; `None`/`None` is the
+    /// `--no-worktree` tombstone a resumed session writes.
+    WorktreeSet {
+        path: Option<String>,
+        branch: Option<String>,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -1383,6 +1390,30 @@ mod tests {
         let max = "x".repeat(MEMORY_NOTE_MAX_CHARS);
         assert_eq!(normalize_memory_note(&max), Some(max.clone()));
         assert_eq!(normalize_memory_note(&format!("{max}y")), None);
+    }
+
+    #[test]
+    fn worktree_set_round_trips_and_the_tombstone_is_two_nulls() {
+        let e = EntryPayload::WorktreeSet {
+            path: Some("/r/.git/hotl-worktrees/fix-auth".into()),
+            branch: Some("fix-auth".into()),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"worktree_set","path":"/r/.git/hotl-worktrees/fix-auth","branch":"fix-auth"}"#
+        );
+        assert_eq!(serde_json::from_str::<EntryPayload>(&json).unwrap(), e);
+        let tomb = EntryPayload::WorktreeSet {
+            path: None,
+            branch: None,
+        };
+        let json = serde_json::to_string(&tomb).unwrap();
+        assert_eq!(json, r#"{"kind":"worktree_set","path":null,"branch":null}"#);
+        assert_eq!(serde_json::from_str::<EntryPayload>(&json).unwrap(), tomb);
+        let future: EntryPayload =
+            serde_json::from_str(r#"{"kind":"worktree_moved","path":"x"}"#).unwrap();
+        assert_eq!(future, EntryPayload::Unknown);
     }
 
     #[test]

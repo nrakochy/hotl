@@ -150,6 +150,8 @@ pub enum EntryKind {
     Cleared,
     /// 0069: a confirmed memory write. Audit only; replay folds nothing.
     MemoryAppended,
+    /// 0065: the session's worktree. Log-only, last one wins.
+    WorktreeSet,
     Unknown,
 }
 
@@ -177,6 +179,7 @@ impl From<&EntryPayload> for EntryKind {
             EntryPayload::GoalSet { .. } => EntryKind::GoalSet,
             EntryPayload::Cleared { .. } => EntryKind::Cleared,
             EntryPayload::MemoryAppended { .. } => EntryKind::MemoryAppended,
+            EntryPayload::WorktreeSet { .. } => EntryKind::WorktreeSet,
             EntryPayload::Unknown => EntryKind::Unknown,
         }
     }
@@ -1387,6 +1390,10 @@ pub struct Replayed {
     /// cleared-vs-never-set, because a cleared goal behaves identically to
     /// no goal — the tombstone's `condition: None` folds to plain `None`.
     pub goal: Option<String>,
+    /// The session's git worktree as `(path, branch)` (last `WorktreeSet` in
+    /// the chain, child wins; 0065). A single `Option` like `goal`: the
+    /// `--no-worktree` tombstone folds to plain `None`.
+    pub worktree: Option<(String, String)>,
     /// Integrity warnings (a broken `parent_id` chain — H-12). Empty is clean.
     /// Replay is defensive regardless (indices clamped, unknowns degraded), so
     /// a warning means "this log was edited/corrupted since it was written",
@@ -1410,6 +1417,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
     let mut todos = Vec::new();
     let mut decisions = Vec::new();
     let mut goal = None;
+    let mut worktree = None;
     let applied = apply_log(
         path,
         &mut items,
@@ -1423,6 +1431,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
         &mut todos,
         &mut decisions,
         &mut goal,
+        &mut worktree,
         None,
     )?;
     Ok(Replayed {
@@ -1437,6 +1446,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
         todos,
         decisions,
         goal,
+        worktree,
         warnings,
         tip_entry_id: applied.last_entry_id,
     })
@@ -1554,6 +1564,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
     let mut todos = Vec::new();
     let mut decisions = Vec::new();
     let mut goal = None;
+    let mut worktree = None;
     let mut tip_entry_id = None;
     for (depth, (path, _)) in lineage.iter().enumerate().rev() {
         // Each ancestor is capped by the pin *its own child* recorded. The
@@ -1574,6 +1585,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
             &mut todos,
             &mut decisions,
             &mut goal,
+            &mut worktree,
             stop_after,
         )?;
         if depth == 0 {
@@ -1592,6 +1604,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
         todos,
         decisions,
         goal,
+        worktree,
         warnings,
         tip_entry_id,
     })
@@ -1634,6 +1647,7 @@ fn apply_log(
     todos: &mut Vec<hotl_types::Todo>,
     decisions: &mut Vec<hotl_types::Decision>,
     goal: &mut Option<String>,
+    worktree: &mut Option<(String, String)>,
     stop_after: Option<&str>,
 ) -> Result<Applied, String> {
     let file = File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -1775,6 +1789,8 @@ fn apply_log(
             // Log-only, last one wins; the tombstone's `condition: None`
             // clears, so chain/fork replay inherits child-wins for free.
             EntryPayload::GoalSet { condition, .. } => *goal = condition,
+            // Log-only, last one wins (0065); the two-null tombstone clears.
+            EntryPayload::WorktreeSet { path, branch } => *worktree = path.zip(branch),
             EntryPayload::Usage { .. } | EntryPayload::Cancelled { .. } => {}
             // `#[serde(other)]` keeps an old binary from crashing on a new
             // entry kind — but a dropped kind that *re-points* the projection
@@ -1881,6 +1897,29 @@ pub fn session_name(path: &Path) -> Option<String> {
 pub fn session_title(path: &Path) -> Option<String> {
     label_in_tail(path, "\"title\"", title_of)
         .or_else(|| label_by_full_scan(path, "\"title\"", title_of))
+}
+
+/// The session's worktree as `(path, branch)`: the last `worktree_set` in its
+/// log, `None` for none or a tombstone (0065). A substring-prefiltered line
+/// scan — the entry sits in the first handful of lines at open, and the
+/// picker and `hotl gc` must never pay for a replay. Last one wins, so the
+/// whole file is read; the prefilter keeps that cheap.
+pub fn session_worktree(path: &Path) -> Option<(String, String)> {
+    let file = File::open(path).ok()?;
+    let mut found: Option<Option<(String, String)>> = None;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if !line.contains("\"worktree_set\"") {
+            continue;
+        }
+        if let Ok(Entry {
+            payload: EntryPayload::WorktreeSet { path, branch },
+            ..
+        }) = serde_json::from_str::<Entry>(&line)
+        {
+            found = Some(path.zip(branch));
+        }
+    }
+    found.flatten()
 }
 
 fn rename_of(entry: Entry) -> Option<String> {
@@ -2460,6 +2499,98 @@ mod tests {
         )
         .unwrap();
         assert_eq!(replay(&path).unwrap().goal, None);
+    }
+
+    /// 0065 T3: the worktree rides the log like a name — last one wins,
+    /// never a projection item, the two-null tombstone clears it, and the
+    /// cheap reader agrees with replay.
+    #[test]
+    fn worktree_set_replays_last_one_wins_and_never_enters_the_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let path = log.path().to_path_buf();
+        assert_eq!(session_worktree(&path), None);
+        log.append(
+            &EntryPayload::WorktreeSet {
+                path: Some("/r/.git/hotl-worktrees/a".into()),
+                branch: Some("a".into()),
+            },
+            2,
+        )
+        .unwrap();
+        log.append(
+            &EntryPayload::WorktreeSet {
+                path: Some("/r/.git/hotl-worktrees/b".into()),
+                branch: Some("b".into()),
+            },
+            3,
+        )
+        .unwrap();
+        let replayed = replay(&path).unwrap();
+        assert_eq!(
+            replayed.worktree,
+            Some(("/r/.git/hotl-worktrees/b".into(), "b".into()))
+        );
+        assert!(
+            replayed.items.is_empty(),
+            "worktree_set is not a projection item"
+        );
+        assert_eq!(session_worktree(&path), replayed.worktree);
+        // A child inherits it, and a child's tombstone wins over the parent.
+        let mut child = SessionLog::create(
+            dir.path(),
+            "m",
+            Some(ParentRef {
+                session_id: log.session_id.clone(),
+                tip_entry_id: None,
+            }),
+            Masker::empty(),
+            4,
+        )
+        .unwrap();
+        let child_path = child.path().to_path_buf();
+        assert_eq!(
+            replay_chain(dir.path(), &child.session_id)
+                .unwrap()
+                .worktree,
+            Some(("/r/.git/hotl-worktrees/b".into(), "b".into()))
+        );
+        child
+            .append(
+                &EntryPayload::WorktreeSet {
+                    path: None,
+                    branch: None,
+                },
+                5,
+            )
+            .unwrap();
+        assert_eq!(
+            replay_chain(dir.path(), &child.session_id)
+                .unwrap()
+                .worktree,
+            None
+        );
+        assert_eq!(
+            session_worktree(&child_path),
+            None,
+            "the tombstone folds to none"
+        );
+        // A big log: the scan still finds the last one.
+        let filler = "y".repeat(4096);
+        for _ in 0..64 {
+            log.append(
+                &EntryPayload::Item {
+                    item: Item::User {
+                        text: filler.clone(),
+                        synthetic: None,
+                        images: Vec::new(),
+                    },
+                },
+                6,
+            )
+            .unwrap();
+        }
+        assert_eq!(session_worktree(&path).map(|w| w.1), Some("b".into()));
     }
 
     /// A parent's tombstone survives into the child: resuming a session whose
