@@ -313,6 +313,7 @@ fn item_fingerprint(item: &TranscriptItem, thinking_expanded: bool, band_keys: b
         TranscriptItem::Report(r) => (6u8, r).hash(&mut h),
         TranscriptItem::Error { text } => (7u8, text_key(text)).hash(&mut h),
         TranscriptItem::WorkflowsReport(runs) => (8u8, runs).hash(&mut h),
+        TranscriptItem::JobsReport(rows) => (10u8, rows).hash(&mut h),
         TranscriptItem::Plan(plan) => (9u8, plan).hash(&mut h),
         TranscriptItem::TurnSummary {
             secs,
@@ -703,6 +704,7 @@ fn speaker(item: &TranscriptItem) -> Speaker {
         | TranscriptItem::Error { .. }
         | TranscriptItem::Report(_)
         | TranscriptItem::WorkflowsReport(_)
+        | TranscriptItem::JobsReport(_)
         | TranscriptItem::TurnSummary { .. }
         | TranscriptItem::Plan(_) => Speaker::Harness,
     }
@@ -1326,6 +1328,17 @@ fn item_block<'a>(
             },
             full(workflow_lines(runs, p)),
         ),
+        // A `/jobs` report (0064): one row per job.
+        TranscriptItem::JobsReport(rows) => (
+            Spine {
+                indent: 0,
+                marker: "·",
+                cont: "·",
+                marker_style: Style::new().fg(p.muted),
+                cont_style: Style::new().fg(p.muted),
+            },
+            full(job_lines(rows, p)),
+        ),
         // The plan card (0056 T3). A live one carries its two keys; an
         // answered one keeps the plan and drops them.
         TranscriptItem::Plan(plan) => (
@@ -1511,6 +1524,40 @@ fn plan_lines<'a>(plan: &crate::app::PresentedPlan, p: &Palette) -> Vec<Line<'a>
             "a approve · r revise (or just say what to change)",
             Style::new().fg(p.accent).bold(),
         ));
+    }
+    out
+}
+
+/// `a1b2c3 · running · 4m12s · cargo nextest run`, one row per job (0064).
+fn job_lines<'a>(rows: &[crate::app::JobRow], p: &Palette) -> Vec<Line<'a>> {
+    let mut out = vec![Line::styled(
+        format!(
+            "Background jobs — {} job{}",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" }
+        ),
+        Style::new().fg(p.ink).bold(),
+    )];
+    for r in rows {
+        let (state, color) = match (r.state.as_str(), r.rc.as_deref()) {
+            ("running", _) => ("running".to_string(), p.active),
+            (_, Some("0")) => ("exit 0".to_string(), p.idle),
+            (_, Some(rc)) => (format!("exit {rc}"), p.blocked),
+            _ => (r.state.clone(), p.muted),
+        };
+        let detached = if r.detached { " · detached" } else { "" };
+        out.push(Line::from(vec![
+            Span::styled(r.id.clone(), Style::new().fg(p.ink).bold()),
+            Span::styled(format!(" · {state}"), Style::new().fg(color)),
+            Span::styled(
+                format!(
+                    " · {}{detached} · {}",
+                    crate::app::fmt_secs(r.secs),
+                    r.command
+                ),
+                Style::new().fg(p.muted),
+            ),
+        ]));
     }
     out
 }
@@ -2352,6 +2399,15 @@ fn strip_chips(state: &State, p: &Palette) -> Vec<Chip> {
         chips.push(Chip {
             text: format!(" ⚑ {} ", state.flag_count),
             style: Style::new().fg(p.band).bg(p.blocked).bold(),
+            rank: anim::KEEP,
+        });
+    }
+    // Jobs chip (0064 D10): how many background jobs run right now — the
+    // only liveness signal a job has, since it owns no stream and no band row.
+    if state.jobs_running > 0 {
+        chips.push(Chip {
+            text: format!(" ⚙ {} ", state.jobs_running),
+            style: Style::new().fg(p.muted).bg(p.band),
             rank: anim::KEEP,
         });
     }

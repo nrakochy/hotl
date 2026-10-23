@@ -510,6 +510,14 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
         Cmd::RequestWorkflows => {
             client.request("session/workflows", json!({})).await?;
         }
+        Cmd::RequestJobs => {
+            client.request("session/jobs", json!({})).await?;
+        }
+        Cmd::StopJob(job) => {
+            client
+                .request("session/jobs/stop", json!({"job": job}))
+                .await?;
+        }
         Cmd::ReplyPermission {
             req_id,
             allow,

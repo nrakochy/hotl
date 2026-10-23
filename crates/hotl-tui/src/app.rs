@@ -264,6 +264,8 @@ pub enum TranscriptItem {
     /// `/workflows` (0044): every run of the `workflow` tool this process has
     /// started, one row each. Parsed ad hoc from the payload like `ContextRow`.
     WorkflowsReport(Vec<WorkflowRun>),
+    /// `/jobs` (0064): this session's background jobs, one row each.
+    JobsReport(Vec<JobRow>),
     /// A plan the model handed over (`present_plan`, 0056 T3). Its own item
     /// rather than a `Notice`: it carries the two answers, and a plan the
     /// human is meant to act on must not read as muted chatter.
@@ -307,6 +309,19 @@ pub struct PlanStep {
 }
 
 /// One `workflow` run as `/workflows` shows it.
+/// One `/jobs` row (0064), parsed from the `jobs_report` payload.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JobRow {
+    pub id: String,
+    /// `running` | `done`, verbatim from the wire.
+    pub state: String,
+    /// The `rc` text once done.
+    pub rc: Option<String>,
+    pub secs: u64,
+    pub command: String,
+    pub detached: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WorkflowRun {
     pub name: String,
@@ -587,6 +602,9 @@ pub struct State {
     /// `read-write`, `off`); `None` on an older server. `/remember <note>`
     /// refuses locally unless it reads `read-write`.
     pub memory_mode: Option<String>,
+    /// Background jobs running right now (0064): `job_started` adds,
+    /// `job_done` removes. The strip's `⚙ N` chip.
+    pub jobs_running: usize,
     /// What the last turn actually cost the provider — the exact figure a
     /// `/context` report shows beside its estimate. `on_prompt_result`
     /// computes it for the strip's `% ctx` segment and used to discard it.
@@ -764,6 +782,7 @@ impl State {
             todos: Vec::new(),
             goal: None,
             memory_mode: None,
+            jobs_running: 0,
             goal_ticks: 0,
             goal_turns: 0,
             goal_last_reason: None,
@@ -1012,6 +1031,11 @@ pub enum Cmd {
     /// Send `session/workflows` (0044; same fire-and-forget shape — the
     /// engine broadcasts `workflows_report`).
     RequestWorkflows,
+    /// Send `session/jobs` (0064); the report comes back as `jobs_report`.
+    RequestJobs,
+    /// Send `session/jobs/stop` for one job id (0064); the `job_done` frame
+    /// is the outcome.
+    StopJob(String),
     /// Re-read the client-side half of `config.toml` — theme, density, vim
     /// mode, mouse. The runtime owns this one: `hotl-tui` never touches the
     /// filesystem.
@@ -1110,6 +1134,11 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                         // owner's own doing, not the dead turn's.
                         | "memory_changed"
                         | "memory_report"
+                        // A job runs on past the dead turn; its frames are
+                        // session state, not the turn's.
+                        | "job_started"
+                        | "job_done"
+                        | "jobs_report"
                         // A plan presented while detached must be on screen
                         // when you come back: it is waiting on you.
                         | "plan_presented"
@@ -2008,6 +2037,27 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         // about a session both surfaces share.
         "context_report" => push_context_report(state, v),
         "workflows_report" => push_workflows_report(state, v),
+        // Jobs (0064): the chip counts, a finished job is one notice line.
+        "job_started" => state.jobs_running += 1,
+        "job_done" => {
+            state.jobs_running = state.jobs_running.saturating_sub(1);
+            let secs = v.get("secs").and_then(Value::as_u64).unwrap_or(0);
+            let by = v
+                .get("stopped_by")
+                .and_then(Value::as_str)
+                .map(|b| format!(" · stopped by {b}"))
+                .unwrap_or_default();
+            notice(
+                state,
+                format!(
+                    "job {} ended · exit {} · {}{by}",
+                    text_of("job"),
+                    text_of("rc"),
+                    fmt_secs(secs)
+                ),
+            );
+        }
+        "jobs_report" => push_jobs_report(state, v),
         // 0056 T3. Only one plan is ever live: a second `present_plan`
         // supersedes the first, so the old card loses its keys.
         "plan_presented" => {
@@ -2179,6 +2229,43 @@ fn push_context_report(state: &mut State, v: &Value) {
         free: window.saturating_sub(estimated.max(reported.unwrap_or(0))),
         rows: display,
     }));
+}
+
+/// `4m12s` / `38s`, for the job lines.
+pub fn fmt_secs(secs: u64) -> String {
+    if secs >= 60 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Turn a `jobs_report` payload into a `TranscriptItem::JobsReport` (0064).
+fn push_jobs_report(state: &mut State, v: &Value) {
+    let Some(jobs) = v.get("jobs").and_then(Value::as_array) else {
+        notice(
+            state,
+            "could not read the jobs report the engine sent".into(),
+        );
+        return;
+    };
+    if jobs.is_empty() {
+        notice(state, "no background jobs in this session".into());
+        return;
+    }
+    let str_of = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("?").to_string();
+    let rows = jobs
+        .iter()
+        .map(|j| JobRow {
+            id: str_of(j, "id"),
+            state: str_of(j, "state"),
+            rc: j.get("rc").and_then(Value::as_str).map(str::to_string),
+            secs: j.get("secs").and_then(Value::as_u64).unwrap_or(0),
+            command: str_of(j, "command"),
+            detached: j.get("detached").and_then(Value::as_bool).unwrap_or(false),
+        })
+        .collect();
+    state.transcript.push(TranscriptItem::JobsReport(rows));
 }
 
 /// Turn a `workflows_report` payload into a `TranscriptItem::WorkflowsReport`.
@@ -3244,6 +3331,15 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
         // Every run of the `workflow` tool this process has started, with
         // per-phase progress — read-only, safe mid-turn like `/context`.
         "workflows" => vec![Cmd::RequestWorkflows],
+        // `/jobs` lists, `/jobs stop <id>` kills (0064 D10).
+        "jobs" => match arg.trim().split_once(char::is_whitespace) {
+            None if arg.trim().is_empty() => vec![Cmd::RequestJobs],
+            Some(("stop", id)) if !id.trim().is_empty() => vec![Cmd::StopJob(id.trim().into())],
+            _ => {
+                notice(state, "usage: /jobs | /jobs stop <id>".into());
+                Vec::new()
+            }
+        },
         // The strip shows a compact line; this prints the breakdown without
         // stealing strip width.
         "cost" => {
@@ -7284,8 +7380,8 @@ mod tests {
     fn typing_a_slash_opens_the_popup_and_narrows_as_you_type() {
         let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/");
-        // Eighteen built-ins plus the one skill.
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(19));
+        // Nineteen built-ins plus the one skill.
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(20));
         type_str(&mut s, "re");
         assert_eq!(selected(&s), "reload");
         // `reload`, `rename`, `review` and `remember` prefix-match, then the
@@ -8508,6 +8604,136 @@ mod tests {
         );
         assert_eq!(slash(&mut s, "context"), vec![Cmd::RequestContext]);
         assert_eq!(slash(&mut s, "workflows"), vec![Cmd::RequestWorkflows]);
+    }
+
+    #[test]
+    fn a_job_started_frame_adds_the_chip_and_job_done_removes_it() {
+        let mut s = State::test_default();
+        upd(
+            &mut s,
+            json!({"type": "job_started", "id": "t1", "job": "a1b2c3", "pid": 42, "command": "cargo test", "detached": false}),
+        );
+        assert_eq!(s.jobs_running, 1);
+        upd(
+            &mut s,
+            json!({"type": "job_started", "id": "t2", "job": "d4e5f6", "pid": 43, "command": "sleep 9", "detached": true}),
+        );
+        assert_eq!(s.jobs_running, 2);
+        upd(
+            &mut s,
+            json!({"type": "job_done", "id": "t1", "job": "a1b2c3", "rc": "0", "secs": 252, "stopped_by": null}),
+        );
+        assert_eq!(s.jobs_running, 1);
+        // A stray done never underflows.
+        upd(
+            &mut s,
+            json!({"type": "job_done", "job": "x", "rc": "0", "secs": 1}),
+        );
+        upd(
+            &mut s,
+            json!({"type": "job_done", "job": "y", "rc": "0", "secs": 1}),
+        );
+        assert_eq!(s.jobs_running, 0);
+    }
+
+    #[test]
+    fn job_done_pushes_a_notice_with_exit_and_duration() {
+        let mut s = State::test_default();
+        upd(
+            &mut s,
+            json!({"type": "job_done", "job": "a1b2c3", "rc": "0", "secs": 252, "stopped_by": null}),
+        );
+        assert_eq!(last_notice(&s), "job a1b2c3 ended · exit 0 · 4m12s");
+        upd(
+            &mut s,
+            json!({"type": "job_done", "job": "d4e5f6", "rc": "killed:SIGKILL", "secs": 38, "stopped_by": "timeout"}),
+        );
+        assert_eq!(
+            last_notice(&s),
+            "job d4e5f6 ended · exit killed:SIGKILL · 38s · stopped by timeout"
+        );
+    }
+
+    #[test]
+    fn slash_jobs_requests_the_report_and_stop_sends_the_id() {
+        let mut s = State::test_default();
+        assert_eq!(type_and_submit(&mut s, "/jobs"), vec![Cmd::RequestJobs]);
+        assert_eq!(
+            type_and_submit(&mut s, "/jobs stop a1b2c3"),
+            vec![Cmd::StopJob("a1b2c3".into())]
+        );
+        assert!(type_and_submit(&mut s, "/jobs frob").is_empty());
+        assert!(
+            last_notice(&s).contains("usage: /jobs"),
+            "{}",
+            last_notice(&s)
+        );
+        assert!(type_and_submit(&mut s, "/jobs stop").is_empty());
+    }
+
+    #[test]
+    fn a_jobs_report_renders_one_row_per_job_and_malformed_or_empty_ones_notice() {
+        let mut s = State::test_default();
+        upd(
+            &mut s,
+            json!({"type": "jobs_report", "jobs": [
+                {"id": "a1b2c3", "pid": 42, "command": "cargo nextest run", "started_ms": 1, "detached": false, "state": "running", "rc": null, "secs": 252},
+                {"id": "d4e5f6", "pid": 43, "command": "sleep 1", "started_ms": 1, "detached": true, "state": "done", "rc": "0", "secs": 1}
+            ]}),
+        );
+        let Some(TranscriptItem::JobsReport(rows)) = s.transcript.last() else {
+            panic!("{:?}", s.transcript.last());
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            JobRow {
+                id: "a1b2c3".into(),
+                state: "running".into(),
+                rc: None,
+                secs: 252,
+                command: "cargo nextest run".into(),
+                detached: false,
+            }
+        );
+        assert_eq!(rows[1].rc.as_deref(), Some("0"));
+        assert!(rows[1].detached);
+        upd(&mut s, json!({"type": "jobs_report", "jobs": []}));
+        assert_eq!(last_notice(&s), "no background jobs in this session");
+        upd(&mut s, json!({"type": "jobs_report"}));
+        assert!(
+            last_notice(&s).contains("could not read"),
+            "{}",
+            last_notice(&s)
+        );
+    }
+
+    #[test]
+    fn the_chip_survives_a_turn_end_and_a_detached_turn() {
+        let mut s = State::test_default();
+        upd(
+            &mut s,
+            json!({"type": "job_started", "job": "a1b2c3", "pid": 42, "command": "x", "detached": false}),
+        );
+        update(
+            &mut s,
+            Msg::PromptResult {
+                outcome_kind: "end_turn".into(),
+                outcome_text: None,
+                usage: json!({}),
+                finished_at: None,
+            },
+        );
+        assert_eq!(s.phase, Phase::Idle);
+        assert_eq!(s.jobs_running, 1, "a job outlives the turn");
+        // And a detached turn's job frames are not absorbed.
+        s.detached_turns = 1;
+        upd(
+            &mut s,
+            json!({"type": "job_done", "job": "a1b2c3", "rc": "0", "secs": 3}),
+        );
+        assert_eq!(s.jobs_running, 0);
+        assert!(last_notice(&s).contains("job a1b2c3 ended"));
     }
 
     #[test]
