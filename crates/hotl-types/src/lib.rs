@@ -560,6 +560,14 @@ pub enum EntryPayload {
     Cleared {
         ids: Vec<String>,
     },
+    /// One confirmed `/remember` write (0069): an audit record of who wrote
+    /// what and when. Log-only — the file is the state; replay restores
+    /// nothing from it.
+    MemoryAppended {
+        path: String,
+        note: String,
+        date: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -755,6 +763,20 @@ pub const GOAL_MAX_CHARS: usize = 4000;
 pub fn normalize_goal(raw: &str) -> Option<String> {
     let goal = raw.trim();
     (!goal.is_empty() && goal.chars().count() <= GOAL_MAX_CHARS).then(|| goal.to_string())
+}
+
+/// A memory note (0069) is at most this many characters.
+pub const MEMORY_NOTE_MAX_CHARS: usize = 2000;
+
+/// One validator for the console, ACP and the `remember` tool: trimmed, one
+/// line (a newline could forge a second bullet or a heading in the memory
+/// file), control sequences stripped, runs of spaces collapsed, 1–2000 chars.
+/// The text is otherwise verbatim — it loads inside the untrusted envelope.
+pub fn normalize_memory_note(raw: &str) -> Option<String> {
+    let flat = raw.replace(['\r', '\n'], " ");
+    let clean = sanitize::strip_control(&flat);
+    let note = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!note.is_empty() && note.chars().count() <= MEMORY_NOTE_MAX_CHARS).then_some(note)
 }
 
 #[cfg(test)]
@@ -1328,6 +1350,39 @@ mod tests {
         assert_eq!(normalize_goal(&long), None);
         let max = "é".repeat(GOAL_MAX_CHARS); // chars, not bytes
         assert_eq!(normalize_goal(&max), Some(max.clone()));
+    }
+
+    #[test]
+    fn normalize_memory_note_collapses_newlines_strips_control_and_bounds() {
+        assert_eq!(
+            normalize_memory_note("  tests need nextest\n- forged bullet\r\n## heading  "),
+            Some("tests need nextest - forged bullet ## heading".into())
+        );
+        assert_eq!(
+            normalize_memory_note("plain\x1b[2K   words"),
+            Some("plain words".into())
+        );
+        assert_eq!(normalize_memory_note("   \n\t "), None);
+        let max = "x".repeat(MEMORY_NOTE_MAX_CHARS);
+        assert_eq!(normalize_memory_note(&max), Some(max.clone()));
+        assert_eq!(normalize_memory_note(&format!("{max}y")), None);
+    }
+
+    #[test]
+    fn memory_appended_roundtrips_and_old_readers_see_unknown() {
+        let entry = EntryPayload::MemoryAppended {
+            path: "/data/memory/abc/MEMORY.md".into(),
+            note: "tests need nextest".into(),
+            date: "2026-10-22".into(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"kind\":\"memory_appended\""), "{json}");
+        assert_eq!(serde_json::from_str::<EntryPayload>(&json).unwrap(), entry);
+        // A kind this binary does not know folds to `Unknown`, so an older
+        // reader of this entry sees the same thing a newer one's stranger does.
+        let future: EntryPayload =
+            serde_json::from_str("{\"kind\":\"memory_consolidated\",\"n\":3}").unwrap();
+        assert_eq!(future, EntryPayload::Unknown);
     }
 
     #[test]

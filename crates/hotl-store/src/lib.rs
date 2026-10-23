@@ -148,6 +148,8 @@ pub enum EntryKind {
     Todos,
     GoalSet,
     Cleared,
+    /// 0069: a confirmed memory write. Audit only; replay folds nothing.
+    MemoryAppended,
     Unknown,
 }
 
@@ -174,6 +176,7 @@ impl From<&EntryPayload> for EntryKind {
             EntryPayload::Todos { .. } => EntryKind::Todos,
             EntryPayload::GoalSet { .. } => EntryKind::GoalSet,
             EntryPayload::Cleared { .. } => EntryKind::Cleared,
+            EntryPayload::MemoryAppended { .. } => EntryKind::MemoryAppended,
             EntryPayload::Unknown => EntryKind::Unknown,
         }
     }
@@ -1725,6 +1728,8 @@ fn apply_log(
             EntryPayload::Cleared { ids } => {
                 hotl_types::clear_results(items, &ids);
             }
+            // Audit only (0069): the memory file is the state.
+            EntryPayload::MemoryAppended { .. } => {}
             EntryPayload::BranchMove { keep_items } => items.truncate(keep_items),
             EntryPayload::Supersede { digest } => items.extend(digest),
             EntryPayload::PendingAsk { id, summary, .. } => {
