@@ -456,7 +456,13 @@ pub fn execute_later_reason(path: &str) -> Option<&'static str> {
     if matches!(file, "agents.md" | "claude.md") {
         return Some("agent instructions: injected into future model contexts");
     }
-    if file == "settings.json" || p.contains(".hotl/") || p.contains(".claude/") {
+    // `.agents/` joins the class (0068 D7): a project skill planted there is
+    // read by the next session's roster walk.
+    if file == "settings.json"
+        || p.contains(".hotl/")
+        || p.contains(".claude/")
+        || p.contains(".agents/")
+    {
         return Some("harness settings/hooks: change how future sessions behave");
     }
     // hotl's own config: allow rules live here, and [provider] api_key_helper
@@ -870,6 +876,27 @@ mod tests {
                 "dot-relative {f}"
             );
         }
+    }
+
+    /// 0068 D7: a project skill planted under `.agents/` is read by the next
+    /// session's roster walk, so the write carries the ⚑ notice like `.claude/`.
+    #[test]
+    fn dot_agents_writes_are_execute_later() {
+        for p in [
+            ".agents/skills/deploy/SKILL.md",
+            "/srv/app/.agents/skills/x/SKILL.md",
+            "sub/.agents/anything.md",
+        ] {
+            assert_eq!(
+                execute_later_reason(p),
+                Some("harness settings/hooks: change how future sessions behave"),
+                "{p}"
+            );
+        }
+        assert!(
+            execute_later_reason("agents/openai.yaml").is_none(),
+            "no dot, no class"
+        );
     }
 
     #[test]
