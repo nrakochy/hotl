@@ -2,7 +2,7 @@
 #
 # nextest schedules every test from every crate into one process pool sized to
 # the machine's cores, instead of `cargo test`'s one-binary-at-a-time run. On
-# this workspace — ~68 test binaries, many latency-bound on sleeps and real
+# this workspace — ~40 test binaries, many latency-bound on sleeps and real
 # `git` subprocesses — that oversubscription cuts the warm run from >10min
 # (cargo test, never finished) to a couple of minutes.
 #
