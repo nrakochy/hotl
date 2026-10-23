@@ -97,6 +97,94 @@ pub fn foreground_argv(pane_id: &str) -> Vec<String> {
     ]
 }
 
+/// The smoke driver's verbs (0074 T1), all against a private server:
+/// `-L <socket>` plus `-f /dev/null` so the developer's `~/.tmux.conf` never
+/// shapes a capture. Pure argv, like `foreground_argv`; the one `Command`
+/// call site lives in the testkit.
+pub fn new_session_argv(
+    socket: &str,
+    name: &str,
+    cols: u16,
+    rows: u16,
+    cwd: &str,
+    cmd: &[&str],
+) -> Vec<String> {
+    let mut v: Vec<String> = [
+        "-L",
+        socket,
+        "-f",
+        "/dev/null",
+        "new-session",
+        "-d",
+        "-s",
+        name,
+        "-x",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    v.push(cols.to_string());
+    v.push("-y".into());
+    v.push(rows.to_string());
+    v.push("-c".into());
+    v.push(cwd.into());
+    v.extend(cmd.iter().map(|s| s.to_string()));
+    v
+}
+
+/// `-l` is what makes typed text literal — without it `send-keys Enter` is a
+/// key and `send-keys go` is two keys (`g`, `o`). Key presses never pass it.
+pub fn send_keys_argv(socket: &str, target: &str, keys: &[&str], literal: bool) -> Vec<String> {
+    let mut v: Vec<String> = ["-L", socket, "send-keys", "-t", target]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if literal {
+        v.push("-l".into());
+    }
+    v.extend(keys.iter().map(|s| s.to_string()));
+    v
+}
+
+/// `-p` prints to stdout; `-e` keeps the escape sequences (colors) in.
+pub fn capture_argv(socket: &str, target: &str, escapes: bool) -> Vec<String> {
+    let mut v: Vec<String> = ["-L", socket, "capture-pane", "-p"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if escapes {
+        v.push("-e".into());
+    }
+    v.push("-t".into());
+    v.push(target.into());
+    v
+}
+
+pub fn resize_argv(socket: &str, target: &str, cols: u16, rows: u16) -> Vec<String> {
+    [
+        "-L",
+        socket,
+        "resize-window",
+        "-t",
+        target,
+        "-x",
+        &cols.to_string(),
+        "-y",
+        &rows.to_string(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// `kill-server`, not `kill-session`: a stray window cannot outlive the test.
+pub fn kill_server_argv(socket: &str) -> Vec<String> {
+    ["-L", socket, "kill-server"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 pub fn run_foreground(pane_id: &str) -> io::Result<()> {
     let status = Command::new("tmux")
         .args(foreground_argv(pane_id))
@@ -137,6 +225,82 @@ mod tests {
 base-0\u{1f}0\u{1f}zsh\u{1f}0\u{1f}%25\u{1f}35580\u{1f}claude\u{1f}/Users/nrakochy/sources/lca-worktrees/nar-lattice-login-map-view-transition\u{1f}0\u{1f}1\u{1f}✳ task a
 base-0\u{1f}0\u{1f}zsh\u{1f}1\u{1f}%51\u{1f}30578\u{1f}claude\u{1f}/Users/nrakochy/sources/lca\u{1f}0\u{1f}1\u{1f}✳ task b
 base-0\u{1f}0\u{1f}zsh\u{1f}4\u{1f}%55\u{1f}80031\u{1f}zsh\u{1f}/Users/nrakochy/sources/lca-worktrees/nar-keycloak-theme-publish-ci\u{1f}1\u{1f}1\u{1f}zsh";
+
+    #[test]
+    fn new_session_argv_is_detached_and_private() {
+        let v = new_session_argv(
+            "hotl-smoke-1-2",
+            "smoke",
+            80,
+            24,
+            "/work",
+            &["hotl", "-n", "smoke"],
+        );
+        assert_eq!(
+            v,
+            [
+                "-L",
+                "hotl-smoke-1-2",
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "smoke",
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "-c",
+                "/work",
+                "hotl",
+                "-n",
+                "smoke"
+            ]
+        );
+        assert_eq!(
+            kill_server_argv("hotl-smoke-1-2"),
+            ["-L", "hotl-smoke-1-2", "kill-server"]
+        );
+        assert_eq!(
+            resize_argv("s", "smoke", 60, 24),
+            [
+                "-L",
+                "s",
+                "resize-window",
+                "-t",
+                "smoke",
+                "-x",
+                "60",
+                "-y",
+                "24"
+            ]
+        );
+        assert_eq!(
+            capture_argv("s", "smoke", false),
+            ["-L", "s", "capture-pane", "-p", "-t", "smoke"]
+        );
+        assert_eq!(
+            capture_argv("s", "smoke", true),
+            ["-L", "s", "capture-pane", "-p", "-e", "-t", "smoke"]
+        );
+    }
+
+    #[test]
+    fn send_keys_argv_is_literal_only_when_asked() {
+        assert_eq!(
+            send_keys_argv("s", "smoke", &["go"], true),
+            ["-L", "s", "send-keys", "-t", "smoke", "-l", "go"]
+        );
+        assert_eq!(
+            send_keys_argv("s", "smoke", &["Enter"], false),
+            ["-L", "s", "send-keys", "-t", "smoke", "Enter"]
+        );
+        assert_eq!(
+            send_keys_argv("s", "smoke", &["C-g", "Escape"], false),
+            ["-L", "s", "send-keys", "-t", "smoke", "C-g", "Escape"]
+        );
+    }
 
     #[test]
     fn parses_all_panes() {
