@@ -3276,3 +3276,209 @@ async fn session_jobs_stop_kills_by_id_and_unknown_ids_say_so() {
     let ack = read_until_id(&mut lines, 7).await;
     assert_eq!(ack["result"]["stopped"], false, "{ack}");
 }
+
+/// Registers a fake running sub-agent with the session's registry (0072), so
+/// `session/children` has something to report without a real child builder.
+struct RegisterChild;
+
+impl hotl_tools::Tool for RegisterChild {
+    fn name(&self) -> &'static str {
+        "register_child"
+    }
+    fn description(&self) -> &str {
+        "starts a fake background child"
+    }
+    fn schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    fn permission(&self, _input: &Value) -> hotl_tools::Permission {
+        hotl_tools::Permission::None
+    }
+    fn read_only(&self) -> bool {
+        true
+    }
+    fn run<'a>(
+        &'a self,
+        _input: Value,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> futures_util::future::BoxFuture<'a, hotl_tools::ToolOutcome> {
+        Box::pin(async move {
+            let Some(children) = hotl_tools::children::registry() else {
+                return hotl_tools::ToolOutcome::err("no registry");
+            };
+            let (steer, _) = tokio::sync::mpsc::channel(1);
+            let (resume, _) = tokio::sync::mpsc::channel(1);
+            let entry = children
+                .register(hotl_tools::children::ChildSpec {
+                    call_id: hotl_tools::current_call_id(),
+                    agent_type: "explore".into(),
+                    summary: "look around".into(),
+                    background: true,
+                    isolated: false,
+                    read_only: true,
+                    started_ms: 1_000,
+                    steer,
+                    resume,
+                })
+                .unwrap();
+            hotl_tools::ToolOutcome::ok(format!("started {}", entry.id))
+        })
+    }
+}
+
+/// A session whose scripted model starts one fake child, then finishes a
+/// second one as parked.
+fn children_factory() -> acp::SessionFactory {
+    Box::new(move |_spec| {
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ScriptedProvider::tool_call("t1", "register_child", json!({})),
+            ScriptedProvider::text_reply("started it"),
+        ]));
+        let mut registry = Registry::builtin();
+        registry.register(Box::new(RegisterChild));
+        Ok(acp::SessionOpen {
+            handle: spawn_session(SessionDeps {
+                concurrency: Default::default(),
+                provider,
+                registry: Arc::new(registry),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: std::env::temp_dir(),
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
+                initial_goal: None,
+                config: EngineConfig {
+                    max_turns: 6,
+                    ..Default::default()
+                },
+            }),
+            name: None,
+            mode: "ask".into(),
+            plan: false,
+            default_effort: None,
+            effort_schedule: None,
+            goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
+            memory_mode: None,
+            session_id,
+            warnings: Vec::new(),
+            title: None,
+            model: None,
+        })
+    })
+}
+
+async fn children_report(
+    cwrite: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    lines: &mut tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+    id: u64,
+) -> Value {
+    send(
+        cwrite,
+        json!({"jsonrpc":"2.0","id":id,"method":"session/children","params":{}}),
+    )
+    .await;
+    for _ in 0..12 {
+        let m = next(lines).await;
+        if m["method"] == "session/update" && m["params"]["update"]["type"] == "children_report" {
+            return m["params"]["update"].clone();
+        }
+    }
+    panic!("no children_report");
+}
+
+#[tokio::test]
+async fn session_children_reports_running_and_closed() {
+    let (mut cwrite, mut lines, _) = open_memory_session(children_factory()).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"text":"go"}}),
+    )
+    .await;
+    read_until_id(&mut lines, 3).await;
+    let r = children_report(&mut cwrite, &mut lines, 4).await;
+    let rows = r["children"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{r}");
+    let row = &rows[0];
+    assert_eq!(row["id"].as_str().unwrap().len(), 6);
+    assert_eq!(row["call_id"], "t1", "the spawn call's id");
+    assert_eq!(row["agent_type"], "explore");
+    assert_eq!(row["summary"], "look around");
+    assert_eq!(row["state"], "running");
+    assert_eq!(row["ok"], json!(null));
+    assert_eq!(row["background"], true);
+    assert_eq!(row["isolated"], false);
+    assert!(row["secs"].as_u64().is_some());
+    let child = row["id"].as_str().unwrap().to_string();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":5,"method":"session/children/stop","params":{"child": child}}),
+    )
+    .await;
+    let ack = read_until_id(&mut lines, 5).await;
+    assert_eq!(ack["result"]["stopped"], true, "{ack}");
+    let r = children_report(&mut cwrite, &mut lines, 6).await;
+    assert_eq!(r["children"][0]["state"], "closed", "{r}");
+}
+
+#[tokio::test]
+async fn session_children_stop_interrupts_by_id_and_unknown_ids_say_so() {
+    let (mut cwrite, mut lines, _) = open_memory_session(children_factory()).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"text":"go"}}),
+    )
+    .await;
+    read_until_id(&mut lines, 3).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/children/stop","params":{"child":"nope00"}}),
+    )
+    .await;
+    let ack = read_until_id(&mut lines, 4).await;
+    assert_eq!(ack["result"]["stopped"], false, "{ack}");
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":5,"method":"session/children/stop","params":{}}),
+    )
+    .await;
+    let err = read_until_id(&mut lines, 5).await;
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("params.child"),
+        "{err}"
+    );
+    let r = children_report(&mut cwrite, &mut lines, 6).await;
+    let child = r["children"][0]["id"].as_str().unwrap().to_string();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":7,"method":"session/children/stop","params":{"child": child}}),
+    )
+    .await;
+    assert_eq!(
+        read_until_id(&mut lines, 7).await["result"]["stopped"],
+        true
+    );
+    // Twice is false: closed is not live.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":8,"method":"session/children/stop","params":{"child": child}}),
+    )
+    .await;
+    assert_eq!(
+        read_until_id(&mut lines, 8).await["result"]["stopped"],
+        false
+    );
+}

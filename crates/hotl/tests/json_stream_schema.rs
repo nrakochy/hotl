@@ -84,6 +84,24 @@ fn every_frame_is_tagged_and_versioned() {
             ok: Some(true),
             tokens: Some(12),
         },
+        // The `agent` row, both phases (0072 D12): a start twin before the
+        // child's first tool, the done frame with its token total.
+        EngineEvent::ChildTool {
+            parent_id: "t5".into(),
+            id: "a1b2c3".into(),
+            name: "agent".into(),
+            summary: "explore · look".into(),
+            ok: None,
+            tokens: None,
+        },
+        EngineEvent::ChildTool {
+            parent_id: "t5".into(),
+            id: "a1b2c3".into(),
+            name: "agent".into(),
+            summary: "explore · look".into(),
+            ok: Some(true),
+            tokens: Some(345),
+        },
         EngineEvent::ChildText {
             parent_id: "t5".into(),
             text: "still looking".into(),
@@ -767,6 +785,40 @@ fn child_tool_frames_carry_parent_id_phase_and_ok_only_on_done() {
     })
     .expect("child_tool is a stream frame");
     assert_eq!(counted["tokens"], json!(1234));
+}
+
+/// 0072 D12: the `agent` row's start twin is the same `child_tool` frame
+/// with `phase: "start"` and no `ok`/`tokens`; its id is the child's registry
+/// id, so a client keys the row and the later `/agents stop` alike.
+#[test]
+fn the_agent_start_frame_is_tagged_with_phase_start_and_no_ok() {
+    let start = wire::update_frame(&EngineEvent::ChildTool {
+        parent_id: "toolu_spawn".into(),
+        id: "a1b2c3".into(),
+        name: "agent".into(),
+        summary: "explore · find every place TokenUsage is summed".into(),
+        ok: None,
+        tokens: None,
+    })
+    .expect("the agent start frame is a stream frame");
+    assert_eq!(start["type"], "child_tool");
+    assert_eq!(start["name"], "agent");
+    assert_eq!(start["id"], "a1b2c3");
+    assert_eq!(start["phase"], "start");
+    assert!(start.get("ok").is_none(), "{start}");
+    assert!(start.get("tokens").is_none(), "{start}");
+    let done = wire::update_frame(&EngineEvent::ChildTool {
+        parent_id: "toolu_spawn".into(),
+        id: "a1b2c3".into(),
+        name: "agent".into(),
+        summary: "explore · find every place TokenUsage is summed".into(),
+        ok: Some(true),
+        tokens: Some(345),
+    })
+    .expect("the agent done frame is a stream frame");
+    assert_eq!(done["phase"], "done");
+    assert_eq!(done["ok"], json!(true));
+    assert_eq!(done["tokens"], json!(345));
 }
 
 /// 0058 T2: a child's own prose and the per-turn delegation summary are both

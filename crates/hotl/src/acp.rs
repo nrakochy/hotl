@@ -1154,6 +1154,61 @@ async fn handle_request(
             )
             .await;
         }
+        // `/agents` (0072): thin ack, `children_report` broadcast — the
+        // `session/jobs` shape. Additive, so `UPDATE_SCHEMA_VERSION` stands.
+        "session/children" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "session/children requires an open session").await;
+            };
+            let children = state.handle.children().await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let rows: Vec<Value> = children
+                .iter()
+                .map(|c| {
+                    use hotl_tools::children::ChildState;
+                    let (state_word, ok) = match &c.state {
+                        ChildState::Running => ("running", Value::Null),
+                        ChildState::Finishing => ("running", Value::Null),
+                        ChildState::Done { ok, .. } => ("done", json!(ok)),
+                        ChildState::Closed => ("closed", Value::Null),
+                    };
+                    json!({
+                        "id": c.id, "call_id": c.call_id, "agent_type": c.agent_type,
+                        "summary": c.summary, "started_ms": c.started_ms,
+                        "background": c.background, "isolated": c.isolated,
+                        "state": state_word, "ok": ok, "secs": c.secs(now),
+                    })
+                })
+                .collect();
+            reply_ok(writer, id, json!({"ok": true})).await;
+            notify(
+                writer,
+                &state.id,
+                json!({"type": "children_report", "children": rows}),
+            )
+            .await;
+        }
+        // `/agents stop <id>` (0072): interrupts a running child or closes a
+        // parked one; the `agent` done frame that follows is the outcome.
+        "session/children/stop" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "session/children/stop requires an open session")
+                    .await;
+            };
+            let Some(child) = msg
+                .pointer("/params/child")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return reply_err(writer, id, "session/children/stop requires params.child").await;
+            };
+            let stopped = state.handle.stop_child(child).await;
+            reply_ok(writer, id, json!({"ok": true, "stopped": stopped})).await;
+        }
         // `/jobs stop <id>` (0064): kills the tree; the `job_done` frame that
         // follows is the outcome.
         "session/jobs/stop" => {
