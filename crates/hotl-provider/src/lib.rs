@@ -97,6 +97,11 @@ pub struct SamplingRequest {
     /// key — the system-prompt head — and past ~15 req/min on that key the
     /// provider starts missing. Explicit-cache dialects ignore it.
     pub cache_key: Option<Arc<str>>,
+    /// A JSON Schema the answer must fit (0073 D8): Anthropic's
+    /// `output_config.format`. The **adapted** schema
+    /// (`hotl_workflow::structured::api_schema`); `None` = no key on the wire,
+    /// which is every request but a `--json-schema` retry turn.
+    pub output_format: Option<Arc<Value>>,
 }
 
 /// How long a cache entry a breakpoint writes stays readable. Anthropic's two

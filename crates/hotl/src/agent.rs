@@ -8398,6 +8398,7 @@ mod tests {
             },
             turn_context: None,
             cache_key: None,
+            output_format: None,
         };
         let base = || "http://localhost:11434/v1".to_string();
         let off = config_from_toml("[provider]\ncache_breakpoints = false\n");

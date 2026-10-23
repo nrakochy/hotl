@@ -2303,6 +2303,7 @@ fn spawn_aside(
         },
         turn_context: None,
         cache_key: Some(Arc::clone(&shared.session_id)),
+        output_format: None,
     };
     let shared = Arc::clone(shared);
     let cmd_tx = cmd_tx.clone();
@@ -2405,6 +2406,7 @@ fn spawn_title(shared: &Arc<SharedDeps>, cmd_tx: &mpsc::WeakSender<SessionCmd>, 
         cache: hotl_provider::CachePolicy::Off,
         turn_context: None,
         cache_key: None,
+        output_format: None,
     };
     let shared = Arc::clone(shared);
     let cmd_tx = cmd_tx.clone();
@@ -3800,6 +3802,7 @@ pub(crate) async fn summarize(
         // Keyless (0045 D2): a different prefix every call would only spend
         // the session key's ~15 req/min routing budget.
         cache_key: None,
+        output_format: None,
     };
     let mut spent = TokenUsage::default();
     for _ in 0..SUMMARIZE_ATTEMPTS {
@@ -3945,6 +3948,7 @@ async fn evaluate_goal(
         turn_context: None,
         // Keyless (0045 D2), as `summarize`.
         cache_key: None,
+        output_format: None,
     };
     // The evaluator is not free: its tokens are the goal loop's, and every
     // attempt counts even when the reply is unparseable (0051 decision 6).

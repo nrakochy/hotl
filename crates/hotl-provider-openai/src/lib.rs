@@ -899,6 +899,7 @@ mod tests {
             cache: hotl_provider::CachePolicy::Off,
             turn_context: None,
             cache_key: None,
+            output_format: None,
         };
         let body = OpenAiCompatProvider::build_body(&req);
         let msgs = body["messages"].as_array().unwrap();
@@ -944,6 +945,7 @@ mod tests {
             cache: hotl_provider::CachePolicy::Off,
             turn_context: None,
             cache_key: None,
+            output_format: None,
         };
         let body = OpenAiCompatProvider::body_for(&req, false, false);
         let text = body.to_string();
@@ -1010,6 +1012,7 @@ mod tests {
             },
             turn_context: Some("<turn-context/>".into()),
             cache_key: None,
+            output_format: None,
         };
         let body = OpenAiCompatProvider::build_body(&req);
         assert_eq!(
@@ -1584,6 +1587,7 @@ mod tests {
             cache: hotl_provider::CachePolicy::Off,
             turn_context: None,
             cache_key: None,
+            output_format: None,
         }
     }
 

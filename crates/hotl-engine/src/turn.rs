@@ -2558,6 +2558,7 @@ impl Turn {
             },
             turn_context: Some(turn_context),
             cache_key: Some(Arc::clone(&self.shared.session_id)),
+            output_format: None,
         }
     }
 

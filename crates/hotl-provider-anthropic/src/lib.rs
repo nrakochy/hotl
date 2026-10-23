@@ -81,6 +81,11 @@ pub struct AnthropicProvider {
     no_credential: bool,
     headers_timeout: std::time::Duration,
     stream_idle_timeout: std::time::Duration,
+    /// The endpoint refused `output_config.format` once (0073 D11): every
+    /// later request from this provider leaves it off. Process-wide by way
+    /// of the provider being process-wide — a gateway in front of an older
+    /// model costs one wasted attempt, never a failed run.
+    format_rejected: Arc<std::sync::atomic::AtomicBool>,
     /// §S3.2 idempotency: `0` when idle, else the generation token of the
     /// in-flight warm request — so a re-arm while already armed is a no-op
     /// instead of a duplicate handshake. A generation (not a plain bool) so
@@ -119,6 +124,7 @@ impl AnthropicProvider {
             headers_timeout: hotl_provider::timeouts::HEADERS,
             stream_idle_timeout: hotl_provider::timeouts::STREAM_IDLE,
             armed: Arc::new(AtomicU64::new(0)),
+            format_rejected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -183,6 +189,9 @@ struct WireBody<'a> {
     send_images: bool,
     mark: bool,
     effort: Option<Effort>,
+    /// `output_config.format` (0073 D8): the adapted schema a retry turn
+    /// carries, when the model supports it and the endpoint has not refused.
+    format: Option<&'a Value>,
     /// Markers emitted so far — the debug-only budget check the old builder
     /// ran over its finished tree, kept live during serialization. The API
     /// rejects a fifth `cache_control`, and the budget is spent by two
@@ -192,6 +201,12 @@ struct WireBody<'a> {
 
 impl<'a> WireBody<'a> {
     fn new(req: &'a SamplingRequest) -> Self {
+        Self::with_format(req, true)
+    }
+
+    /// `format_on = false` renders the same request without
+    /// `output_config.format` — the probe's fallback body (0073 D11).
+    fn with_format(req: &'a SamplingRequest, format_on: bool) -> Self {
         let mark = req.cache.marks_breakpoints();
         let ttl = match req.cache {
             CachePolicy::Static { prefix_ttl } => prefix_ttl,
@@ -204,6 +219,9 @@ impl<'a> WireBody<'a> {
         let effort = req
             .effort
             .and_then(|e| AnthropicLadder.resolve(&req.model, e));
+        let format = req.output_format.as_deref().filter(|_| {
+            format_on && hotl_provider::catalog::supports_structured_output(&req.model)
+        });
         Self {
             req,
             plan,
@@ -211,6 +229,7 @@ impl<'a> WireBody<'a> {
             send_images,
             mark,
             effort,
+            format,
             markers: std::cell::Cell::new(0),
         }
     }
@@ -251,8 +270,14 @@ impl serde::Serialize for WireBody<'_> {
         map.serialize_entry("max_tokens", &req.max_tokens)?;
         map.serialize_entry("messages", &Messages(self))?;
         map.serialize_entry("model", &req.model)?;
-        if let Some(e) = self.effort {
-            map.serialize_entry("output_config", &OutputConfig(e))?;
+        if self.effort.is_some() || self.format.is_some() {
+            map.serialize_entry(
+                "output_config",
+                &OutputConfig {
+                    effort: self.effort,
+                    format: self.format,
+                },
+            )?;
         }
         map.serialize_entry("stream", &true)?;
         // ONE prefix marker, not two. Render order is tools → system, so a
@@ -279,14 +304,38 @@ impl serde::Serialize for WireBody<'_> {
     }
 }
 
-/// `{"effort": "..."}` — the created-if-absent `output_config` object.
-struct OutputConfig(Effort);
+/// `{"effort": "...", "format": {"schema": …, "type": "json_schema"}}` — the
+/// created-if-absent `output_config` object, keys in ASCII order (the
+/// workspace's serde_json has no `preserve_order`, and the byte oracle sorts
+/// the same way).
+struct OutputConfig<'a> {
+    effort: Option<Effort>,
+    format: Option<&'a Value>,
+}
 
-impl serde::Serialize for OutputConfig {
+impl serde::Serialize for OutputConfig<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let mut map = s.serialize_map(None)?;
-        map.serialize_entry("effort", self.0.as_str())?;
+        if let Some(e) = self.effort {
+            map.serialize_entry("effort", e.as_str())?;
+        }
+        if let Some(schema) = self.format {
+            map.serialize_entry("format", &FormatField(schema))?;
+        }
+        map.end()
+    }
+}
+
+/// `{"schema": …, "type": "json_schema"}` — `schema` before `type`, ASCII order.
+struct FormatField<'a>(&'a Value);
+
+impl serde::Serialize for FormatField<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(None)?;
+        map.serialize_entry("schema", self.0)?;
+        map.serialize_entry("type", "json_schema")?;
         map.end()
     }
 }
@@ -670,8 +719,26 @@ pub fn wire_body(req: &SamplingRequest) -> String {
 }
 
 #[cfg(test)] // the Value-tree reference oracle's tool renderer
+/// `"strict": true` per tool would be emitted here, gated by a future
+/// `Caps.strict_tools` (0073 D12) — not now: plan mode and wrap-up swap the
+/// roster per turn, and every roster change recompiles the grammar.
 fn tool_json(t: &ToolDef) -> Value {
     json!({"name": t.name, "description": t.description, "input_schema": t.input_schema})
+}
+
+/// A 400/422 whose structured message names the structured-output field:
+/// the endpoint predates or refuses `output_config.format` (0073 D11). Like
+/// the OpenAI crate's `rejects_max_completion_tokens`, matched on API error
+/// text only — the RELIABILITY.md carve-out.
+pub fn rejects_output_format(err: &ProviderError) -> bool {
+    matches!(
+        err,
+        ProviderError::Http { status, message, .. }
+            if (*status == 400 || *status == 422)
+                && (message.contains("output_config")
+                    || message.contains("format")
+                    || message.contains("json_schema"))
+    )
 }
 
 /// The `cache_control` value a ttl-eligible marker (prefix or rolling anchor)
@@ -1006,8 +1073,14 @@ impl Provider for AnthropicProvider {
         // One borrowed pass, straight to bytes — serialization is still
         // charged here, before the first await point, so the ledger's
         // `RequestBuilt` stamp keeps meaning what it says.
-        let body =
-            serde_json::to_vec(&WireBody::new(&req)).expect("a request body always serializes");
+        // The structured-output probe (0073 D11): the format rides until the
+        // endpoint refuses it once, then never again from this provider.
+        let format_rejected = self.format_rejected.clone();
+        let mut with_format = req.output_format.is_some()
+            && hotl_provider::catalog::supports_structured_output(&req.model)
+            && !format_rejected.load(Ordering::Relaxed);
+        let mut body = serde_json::to_vec(&WireBody::with_format(&req, with_format))
+            .expect("a request body always serializes");
         let source = self.key_source.clone();
         let api_url = self.api_url.clone();
         let no_credential = self.no_credential;
@@ -1088,6 +1161,27 @@ impl Provider for AnthropicProvider {
                                 return;
                             }
                         }
+                    }
+                    // 0046 D4's shape: one wasted attempt per process, no
+                    // retry slot consumed, the same sample re-sent without the
+                    // field; the client-side validation loop still applies.
+                    Attempt::Fail(e) if with_format && rejects_output_format(&e) => {
+                        with_format = false;
+                        format_rejected.store(true, Ordering::Relaxed);
+                        body = serde_json::to_vec(&WireBody::with_format(&req, false))
+                            .expect("a request body always serializes");
+                        let status = match &e {
+                            ProviderError::Http { status, .. } => Some(*status),
+                            _ => None,
+                        };
+                        yield Ok(StreamEvent::Retrying {
+                            attempt,
+                            max: hotl_provider::retry::MAX_ATTEMPTS,
+                            reason: "endpoint rejects output_config.format — retrying without; the validation loop still applies".into(),
+                            delay_ms: 0,
+                            status,
+                            request_id: None,
+                        });
                     }
                     Attempt::Fail(e) => {
                         yield Err(e);
@@ -1204,6 +1298,13 @@ mod tests {
         {
             body["output_config"]["effort"] = json!(e.as_str());
         }
+        if let Some(schema) = req
+            .output_format
+            .as_deref()
+            .filter(|_| hotl_provider::catalog::supports_structured_output(&req.model))
+        {
+            body["output_config"]["format"] = json!({"schema": schema, "type": "json_schema"});
+        }
         debug_assert!(
             count_markers(&body) <= cache_plan::MAX_BREAKPOINTS,
             "{} cache_control markers exceeds the API budget of {}",
@@ -1309,6 +1410,7 @@ mod tests {
             },
             turn_context: Some("<turn-context t=1/>".into()),
             cache_key: None,
+            output_format: None,
         };
         let mut one_hour = full.clone();
         one_hour.cache = CachePolicy::Static {
@@ -1341,6 +1443,18 @@ mod tests {
             let old = serde_json::to_string(&build_body_reference(&req)).unwrap();
             assert_eq!(new, old, "wire bytes diverged for corpus case `{name}`");
         }
+        // 0073 D8: the same proof with `output_config.format` beside `effort`
+        // — the oracle sorts keys, so this pins `schema` before `type`.
+        let mut with_format = corpus()[0].1.clone();
+        with_format.model = "claude-opus-5".into();
+        with_format.effort = Some(Effort::High);
+        with_format.output_format = Some(schema());
+        assert_eq!(
+            wire_body(&with_format),
+            serde_json::to_string(&build_body_reference(&with_format)).unwrap(),
+            "wire bytes diverged with output_config.format"
+        );
+        assert!(wire_body(&with_format).contains("\"json_schema\""));
         // Non-vacuous: the corpus really exercises markers, both marker
         // kinds, and error results.
         let full = body_json(&corpus()[0].1);
@@ -1445,7 +1559,217 @@ mod tests {
             cache: CachePolicy::Off,
             turn_context: None,
             cache_key: None,
+            output_format: None,
         }
+    }
+
+    fn schema() -> Arc<Value> {
+        Arc::new(json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+            "additionalProperties": false
+        }))
+    }
+
+    #[test]
+    fn an_output_format_rides_in_output_config_beside_effort() {
+        let mut req = sampling_req();
+        req.model = "claude-opus-5".into();
+        req.effort = Some(Effort::High);
+        req.output_format = Some(schema());
+        let body = body_json(&req);
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(body["output_config"]["format"]["schema"], *schema());
+        // ASCII key order, `schema` before `type` — what the oracle sorts to.
+        let text = wire_body(&req);
+        let fmt = text.find("\"format\":{").expect("format object");
+        assert!(
+            text[fmt..].find("\"schema\"").unwrap()
+                < text[fmt..].find("\"type\":\"json_schema\"").unwrap()
+        );
+        assert!(text.find("\"effort\"").unwrap() < fmt);
+    }
+
+    #[test]
+    fn an_output_format_without_effort_still_creates_output_config() {
+        let mut req = sampling_req();
+        req.model = "claude-opus-5".into();
+        req.output_format = Some(schema());
+        let body = body_json(&req);
+        assert!(body["output_config"].get("effort").is_none());
+        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+    }
+
+    /// The byte-identity guard: `output_format: None` is today's wire, with
+    /// no `output_config` at all.
+    #[test]
+    fn no_output_format_keeps_the_wire_byte_identical() {
+        let req = sampling_req();
+        let text = wire_body(&req);
+        assert!(!text.contains("output_config"), "{text}");
+        assert!(!text.contains("json_schema"));
+        assert_eq!(
+            text,
+            r#"{"max_tokens":16,"messages":[{"content":[{"text":"hi","type":"text"}],"role":"user"}],"model":"m","stream":true}"#
+        );
+    }
+
+    /// D9 fails closed: a model the catalog does not mark sends no format.
+    #[test]
+    fn an_unsupported_model_sends_no_format() {
+        for model in [
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-sonnet-4-6",
+            "m",
+        ] {
+            let mut req = sampling_req();
+            req.model = model.into();
+            req.output_format = Some(schema());
+            let body = body_json(&req);
+            assert!(body.get("output_config").is_none(), "{model}: {body}");
+        }
+    }
+
+    #[test]
+    fn rejects_output_format_matches_a_400_naming_the_field_only() {
+        let http = |status: u16, message: &str| ProviderError::Http {
+            status,
+            message: message.into(),
+            retry_after: None,
+            request_id: None,
+        };
+        assert!(rejects_output_format(&http(
+            400,
+            "output_config.format: unsupported"
+        )));
+        assert!(rejects_output_format(&http(
+            422,
+            "json_schema is not supported by this model"
+        )));
+        assert!(!rejects_output_format(&http(
+            400,
+            "max_tokens: 1 is below the minimum"
+        )));
+        assert!(!rejects_output_format(&http(500, "output_config.format")));
+        assert!(!rejects_output_format(&ProviderError::Transport(
+            "format".into()
+        )));
+    }
+
+    /// Like `tcp_double`, but keeps each request's body: the probe test reads
+    /// what went on the wire, not who sent it.
+    async fn tcp_double_bodies(
+        responses: Vec<String>,
+        bodies: Arc<StdMutex<Vec<String>>>,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            for resp in responses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 65536];
+                let mut req: Vec<u8> = Vec::new();
+                let body_at = loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    req.extend_from_slice(&buf[..n]);
+                    if let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&req[..body_at]).to_string();
+                let len: usize = head
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                    .and_then(|l| l.split_once(':').unwrap().1.trim().parse().ok())
+                    .unwrap_or(0);
+                while req.len() < body_at + len {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                }
+                bodies
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&req[body_at..]).to_string());
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.shutdown().await.ok();
+            }
+        });
+        base
+    }
+
+    fn format_400() -> String {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"output_config.format: unsupported on this endpoint"}}"#;
+        format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// D11: a 400 naming the field re-sends the same sample without it,
+    /// announces itself as a zero-delay `Retrying`, consumes no retry slot,
+    /// and latches — the next `stream()` sends no format and no probe.
+    #[tokio::test]
+    async fn a_rejected_format_probes_once_and_latches() {
+        let bodies = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double_bodies(
+            vec![format_400(), SSE_OK.to_string(), SSE_OK.to_string()],
+            bodies.clone(),
+        )
+        .await;
+        let p = AnthropicProvider::new(Arc::new(hotl_provider::key::StaticKey(Some("k".into()))))
+            .with_base_url(&base);
+        let mut req = sampling_req();
+        req.model = "claude-opus-5".into();
+        req.output_format = Some(schema());
+
+        let events: Vec<_> = p.stream(req.clone()).collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()), "{events:?}");
+        let probe = events
+            .iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Retrying {
+                    attempt,
+                    reason,
+                    delay_ms,
+                    status,
+                    ..
+                }) => Some((*attempt, reason.clone(), *delay_ms, *status)),
+                _ => None,
+            })
+            .expect("the probe announced itself");
+        assert_eq!(probe.0, 1, "no retry slot consumed");
+        assert!(
+            probe.1.starts_with("endpoint rejects output_config.format"),
+            "{}",
+            probe.1
+        );
+        assert_eq!((probe.2, probe.3), (0, Some(400)));
+        {
+            let b = bodies.lock().unwrap();
+            assert_eq!(b.len(), 2);
+            assert!(b[0].contains("\"json_schema\""), "{}", b[0]);
+            assert!(!b[1].contains("output_config"), "{}", b[1]);
+        }
+        assert!(p.format_rejected.load(Ordering::Relaxed));
+
+        // Latched: the next request sends no format and no probe.
+        let events: Vec<_> = p.stream(req).collect::<Vec<_>>().await;
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, Ok(StreamEvent::Retrying { .. }))),
+            "{events:?}"
+        );
+        let b = bodies.lock().unwrap();
+        assert_eq!(b.len(), 3);
+        assert!(!b[2].contains("output_config"), "{}", b[2]);
     }
 
     #[test]
@@ -1970,6 +2294,7 @@ mod tests {
             },
             turn_context: Some("<turn-context sample=\"1\"/>".into()),
             cache_key: None,
+            output_format: None,
         };
         let body = body_json(&req);
         assert_eq!(body["stream"], true);
@@ -2119,6 +2444,7 @@ mod tests {
             },
             turn_context: Some("<turn-context/>".into()),
             cache_key: None,
+            output_format: None,
         };
         let mut active = base.clone();
         active.ephemeral_tail = hotl_provider::arc_items(vec![Item::User {

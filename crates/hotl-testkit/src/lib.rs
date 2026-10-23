@@ -2118,6 +2118,7 @@ mod tests {
         hotl_provider::SamplingRequest {
             turn_context: Some("<MOIM>".into()),
             cache_key: None,
+            output_format: None,
             ..req.clone()
         }
     }

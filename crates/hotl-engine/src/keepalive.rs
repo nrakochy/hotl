@@ -193,6 +193,7 @@ mod tests {
             },
             turn_context: Some("<moim>".into()),
             cache_key: Some("sid".into()),
+            output_format: None,
         }
     }
 

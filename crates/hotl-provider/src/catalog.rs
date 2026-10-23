@@ -41,6 +41,9 @@ pub struct Caps {
     pub images: bool,
     /// Accepts `output_config.effort`.
     pub effort: bool,
+    /// Accepts `output_config.format` (structured outputs, 0073 D9). Gated
+    /// per request by [`supports_structured_output`], which fails closed.
+    pub structured_output: bool,
 }
 
 /// One model's properties. Prices are **USD per million tokens**.
@@ -74,11 +77,20 @@ const FULL: Caps = Caps {
     thinking: true,
     images: true,
     effort: true,
+    structured_output: true,
+};
+/// Full but for structured outputs: the generation before the grammar shipped.
+const NO_FORMAT: Caps = Caps {
+    thinking: true,
+    images: true,
+    effort: true,
+    structured_output: false,
 };
 const NO_EFFORT: Caps = Caps {
     thinking: true,
     images: true,
     effort: false,
+    structured_output: true,
 };
 
 /// Anthropic models only, deliberately: the OpenAI-compatible family is
@@ -136,7 +148,7 @@ pub const CATALOG: &[ModelInfo] = &[
         cache_write_1h_usd_per_mtok: 10.00,
         min_cacheable_prefix: 2048,
         ascii_chars_per_token: 3.0,
-        caps: FULL,
+        caps: NO_FORMAT,
     },
     ModelInfo {
         id: "claude-opus-4-6",
@@ -149,7 +161,7 @@ pub const CATALOG: &[ModelInfo] = &[
         cache_write_1h_usd_per_mtok: 10.00,
         min_cacheable_prefix: 4096,
         ascii_chars_per_token: 3.5,
-        caps: FULL,
+        caps: NO_FORMAT,
     },
     ModelInfo {
         id: "claude-sonnet-5",
@@ -175,7 +187,7 @@ pub const CATALOG: &[ModelInfo] = &[
         cache_write_1h_usd_per_mtok: 6.00,
         min_cacheable_prefix: 1024,
         ascii_chars_per_token: 3.5,
-        caps: FULL,
+        caps: NO_FORMAT,
     },
     ModelInfo {
         id: "claude-haiku-4-5",
@@ -322,9 +334,39 @@ pub fn supports_images(model: &str) -> bool {
     lookup(model).map(|m| m.caps.images).unwrap_or(true)
 }
 
+/// Whether `output_config.format` may ride a request for `model` (0073 D9).
+/// Fails **closed**, unlike [`supports_images`]: a dropped image is a degraded
+/// answer, a rejected `format` is a 400 that ends the run, and a missing
+/// format is just today's validation loop.
+pub fn supports_structured_output(model: &str) -> bool {
+    lookup(model).is_some_and(|m| m.caps.structured_output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supports_structured_output_fails_closed_for_unknown_models() {
+        for m in [
+            "claude-fable-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+        ] {
+            assert!(supports_structured_output(m), "{m}");
+        }
+        for m in [
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "sol-fast",
+            "",
+        ] {
+            assert!(!supports_structured_output(m), "{m}");
+        }
+    }
 
     #[test]
     fn supports_images_reads_the_catalog_and_fails_open_for_unknown_models() {

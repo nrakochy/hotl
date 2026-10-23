@@ -1084,6 +1084,7 @@ mod tests {
             cache: hotl_provider::CachePolicy::Off,
             turn_context: None,
             cache_key: None,
+            output_format: None,
         }
     }
 
