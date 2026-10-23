@@ -198,9 +198,23 @@ impl SkillTool {
     /// registers no tool, so the roster is walked exactly once per start.
     /// The warnings come back even then.
     pub fn with_roots(roots: &SkillRoots) -> (Option<Self>, Vec<String>) {
-        let Discovery { entries, warnings } = discover(roots);
+        let Discovery {
+            entries,
+            mut warnings,
+        } = discover(roots);
         if entries.is_empty() {
             return (None, warnings);
+        }
+        // Both flags set: nothing can reach it (D4). A warning, not an error.
+        for e in entries
+            .iter()
+            .filter(|e| e.disable_model_invocation && !e.user_invocable)
+        {
+            warnings.push(format!(
+                "skill `{}` ({}) is hidden from the model and from the user: nothing can reach it",
+                e.name,
+                e.path.display()
+            ));
         }
         let description = describe(&entries);
         (
@@ -257,17 +271,27 @@ impl SkillTool {
     /// always-sent tool description ([`describe`]) omits every description
     /// listed here — the model sees them only by calling the skill tool
     /// itself (a bare call, `{"query": …}`, or `{"source": …}` all return
-    /// them, same as they always have).
+    /// them, same as they always have). A `user-invocable: false` skill is
+    /// left out (D4): the tool still accepts its name.
     pub fn catalog(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.entries.iter().flat_map(|e| {
-            std::iter::once((e.name.as_str(), e.description.as_str())).chain(
-                e.qualified
-                    .as_deref()
-                    .filter(|q| *q != e.name.as_str())
-                    .map(|q| (q, e.description.as_str())),
-            )
-        })
+        self.entries
+            .iter()
+            .filter(|e| e.user_invocable)
+            .flat_map(|e| {
+                std::iter::once((e.name.as_str(), e.description.as_str())).chain(
+                    e.qualified
+                        .as_deref()
+                        .filter(|q| *q != e.name.as_str())
+                        .map(|q| (q, e.description.as_str())),
+                )
+            })
     }
+}
+
+/// Visible to the model in listings, search and the roster: everything but
+/// a `disable-model-invocation` skill (D4), which loads by exact name only.
+fn model_visible(e: &&SkillEntry) -> bool {
+    !e.disable_model_invocation
 }
 
 /// The always-sent tool description: one line per source, large sources
@@ -276,7 +300,7 @@ impl SkillTool {
 /// here is still reachable.
 fn describe(entries: &[SkillEntry]) -> String {
     let mut sources: Vec<(u8, &str)> = Vec::new();
-    for e in entries {
+    for e in entries.iter().filter(model_visible) {
         if !sources.iter().any(|(_, s)| *s == e.source.as_str()) {
             sources.push((e.tier, &e.source));
         }
@@ -292,6 +316,7 @@ fn describe(entries: &[SkillEntry]) -> String {
     for (_, source) in sources {
         let names: Vec<&str> = entries
             .iter()
+            .filter(model_visible)
             .filter(|e| e.source == source)
             .map(|e| e.name.as_str())
             .collect();
@@ -759,6 +784,7 @@ impl SkillTool {
             let listing = self
                 .entries
                 .iter()
+                .filter(model_visible)
                 .map(|e| {
                     format!(
                         "{} ({}) — {}",
@@ -823,13 +849,19 @@ impl SkillTool {
         let mut ranked: Vec<(usize, &SkillEntry)> = self
             .entries
             .iter()
+            .filter(model_visible)
             .map(|e| (score(e, &terms), e))
             .filter(|(s, _)| *s > 0)
             .collect();
         // Score desc, then name asc — a stable order for identical scores.
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
         if ranked.is_empty() {
-            let names: Vec<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
+            let names: Vec<&str> = self
+                .entries
+                .iter()
+                .filter(model_visible)
+                .map(|e| e.name.as_str())
+                .collect();
             return ToolOutcome::ok(format!(
                 "No skill matched `{query}`. All {} skills: {}.",
                 names.len(),
@@ -854,6 +886,7 @@ impl SkillTool {
         let rows: Vec<String> = self
             .entries
             .iter()
+            .filter(model_visible)
             .filter(|e| e.source == source)
             .map(|e| format!("{} — {}", e.name, e.description))
             .collect();
@@ -1709,9 +1742,102 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_model_hidden_skill_is_absent_from_every_listing_but_loads_by_exact_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("claude");
+        write_skill(
+            &user.join("deploy"),
+            "name: deploy\ndescription: tag and push\ndisable-model-invocation: true",
+            "deploy body",
+        );
+        write_skill(
+            &user.join("review"),
+            "name: review\ndescription: review a PR",
+            "r",
+        );
+        let (tool, warnings) = SkillTool::with_roots(&SkillRoots {
+            claude_user: Some(user),
+            ..Default::default()
+        });
+        let tool = tool.unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            !tool.description().contains("deploy"),
+            "{}",
+            tool.description()
+        );
+        assert!(!tool.run_impl(&json!({})).content.contains("deploy"));
+        assert!(!tool
+            .run_impl(&json!({"query": "tag push"}))
+            .content
+            .contains("deploy"));
+        assert!(!tool
+            .run_impl(&json!({"source": "claude"}))
+            .content
+            .contains("deploy"));
+        // The user's `/deploy` still works: the catalog and the exact name.
+        assert!(tool.catalog().any(|(n, _)| n == "deploy"));
+        assert!(tool
+            .run_impl(&json!({"name": "deploy"}))
+            .content
+            .contains("deploy body"));
+        assert!(tool
+            .roster()
+            .any(|r| r.name == "deploy" && r.flags == vec!["model-hidden"]));
+    }
+
+    #[test]
+    fn a_user_hidden_skill_is_out_of_the_client_catalog_but_still_in_the_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("claude");
+        write_skill(
+            &user.join("internal"),
+            "name: internal\ndescription: the model's own helper\nuser-invocable: false",
+            "body",
+        );
+        let (tool, warnings) = SkillTool::with_roots(&SkillRoots {
+            claude_user: Some(user),
+            ..Default::default()
+        });
+        let tool = tool.unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!tool.catalog().any(|(n, _)| n == "internal"));
+        assert!(
+            tool.names().any(|n| n == "internal"),
+            "the tool still accepts it"
+        );
+        assert!(tool.description().contains("claude: internal"));
+        assert!(tool
+            .roster()
+            .any(|r| r.name == "internal" && r.flags == vec!["user-hidden"]));
+    }
+
+    #[test]
+    fn a_skill_hidden_both_ways_is_reported_as_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("claude");
+        write_skill(
+            &user.join("ghost"),
+            "name: ghost\ndescription: d\nuser-invocable: false\ndisable-model-invocation: true",
+            "body",
+        );
+        let (tool, warnings) = SkillTool::with_roots(&SkillRoots {
+            claude_user: Some(user.clone()),
+            ..Default::default()
+        });
+        assert!(tool.is_some(), "a warning, not a drop");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("skill `ghost`") && warnings[0].contains("nothing can reach it")
+        );
+    }
+
     /// The client-facing catalog pairs every accepted name with its
     /// description — including the `source:skill` alias, which `names()`
-    /// emits bare.
+    /// emits bare — over the user-visible entries; `names()` is the whole
+    /// set the tool accepts, so a `user-invocable: false` skill is in one
+    /// and not the other.
     #[test]
     fn catalog_pairs_every_accepted_name_with_its_description() {
         let dir = tempfile::tempdir().unwrap();
@@ -1719,6 +1845,11 @@ mod tests {
         write_skill(
             &mkt.join("deploy"),
             "name: deploy\ndescription: tag and push the release",
+            "body",
+        );
+        write_skill(
+            &mkt.join("hidden"),
+            "name: hidden\ndescription: not for the menu\nuser-invocable: false",
             "body",
         );
         let none = dir.path().join("none");
@@ -1739,11 +1870,10 @@ mod tests {
                 ("acme:deploy", "tag and push the release"),
             ]
         );
-        // Same names, same order as the roster front ends already resolve.
-        assert_eq!(
-            tool.catalog().map(|(n, _)| n).collect::<Vec<_>>(),
-            tool.names().collect::<Vec<_>>()
-        );
+        // Same order as `names()`, minus the user-hidden entry's two names.
+        let visible: Vec<&str> = tool.names().filter(|n| !n.contains("hidden")).collect();
+        assert_eq!(tool.catalog().map(|(n, _)| n).collect::<Vec<_>>(), visible);
+        assert_eq!(tool.names().count(), 4);
     }
 
     /// The load-bearing guard: descriptions are client-facing only. The tool
