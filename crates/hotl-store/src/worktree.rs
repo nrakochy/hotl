@@ -1,6 +1,8 @@
 //! Per-sub-agent git worktrees (0024): an isolated child edits its own
 //! checkout instead of the parent's working tree, and its diff is applied
-//! back — whole, or not at all — when it finishes.
+//! back — whole, or not at all — when it finishes. Since 0065 the main
+//! session can have one too ([`SessionWorktree`]): named, on a branch, not
+//! seeded, locked while a session owns it.
 //!
 //! Owns hotl's "shell out to the git CLI, degrade to `None` if it isn't
 //! there" posture via [`git_available`].
@@ -34,6 +36,33 @@ pub fn git_available() -> bool {
 
 /// Where child worktrees live, relative to the workspace root.
 const WORKTREE_DIR: &str = ".git/hotl-worktrees";
+/// The same, relative to the git dir.
+const WORKTREE_SUBDIR: &str = "hotl-worktrees";
+
+/// `rev-parse --show-toplevel`, canonical. `None` outside a git worktree.
+fn toplevel(dir: &Path) -> Option<PathBuf> {
+    let top = git_ok(dir, &["rev-parse", "--show-toplevel"])?;
+    let top = PathBuf::from(String::from_utf8(top.stdout).ok()?.trim());
+    dunce::canonicalize(&top).ok().or(Some(top))
+}
+
+/// The repository's one `.git` directory, absolute — the main checkout's even
+/// when `dir` is a linked worktree. `--git-common-dir` is relative unless
+/// `--path-format=absolute` (git ≥ 2.31), so both spellings are handled.
+fn git_common_dir(toplevel: &Path) -> Option<PathBuf> {
+    let out = git_ok(
+        toplevel,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .or_else(|| git_ok(toplevel, &["rev-parse", "--git-common-dir"]))?;
+    let raw = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim());
+    let abs = if raw.is_absolute() {
+        raw
+    } else {
+        toplevel.join(raw)
+    };
+    dunce::canonicalize(&abs).ok().or(Some(abs))
+}
 
 pub struct Worktree {
     path: PathBuf,
@@ -68,10 +97,17 @@ impl Worktree {
             return None;
         }
         // Not inside a git worktree ⇒ nothing to isolate against.
-        let top = git_ok(workspace, &["rev-parse", "--show-toplevel"])?;
-        let workspace = PathBuf::from(String::from_utf8(top.stdout).ok()?.trim());
-
-        let path = workspace.join(WORKTREE_DIR).join(id);
+        let top = toplevel(workspace)?;
+        // From below the toplevel the child would land outside the kernel
+        // floor (the process cwd): degrade to shared-cwd (0065 T2).
+        if dunce::canonicalize(workspace).ok()? != top {
+            return None;
+        }
+        let workspace = top;
+        // Under the **common** git dir, not `<toplevel>/.git`: inside a linked
+        // worktree (a 0065 session) `.git` is a file, and the common dir is
+        // the main repo's — still under the floor (0065 T2).
+        let path = git_common_dir(&workspace)?.join(WORKTREE_SUBDIR).join(id);
         // `--detach`: no branch is created, so the user's ref namespace stays
         // clean. The id is a fresh ULID per child — `worktree add` refuses an
         // existing path and reuse is never attempted.
@@ -229,11 +265,271 @@ impl Worktree {
     }
 }
 
+/// Where a session worktree lives (0065): the same directory as the
+/// children's, named after its branch.
+pub fn session_path(toplevel: &Path, name: &str) -> PathBuf {
+    toplevel.join(WORKTREE_DIR).join(name)
+}
+
+/// The branch `-w` with no name uses: never collides with a human's.
+pub fn derived_branch(session_id: &str) -> String {
+    format!("hotl/{session_id}")
+}
+
+/// The main session's git worktree (0065): on a branch, named, not seeded,
+/// locked with the session's id and pid while the session owns it. A
+/// [`Worktree`] (a child's) is none of those, so the two stay two types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionWorktree {
+    path: PathBuf,
+    workspace: PathBuf,
+    branch: String,
+}
+
+/// How [`SessionWorktree::reopen`] found the worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reopened {
+    Existing,
+    /// The directory was gone; `worktree add <path> <branch>` brought it back.
+    RecreatedFromBranch,
+}
+
+/// One row of `git worktree list --porcelain` under `.git/hotl-worktrees/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    /// `Some` only for a lock hotl wrote; a foreign reason reads as `None`.
+    pub lock: Option<Lock>,
+}
+
+/// The ownership record a session leaves in `git worktree lock --reason`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lock {
+    pub session_id: String,
+    pub pid: u32,
+}
+
+impl SessionWorktree {
+    /// `git -C <workspace> worktree add -b <branch> <path> HEAD` — the local
+    /// `HEAD`, never a remote ref. A branch that already exists and is free is
+    /// reused (`worktree add <path> <branch>`), which is what resume relies on.
+    /// `Err` is one plain sentence: git missing, `workspace` not the repo
+    /// toplevel, a bad branch name, the path taken, or the branch checked out
+    /// elsewhere.
+    pub fn open(workspace: &Path, branch: &str) -> Result<Self, String> {
+        if !git_available() {
+            return Err("git is not on PATH, so a worktree cannot be made".into());
+        }
+        let top = toplevel(workspace)
+            .ok_or_else(|| format!("{} is not inside a git repository", workspace.display()))?;
+        let here = dunce::canonicalize(workspace).map_err(|e| e.to_string())?;
+        if here != top {
+            return Err(format!(
+                "run hotl -w from the repository root: {}",
+                top.display()
+            ));
+        }
+        if git_ok(&top, &["check-ref-format", "--branch", branch]).is_none() {
+            return Err(format!("`{branch}` is not a valid git branch name"));
+        }
+        let path = session_path(&top, branch);
+        if path.exists() {
+            return Err(format!(
+                "{} already exists; `hotl -r` reopens a session's worktree, `hotl gc` removes a stale one",
+                path.display()
+            ));
+        }
+        let path_s = path.display().to_string();
+        // A fresh branch first; an existing one is reused if nothing has it
+        // checked out. git's own stderr becomes the sentence either way.
+        let fresh = git(&top, &["worktree", "add", "-b", branch, &path_s, "HEAD"])
+            .ok_or("could not run git")?;
+        if !fresh.status.success() {
+            let reuse =
+                git(&top, &["worktree", "add", &path_s, branch]).ok_or("could not run git")?;
+            if !reuse.status.success() {
+                let why = first_line(&reuse.stderr);
+                let why = if why == "git apply failed" {
+                    first_line(&fresh.stderr)
+                } else {
+                    why
+                };
+                return Err(format!("could not open a worktree on `{branch}`: {why}"));
+            }
+        }
+        Ok(Self {
+            path,
+            workspace: top,
+            branch: branch.to_string(),
+        })
+    }
+
+    /// Reopen a known pair. A directory that is gone is recreated from its
+    /// branch (the work is on the branch; the directory is disposable); a
+    /// branch that is gone is an `Err`.
+    pub fn reopen(workspace: &Path, path: &Path, branch: &str) -> Result<(Self, Reopened), String> {
+        if !git_available() {
+            return Err("git is not on PATH, so a worktree cannot be reopened".into());
+        }
+        let top = toplevel(workspace)
+            .ok_or_else(|| format!("{} is not inside a git repository", workspace.display()))?;
+        let registered = list_session_worktrees(&top)
+            .into_iter()
+            .any(|l| l.path == path && path.is_dir());
+        if registered {
+            return Ok((
+                Self {
+                    path: path.to_path_buf(),
+                    workspace: top,
+                    branch: branch.to_string(),
+                },
+                Reopened::Existing,
+            ));
+        }
+        if git_ok(
+            &top,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+        )
+        .is_none()
+        {
+            return Err(format!("branch `{branch}` no longer exists"));
+        }
+        // The lock reason outlives the directory; `prune` clears the stale
+        // registration or `worktree add` reports the path as taken.
+        let _ = git_ok(&top, &["worktree", "prune"]);
+        let out = git(
+            &top,
+            &["worktree", "add", &path.display().to_string(), branch],
+        )
+        .ok_or("could not run git")?;
+        if !out.status.success() {
+            return Err(format!(
+                "could not recreate the worktree on `{branch}`: {}",
+                first_line(&out.stderr)
+            ));
+        }
+        Ok((
+            Self {
+                path: path.to_path_buf(),
+                workspace: top,
+                branch: branch.to_string(),
+            },
+            Reopened::RecreatedFromBranch,
+        ))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
+    /// `git worktree lock --reason "hotl <id> pid <pid>"`: the ownership
+    /// record `hotl gc` reads. Infallible to the caller.
+    pub fn lock(&self, session_id: &str) {
+        let _ = git_ok(
+            &self.workspace,
+            &["worktree", "unlock", &self.path.display().to_string()],
+        );
+        let _ = git_ok(
+            &self.workspace,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                &lock_reason(session_id, std::process::id()),
+                &self.path.display().to_string(),
+            ],
+        );
+    }
+
+    pub fn unlock(&self) {
+        let _ = git_ok(
+            &self.workspace,
+            &["worktree", "unlock", &self.path.display().to_string()],
+        );
+    }
+}
+
+fn lock_reason(session_id: &str, pid: u32) -> String {
+    format!("hotl {session_id} pid {pid}")
+}
+
+/// `hotl <id> pid <n>` → the lock; anything else is somebody else's lock.
+fn parse_lock_reason(reason: &str) -> Option<Lock> {
+    let mut words = reason.split_whitespace();
+    (words.next()? == "hotl").then_some(())?;
+    let session_id = words.next()?.to_string();
+    (words.next()? == "pid").then_some(())?;
+    let pid = words.next()?.parse().ok()?;
+    words.next().is_none().then_some(Lock { session_id, pid })
+}
+
+/// The session worktrees of the repository `workspace` is in: every entry of
+/// `git worktree list --porcelain` under `.git/hotl-worktrees/`.
+pub fn list_session_worktrees(workspace: &Path) -> Vec<Listed> {
+    let Some(top) = toplevel(workspace) else {
+        return Vec::new();
+    };
+    let Some(common) = git_common_dir(&top) else {
+        return Vec::new();
+    };
+    let under = common.join(WORKTREE_SUBDIR);
+    let Some(out) = git_ok(&top, &["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+    parse_worktree_list(&String::from_utf8_lossy(&out.stdout), &under)
+}
+
+/// The porcelain format: blocks separated by a blank line; `worktree <path>`,
+/// `HEAD <sha>`, `branch refs/heads/<b>` or `detached`, `locked` alone or
+/// `locked <reason>`.
+fn parse_worktree_list(text: &str, under: &Path) -> Vec<Listed> {
+    let mut out = Vec::new();
+    for block in text.split("\n\n") {
+        let mut path: Option<PathBuf> = None;
+        let mut branch = None;
+        let mut lock = None;
+        for line in block.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                path = Some(PathBuf::from(p));
+            } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+                branch = Some(b.to_string());
+            } else if let Some(rest) = line.strip_prefix("locked") {
+                lock = parse_lock_reason(rest.trim());
+            }
+        }
+        let Some(path) = path else { continue };
+        let canon = dunce::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if canon.starts_with(under) || path.starts_with(under) {
+            out.push(Listed {
+                path: canon,
+                branch,
+                lock,
+            });
+        }
+    }
+    out
+}
+
 fn git(dir: &Path, args: &[&str]) -> Option<std::process::Output> {
     Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
+        // Never an ambient repo: a test once escaped its tempdir this way.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
         .output()
         .ok()
 }
@@ -647,5 +943,284 @@ mod tests {
             .share_mode(0)
             .open(path)
             .ok()
+    }
+}
+
+/// 0065 T1/T2 — the session worktree and the common-dir child path.
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    fn repo() -> Option<tempfile::TempDir> {
+        if !git_available() {
+            return None;
+        }
+        let tmp = tempfile::tempdir().ok()?;
+        let dir = tmp.path();
+        git_ok(dir, &["init", "-q", "-b", "main"])?;
+        git_ok(dir, &["config", "user.email", "t@example.com"])?;
+        git_ok(dir, &["config", "user.name", "t"])?;
+        git_ok(dir, &["config", "core.autocrlf", "false"])?;
+        std::fs::write(dir.join("a.txt"), "a1\n").unwrap();
+        git_ok(dir, &["add", "-A"])?;
+        git_ok(dir, &["commit", "-qm", "init"])?;
+        Some(tmp)
+    }
+
+    macro_rules! repo_or_skip {
+        () => {
+            match repo() {
+                Some(r) => r,
+                None => return,
+            }
+        };
+    }
+
+    fn commit(dir: &Path, file: &str, text: &str, msg: &str) {
+        std::fs::write(dir.join(file), text).unwrap();
+        git_ok(dir, &["add", "-A"]).unwrap();
+        git_ok(dir, &["commit", "-qm", msg]).unwrap();
+    }
+
+    fn head(dir: &Path) -> String {
+        let out = git_ok(dir, &["rev-parse", "HEAD"]).unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn open_branches_from_local_head_not_origin() {
+        let tmp = repo_or_skip!();
+        let root = tmp.path();
+        git_ok(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
+        commit(root, "two.txt", "two\n", "two");
+        let wt = SessionWorktree::open(root, "fix-auth").unwrap();
+        assert!(
+            wt.path().join("two.txt").exists(),
+            "branched from the local tip"
+        );
+        assert_eq!(head(wt.path()), head(root));
+        assert_eq!(wt.branch(), "fix-auth");
+        assert_eq!(wt.path(), session_path(wt.workspace(), "fix-auth"));
+    }
+
+    #[test]
+    fn open_reuses_an_existing_free_branch_and_refuses_one_checked_out_elsewhere() {
+        let tmp = repo_or_skip!();
+        let root = tmp.path();
+        git_ok(root, &["branch", "free"]).unwrap();
+        let wt = SessionWorktree::open(root, "free").expect("a free branch is reused");
+        assert_eq!(wt.branch(), "free");
+        // The same branch twice: the second is checked out elsewhere.
+        std::fs::remove_dir_all(wt.path()).unwrap();
+        git_ok(root, &["worktree", "prune"]).unwrap();
+        git_ok(
+            root,
+            &[
+                "worktree",
+                "add",
+                &root.join("elsewhere").display().to_string(),
+                "free",
+            ],
+        )
+        .unwrap();
+        let err = SessionWorktree::open(root, "free").unwrap_err();
+        assert!(err.contains("free"), "{err}");
+    }
+
+    #[test]
+    fn open_refuses_a_bad_branch_name_and_below_the_toplevel() {
+        let tmp = repo_or_skip!();
+        let root = tmp.path();
+        for bad in ["a..b", "-x", "a b"] {
+            let err = SessionWorktree::open(root, bad).unwrap_err();
+            assert!(err.contains("branch name"), "{bad}: {err}");
+        }
+        let sub = root.join("crates");
+        std::fs::create_dir_all(&sub).unwrap();
+        let err = SessionWorktree::open(&sub, "ok").unwrap_err();
+        assert!(err.contains("repository root"), "{err}");
+        assert!(root
+            .join(".git/hotl-worktrees")
+            .read_dir()
+            .map_or(true, |mut d| d.next().is_none()));
+    }
+
+    /// Phase 1's contract: uncommitted changes stay in the main checkout.
+    #[test]
+    fn open_does_not_seed_uncommitted_changes() {
+        let tmp = repo_or_skip!();
+        let root = tmp.path();
+        std::fs::write(root.join("a.txt"), "dirty\n").unwrap();
+        std::fs::write(root.join("new.txt"), "new\n").unwrap();
+        let wt = SessionWorktree::open(root, "clean").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(wt.path().join("a.txt")).unwrap(),
+            "a1\n"
+        );
+        assert!(!wt.path().join("new.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "dirty\n"
+        );
+    }
+
+    #[test]
+    fn lock_reason_names_the_session_and_pid_and_list_ignores_foreign_locks() {
+        let tmp = repo_or_skip!();
+        let root = tmp.path();
+        let wt = SessionWorktree::open(root, "fix-auth").unwrap();
+        wt.lock("01JSESSION");
+        let listed = list_session_worktrees(root);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].branch.as_deref(), Some("fix-auth"));
+        assert_eq!(
+            listed[0].lock,
+            Some(Lock {
+                session_id: "01JSESSION".into(),
+                pid: std::process::id()
+            })
+        );
+        // Relocking replaces the reason; unlocking clears it.
+        wt.lock("01JOTHER");
+        assert_eq!(
+            list_session_worktrees(root)[0]
+                .lock
+                .as_ref()
+                .unwrap()
+                .session_id,
+            "01JOTHER"
+        );
+        wt.unlock();
+        assert_eq!(list_session_worktrees(root)[0].lock, None);
+        // A foreign lock (a human's reason, or none) is not ours.
+        git_ok(
+            root,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "mine",
+                &wt.path().display().to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(list_session_worktrees(root)[0].lock, None);
+        wt.unlock();
+        git_ok(
+            root,
+            &["worktree", "lock", &wt.path().display().to_string()],
+        )
+        .unwrap();
+        assert_eq!(list_session_worktrees(root)[0].lock, None);
+        // A worktree outside `.git/hotl-worktrees/` is not listed.
+        git_ok(
+            root,
+            &[
+                "worktree",
+                "add",
+                &root.join("../other-wt").display().to_string(),
+                "-b",
+                "x",
+            ],
+        )
+        .unwrap();
+        assert_eq!(list_session_worktrees(root).len(), 1);
+        git_ok(
+            root,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &root.join("../other-wt").display().to_string(),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn parse_worktree_list_handles_bare_and_reasoned_locks() {
+        let text = "worktree /r\nHEAD abc\nbranch refs/heads/main\n\nworktree /r/.git/hotl-worktrees/a\nHEAD abc\nbranch refs/heads/a\nlocked hotl 01J pid 42\n\nworktree /r/.git/hotl-worktrees/b\nHEAD abc\ndetached\nlocked\n\nworktree /r/.git/hotl-worktrees/c\nHEAD abc\nbranch refs/heads/c\nlocked hotl 01J pid notanumber\n";
+        let rows = parse_worktree_list(text, Path::new("/r/.git/hotl-worktrees"));
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].lock,
+            Some(Lock {
+                session_id: "01J".into(),
+                pid: 42
+            })
+        );
+        assert_eq!(
+            rows[1],
+            Listed {
+                path: "/r/.git/hotl-worktrees/b".into(),
+                branch: None,
+                lock: None
+            }
+        );
+        assert_eq!(rows[2].lock, None);
+    }
+
+    #[test]
+    fn reopen_recreates_a_missing_directory_from_its_branch_and_fails_when_it_is_gone() {
+        let tmp = repo_or_skip!();
+        let root = tmp.path();
+        let wt = SessionWorktree::open(root, "fix-auth").unwrap();
+        commit(wt.path(), "wt.txt", "in the worktree\n", "wt");
+        let (same, how) = SessionWorktree::reopen(root, wt.path(), "fix-auth").unwrap();
+        assert_eq!((how, &same), (Reopened::Existing, &wt));
+        std::fs::remove_dir_all(wt.path()).unwrap();
+        let (again, how) = SessionWorktree::reopen(root, wt.path(), "fix-auth").unwrap();
+        assert_eq!(how, Reopened::RecreatedFromBranch);
+        assert_eq!(again.path(), wt.path());
+        assert!(
+            wt.path().join("wt.txt").exists(),
+            "the branch's commit is checked out"
+        );
+        std::fs::remove_dir_all(wt.path()).unwrap();
+        git_ok(root, &["worktree", "prune"]).unwrap();
+        git_ok(root, &["branch", "-D", "fix-auth"]).unwrap();
+        let err = SessionWorktree::reopen(root, wt.path(), "fix-auth").unwrap_err();
+        assert!(err.contains("no longer exists"), "{err}");
+    }
+
+    #[test]
+    fn derived_branch_is_the_session_id_under_hotl() {
+        assert_eq!(derived_branch("01JABC"), "hotl/01JABC");
+        assert_eq!(lock_reason("01J", 7), "hotl 01J pid 7");
+    }
+
+    /// T2: a child of a session worktree nests under the main repo's `.git`
+    /// (the floor), and its diff lands in the session worktree.
+    #[test]
+    fn create_inside_a_linked_worktree_nests_under_the_common_git_dir() {
+        let tmp = repo_or_skip!();
+        let root = tmp.path();
+        let session = SessionWorktree::open(root, "fix-auth").unwrap();
+        let child = Worktree::create(session.path(), "01JCHILD").expect("a child inside a session");
+        let main_dir = dunce::canonicalize(root.join(".git/hotl-worktrees")).unwrap();
+        assert!(
+            child.path().starts_with(&main_dir),
+            "{} is not under {}",
+            child.path().display(),
+            main_dir.display()
+        );
+        std::fs::write(child.path().join("c.txt"), "child\n").unwrap();
+        assert_eq!(child.apply_to_workspace().unwrap(), 1);
+        assert!(
+            session.path().join("c.txt").exists(),
+            "merged into the session worktree"
+        );
+        assert!(!root.join("c.txt").exists(), "never into the main checkout");
+        child.remove();
+    }
+
+    #[test]
+    fn create_degrades_when_the_cwd_is_below_the_toplevel() {
+        let tmp = repo_or_skip!();
+        let root = tmp.path();
+        let sub = root.join("crates/hotl");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(Worktree::create(&sub, "01JSUB").is_none());
+        assert!(Worktree::create(root, "01JTOP").is_some());
     }
 }
