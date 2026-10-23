@@ -631,3 +631,205 @@ async fn first_use_screen_then_trust_then_sanitized_traffic() {
     assert!(bad_tool.is_error && bad_tool.content.contains("trust=\"untrusted\""));
     assert!(bad_tool.content.contains("source=\"mcp:docs/missing\""));
 }
+
+// ---------------------------------------------------------------------------
+// 0063 T4 — URL servers through the same screen, grant and connector seam.
+
+fn url_cfg(url: &str, bearer: Option<&str>) -> ServerConfig {
+    ServerConfig {
+        bearer_token_env: bearer.map(str::to_string),
+        description: "remote test server".into(),
+        ..ServerConfig::http("gh", url)
+    }
+}
+
+/// The scripted duplex server behind a URL config: the connector ignores the
+/// address (there is no socket), so this exercises the trust and gate path.
+fn url_tool(cfg: ServerConfig, trust_dir: &std::path::Path) -> McpTool {
+    McpTool::with_connector(vec![cfg], TrustStore::load(trust_dir), connect_scripted())
+}
+
+#[tokio::test]
+async fn a_url_server_connects_after_the_screen() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = url_cfg(
+        "https://api.githubcopilot.com/mcp/",
+        Some("GITHUB_MCP_TOKEN"),
+    );
+    let tool = url_tool(cfg.clone(), dir.path());
+    let Permission::AskProtected { why, .. } = tool.permission(&json!({"server": "gh"})) else {
+        panic!("first use is protected");
+    };
+    assert!(why.contains("https://api.githubcopilot.com"), "{why}");
+    let out = run(
+        &tool,
+        json!({"server": "gh", "tool": "echo", "arguments": {"msg": "hi"}}),
+    )
+    .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("echo: hi"), "{}", out.content);
+    // The grant landed under the URL key space.
+    let fp = Fingerprint::of(&cfg);
+    assert!(fp.key().starts_with("fpu1:"));
+    assert!(TrustStore::load(dir.path()).is_trusted("gh", &fp));
+    // Second call: trusted → a plain ask, no screen.
+    assert!(matches!(
+        tool.permission(&json!({"server": "gh"})),
+        Permission::Ask { .. }
+    ));
+}
+
+#[tokio::test]
+async fn a_url_server_without_a_screen_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = url_cfg("https://api.githubcopilot.com/mcp/", None);
+    let tool = url_tool(cfg.clone(), dir.path());
+    let out = run(&tool, json!({"server": "gh", "tool": "echo"})).await;
+    assert!(
+        out.is_error && out.content.contains("approval"),
+        "{}",
+        out.content
+    );
+    assert!(!TrustStore::load(dir.path()).is_trusted("gh", &Fingerprint::of(&cfg)));
+}
+
+/// The binary-swap mirror: a grant names one address; the same server name
+/// pointed elsewhere (or with other headers) is screened again and, without
+/// that screen, never connects.
+#[tokio::test]
+async fn a_url_changed_after_the_screen_does_not_connect() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = url_cfg("https://api.githubcopilot.com/mcp/", None);
+    let tool = url_tool(first.clone(), dir.path());
+    assert!(matches!(
+        tool.permission(&json!({"server": "gh"})),
+        Permission::AskProtected { .. }
+    ));
+    assert!(!run(&tool, json!({"server": "gh"})).await.is_error);
+    assert!(TrustStore::load(dir.path()).is_trusted("gh", &Fingerprint::of(&first)));
+
+    let moved = url_cfg("https://evil.example/mcp", None);
+    let tool = url_tool(moved.clone(), dir.path());
+    assert!(
+        matches!(
+            tool.permission(&json!({"server": "gh"})),
+            Permission::AskProtected { .. }
+        ),
+        "a new address re-raises the screen"
+    );
+    assert!(!TrustStore::load(dir.path()).is_trusted("gh", &Fingerprint::of(&moved)));
+    let unscreened = url_tool(moved, dir.path());
+    let out = run(&unscreened, json!({"server": "gh"})).await;
+    assert!(
+        out.is_error && out.content.contains("approval"),
+        "{}",
+        out.content
+    );
+}
+
+struct NoSecrets;
+impl hotl_platform::SecretStore for NoSecrets {
+    fn get(&self, _name: &str) -> Option<String> {
+        None
+    }
+}
+
+struct Planted(&'static str);
+impl hotl_platform::SecretStore for Planted {
+    fn get(&self, name: &str) -> Option<String> {
+        (name == "GITHUB_MCP_TOKEN").then(|| self.0.to_string())
+    }
+}
+
+#[tokio::test]
+async fn a_missing_bearer_env_refuses_before_any_connect_and_names_the_var() {
+    let dir = tempfile::tempdir().unwrap();
+    // An unroutable address: a connect attempt would fail differently (and
+    // slowly); the refusal below must come from the token check instead.
+    let cfg = url_cfg("https://mcp.invalid/mcp", Some("GITHUB_MCP_TOKEN"));
+    let tool =
+        McpTool::new_with_secrets(vec![cfg], TrustStore::load(dir.path()), Arc::new(NoSecrets));
+    assert!(matches!(
+        tool.permission(&json!({"server": "gh"})),
+        Permission::AskProtected { .. }
+    ));
+    let started = std::time::Instant::now();
+    let out = run(&tool, json!({"server": "gh"})).await;
+    assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("needs a token") && out.content.contains("`GITHUB_MCP_TOKEN`"),
+        "{}",
+        out.content
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "no connect was attempted"
+    );
+}
+
+/// A loopback origin that answers every request 401 and echoes the
+/// Authorization header it was sent.
+async fn refusing_origin() -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let auth = head
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .unwrap_or("")
+                    .to_string();
+                let body = format!("rejected {auth}");
+                let _ = s
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 401 X\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}/mcp")
+}
+
+#[tokio::test]
+async fn the_token_never_appears_anywhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = refusing_origin().await;
+    let cfg = url_cfg(&url, Some("GITHUB_MCP_TOKEN"));
+    let tool = McpTool::new_with_secrets(
+        vec![cfg.clone()],
+        TrustStore::load(dir.path()),
+        Arc::new(Planted("tok-PLANTED-123")),
+    );
+    let Permission::AskProtected { why, summary, .. } = tool.permission(&json!({"server": "gh"}))
+    else {
+        panic!("first use is protected");
+    };
+    let out = run(&tool, json!({"server": "gh"})).await;
+    assert!(out.is_error, "{}", out.content);
+    assert!(out.content.contains("401"), "{}", out.content);
+    let trust_file = std::fs::read_to_string(dir.path().join("trust.toml")).unwrap_or_default();
+    for (what, text) in [
+        ("the ask why", why.as_str()),
+        ("the ask summary", summary.as_str()),
+        ("the tool output", out.content.as_str()),
+        ("the trust file", trust_file.as_str()),
+        ("the fingerprint", &Fingerprint::of(&cfg).to_string()),
+    ] {
+        assert!(
+            !text.contains("tok-PLANTED"),
+            "{what} leaked the token: {text}"
+        );
+    }
+}

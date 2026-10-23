@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::Client;
-use crate::config::ServerConfig;
+use crate::config::{ServerConfig, Transport};
 use crate::sanitize::{self, wrap_budgeted, Budget, MCP_TRAILER};
 use crate::trust::{Fingerprint, TrustStore};
 
@@ -108,25 +108,76 @@ pub struct McpTool {
     budget: Budget,
 }
 
+/// The one connect path the tool and `hotl mcp test` share (0063 T4). A
+/// program spawns over stdio. A URL server first takes `web_fetch`'s two
+/// egress checks — `host_allowed`, then the session ask for a denied host —
+/// then resolves its token by *name* through `secrets`, then connects over
+/// Streamable HTTP. Every refusal names the fix. Nothing here screens trust;
+/// that is `McpTool::permission`/`ensure_client`'s job.
+pub async fn connect(
+    cfg: &ServerConfig,
+    secrets: &dyn hotl_platform::SecretStore,
+) -> Result<Arc<Client>, String> {
+    match cfg.transport() {
+        Transport::Stdio { .. } => {
+            let command = cfg
+                .build_command()
+                .ok_or_else(|| format!("`{}` has no program to start", cfg.name))?;
+            let client = Client::connect_command(command)?;
+            client.initialize().await?;
+            Ok(client)
+        }
+        Transport::Http {
+            url,
+            bearer_token_env,
+            ..
+        } => {
+            let host = crate::http::url_host(url);
+            if let hotl_tools::net::HostVerdict::Denied(reason) =
+                hotl_tools::net::host_allowed(host)
+            {
+                if !hotl_tools::net::decide_denied_host(host).await {
+                    return Err(format!("`{}` was not connected: {reason}", cfg.name));
+                }
+            }
+            let token = match bearer_token_env {
+                None => None,
+                Some(var) => match secrets.get(var).filter(|v| !v.trim().is_empty()) {
+                    Some(v) => Some(crate::http::Secret::new(v)),
+                    None => {
+                        return Err(format!(
+                            "`{}` needs a token: export `{var}` and retry",
+                            cfg.name
+                        ))
+                    }
+                },
+            };
+            let client = crate::http::connect_http(cfg, token)?;
+            client.initialize().await?;
+            Ok(client)
+        }
+    }
+}
+
 impl McpTool {
+    /// Production: tokens come from the environment.
     pub fn new(servers: Vec<ServerConfig>, trust: TrustStore) -> Self {
+        Self::new_with_secrets(servers, trust, Arc::new(hotl_platform::EnvSecrets))
+    }
+
+    /// `new` with a secret source of the caller's choosing (tests plant a
+    /// token; a Keychain store slots in here later).
+    pub fn new_with_secrets(
+        servers: Vec<ServerConfig>,
+        trust: TrustStore,
+        secrets: Arc<dyn hotl_platform::SecretStore>,
+    ) -> Self {
         Self::with_connector(
             servers,
             trust,
-            Box::new(|cfg| {
-                Box::pin(async move {
-                    // URL servers connect from 0063 T4; until then the
-                    // loader's validation keeps them out of the roster.
-                    let Some(command) = cfg.build_command() else {
-                        return Err(format!(
-                            "`{}` is a URL server; not connectable yet",
-                            cfg.name
-                        ));
-                    };
-                    let client = Client::connect_command(command)?;
-                    client.initialize().await?;
-                    Ok(client)
-                })
+            Box::new(move |cfg| {
+                let secrets = Arc::clone(&secrets);
+                Box::pin(async move { connect(&cfg, secrets.as_ref()).await })
             }),
         )
     }

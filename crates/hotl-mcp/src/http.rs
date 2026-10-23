@@ -254,6 +254,18 @@ fn scrub(msg: &str, token: Option<&Secret>) -> String {
     }
 }
 
+/// The host of a URL, without port or brackets — what the egress policy is
+/// asked about.
+pub(crate) fn url_host(url: &str) -> &str {
+    let after = url.find("://").map_or(url, |i| &url[i + 3..]);
+    let authority = after.split(['/', '?', '#']).next().unwrap_or("");
+    if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    }
+}
+
 /// `scheme://host[:port]` of a URL.
 fn origin(url: &str) -> &str {
     let Some(scheme_end) = url.find("://") else {
