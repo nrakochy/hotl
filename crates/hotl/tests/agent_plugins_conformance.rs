@@ -89,16 +89,15 @@ fn data_base(dir: &Path) -> PathBuf {
 fn to_server_config(plugin: &str, s: &hotl_tools::plugins::PluginServer) -> ServerConfig {
     ServerConfig {
         name: format!("{plugin}:{}", s.name),
-        command: s.command.clone(),
         args: s.args.clone(),
-        description: String::new(),
         env: s.env.clone(),
         cwd: Some(s.cwd.clone()),
+        ..ServerConfig::stdio("", &s.command, &[])
     }
 }
 
 fn envs_of(cfg: &ServerConfig) -> Vec<(String, String)> {
-    let cmd = cfg.build_command();
+    let cmd = cfg.build_command().expect("stdio");
     cmd.as_std()
         .get_envs()
         .map(|(k, v)| {
@@ -354,7 +353,7 @@ fn a_stdio_transport_is_implemented() {
         &data_base(dir.path()),
     );
     let cfg = to_server_config("p", &out.servers[0]);
-    let cmd = cfg.build_command();
+    let cmd = cfg.build_command().expect("stdio");
     assert_eq!(cmd.as_std().get_program(), "npx");
     let args: Vec<_> = cmd.as_std().get_args().collect();
     assert_eq!(args, ["-y", "@x/mem"]);
@@ -487,7 +486,7 @@ fn a_command_resolves_as_a_single_token() {
         &data,
     );
     let cfg = to_server_config("p", &out.servers[0]);
-    let cmd = cfg.build_command();
+    let cmd = cfg.build_command().expect("stdio");
     assert_eq!(
         cmd.as_std().get_program(),
         "name with spaces",
@@ -528,7 +527,10 @@ fn a_cwd_defaults_to_plugin_root() {
     );
     let cfg = to_server_config("p", &out.servers[0]);
     assert_eq!(
-        cfg.build_command().as_std().get_current_dir(),
+        cfg.build_command()
+            .expect("stdio")
+            .as_std()
+            .get_current_dir(),
         Some(root.as_path())
     );
 }
@@ -614,15 +616,11 @@ fn a_reserved_vars_set_last_replace_configured() {
     // …and `build_command` gives the last duplicate the final word, so
     // appended-last means replaces-configured by construction.
     let cfg = ServerConfig {
-        name: "s".into(),
-        command: "npx".into(),
-        args: vec![],
-        description: String::new(),
         env: vec![
             ("PLUGIN_ROOT".into(), "configured".into()),
             ("PLUGIN_ROOT".into(), "client".into()),
         ],
-        cwd: None,
+        ..ServerConfig::stdio("s", "npx", &[])
     };
     let envs = envs_of(&cfg);
     assert_eq!(envs, vec![("PLUGIN_ROOT".into(), "client".into())]);
@@ -647,7 +645,7 @@ fn a_configured_path_does_not_affect_bare_commands() {
     assert_eq!(out.servers[0].command, "npx");
     let cfg = to_server_config("p", &out.servers[0]);
     assert_eq!(
-        cfg.build_command().as_std().get_program(),
+        cfg.build_command().expect("stdio").as_std().get_program(),
         "npx",
         "resolution is left to the platform at spawn, not the configured PATH"
     );

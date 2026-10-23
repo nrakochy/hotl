@@ -70,12 +70,17 @@ fn usage() -> i32 {
     2
 }
 
-/// `command arg arg` as one display string.
+/// `command arg arg` as one display string; a URL server shows its address.
 fn program(cfg: &ServerConfig) -> String {
-    if cfg.args.is_empty() {
-        cfg.command.clone()
-    } else {
-        format!("{} {}", cfg.command, cfg.args.join(" "))
+    match cfg.transport() {
+        hotl_mcp::config::Transport::Http { url, .. } => url.to_string(),
+        hotl_mcp::config::Transport::Stdio { command, args, .. } => {
+            if args.is_empty() {
+                command.to_string()
+            } else {
+                format!("{command} {}", args.join(" "))
+            }
+        }
     }
 }
 
@@ -324,7 +329,13 @@ fn probe(cfg: &ServerConfig) -> Result<Vec<(String, String)>, String> {
         .build()
         .map_err(|e| format!("could not build a runtime ({e})"))?;
     rt.block_on(async {
-        let client = hotl_mcp::client::Client::connect_command(cfg.build_command())?;
+        let Some(command) = cfg.build_command() else {
+            return Err(format!(
+                "`{}` is a URL server; `hotl mcp test` connects to those from 0063 T6",
+                cfg.name
+            ));
+        };
+        let client = hotl_mcp::client::Client::connect_command(command)?;
         client.initialize().await?;
         let tools = client.list_tools().await?;
         Ok(tools.into_iter().map(|t| (t.name, t.description)).collect())
@@ -365,11 +376,14 @@ mod tests {
     fn cfg_for(name: &str, bin: &Path) -> ServerConfig {
         ServerConfig {
             name: name.into(),
-            command: bin.to_string_lossy().into(),
+            command: Some(bin.to_string_lossy().into()),
             args: vec![],
             description: String::new(),
             env: Vec::new(),
             cwd: None,
+            url: None,
+            headers: Vec::new(),
+            bearer_token_env: None,
         }
     }
 

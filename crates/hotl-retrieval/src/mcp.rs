@@ -64,10 +64,19 @@ pub struct McpRetriever {
 }
 
 impl McpRetriever {
-    pub fn new(cfg: ServerConfig, tool: String, trust: TrustStore) -> Self {
-        let command = cfg.command.clone();
-        let args = cfg.args.clone();
-        Self::with_connector(
+    /// `[[retrieval]]` MCP backends are stdio-only (0063; tracker row): a URL
+    /// config is refused here, before any connect.
+    pub fn new(cfg: ServerConfig, tool: String, trust: TrustStore) -> Result<Self, String> {
+        let hotl_mcp::config::Transport::Stdio { command, args, .. } = cfg.transport() else {
+            return Err(format!(
+                "`[[retrieval]]` MCP backend `{}` names a `url`; retrieval backends are \
+                 stdio-only — give it a `command`",
+                cfg.name
+            ));
+        };
+        let command = command.to_string();
+        let args = args.to_vec();
+        Ok(Self::with_connector(
             cfg,
             tool,
             trust,
@@ -81,7 +90,7 @@ impl McpRetriever {
                     Ok(client)
                 })
             }),
-        )
+        ))
     }
 
     /// Tests inject an in-process transport here.
@@ -282,11 +291,14 @@ mod tests {
         std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").expect("fixture binary");
         let cfg = hotl_mcp::config::ServerConfig {
             name: "docs".into(),
-            command: bin.to_str().expect("utf-8 tempdir").into(),
+            command: Some(bin.to_str().expect("utf-8 tempdir").into()),
             args: vec![],
             description: "doc search".into(),
             env: Vec::new(),
             cwd: None,
+            url: None,
+            headers: Vec::new(),
+            bearer_token_env: None,
         };
         McpRetriever::with_connector(
             cfg,
@@ -382,11 +394,14 @@ mod tests {
         let store = TrustStore::load(dir.path());
         let fp = Fingerprint::of(&hotl_mcp::config::ServerConfig {
             name: "docs".into(),
-            command: dir.path().join("docs-server").to_str().unwrap().into(),
+            command: Some(dir.path().join("docs-server").to_str().unwrap().into()),
             args: vec![],
             description: "doc search".into(),
             env: Vec::new(),
             cwd: None,
+            url: None,
+            headers: Vec::new(),
+            bearer_token_env: None,
         });
         assert!(
             !store.is_trusted("docs", &fp),
@@ -423,11 +438,14 @@ mod tests {
         };
         let fp = Fingerprint::of(&hotl_mcp::config::ServerConfig {
             name: "docs".into(),
-            command: dir.path().join("docs-server").to_str().unwrap().into(),
+            command: Some(dir.path().join("docs-server").to_str().unwrap().into()),
             args: vec![],
             description: "doc search".into(),
             env: Vec::new(),
             cwd: None,
+            url: None,
+            headers: Vec::new(),
+            bearer_token_env: None,
         });
         assert!(
             why.contains(&fp.to_string()),

@@ -115,7 +115,15 @@ impl McpTool {
             trust,
             Box::new(|cfg| {
                 Box::pin(async move {
-                    let client = Client::connect_command(cfg.build_command())?;
+                    // URL servers connect from 0063 T4; until then the
+                    // loader's validation keeps them out of the roster.
+                    let Some(command) = cfg.build_command() else {
+                        return Err(format!(
+                            "`{}` is a URL server; not connectable yet",
+                            cfg.name
+                        ));
+                    };
+                    let client = Client::connect_command(command)?;
                     client.initialize().await?;
                     Ok(client)
                 })
@@ -462,11 +470,14 @@ mod tests {
     fn tiny_tool(trust_dir: &std::path::Path) -> McpTool {
         let cfg = ServerConfig {
             name: "docs".into(),
-            command: "/fake/docs-server".into(),
+            command: Some("/fake/docs-server".into()),
             args: vec![],
             description: "test server".into(),
             env: Vec::new(),
             cwd: None,
+            url: None,
+            headers: Vec::new(),
+            bearer_token_env: None,
         };
         McpTool::with_connector(
             vec![cfg],
@@ -511,11 +522,14 @@ mod tests {
     fn tool_named(name: &str, trust_dir: &std::path::Path) -> McpTool {
         let cfg = ServerConfig {
             name: name.into(),
-            command: "/fake/docs-server".into(),
+            command: Some("/fake/docs-server".into()),
             args: vec![],
             description: "test server".into(),
             env: Vec::new(),
             cwd: None,
+            url: None,
+            headers: Vec::new(),
+            bearer_token_env: None,
         };
         McpTool::with_connector(
             vec![cfg],

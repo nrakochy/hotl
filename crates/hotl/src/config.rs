@@ -241,12 +241,21 @@ pub fn all_mcp_servers(
     cfg: &Config,
     plugins: &[hotl_tools::plugins::PluginEntry],
 ) -> Vec<hotl_mcp::config::ServerConfig> {
-    let mut servers = cfg.mcp_servers();
+    all_mcp_servers_reporting(cfg, plugins).0
+}
+
+/// `all_mcp_servers` plus the warnings `[[mcp]]` validation raised (0063 T1):
+/// one invalid server loads none, and the warning names it and the fix.
+pub fn all_mcp_servers_reporting(
+    cfg: &Config,
+    plugins: &[hotl_tools::plugins::PluginEntry],
+) -> (Vec<hotl_mcp::config::ServerConfig>, Vec<String>) {
+    let (mut servers, warnings) = cfg.mcp_servers_reporting();
     for plugin in plugins {
         for s in &plugin.servers {
             servers.push(hotl_mcp::config::ServerConfig {
                 name: format!("{}:{}", plugin.name, s.name),
-                command: s.command.clone(),
+                command: Some(s.command.clone()),
                 args: s.args.clone(),
                 description: if s.description.is_empty() {
                     format!("from plugin `{}`", plugin.name)
@@ -255,10 +264,13 @@ pub fn all_mcp_servers(
                 },
                 env: s.env.clone(),
                 cwd: Some(s.cwd.clone()),
+                url: None,
+                headers: Vec::new(),
+                bearer_token_env: None,
             });
         }
     }
-    servers
+    (servers, warnings)
 }
 
 /// `[agents]` — user-defined subagent shapes (tier-1 gap #6). Mirrors
@@ -1330,10 +1342,27 @@ impl Config {
     /// A `[[mcp]]` section that fails to parse yields none, matching the
     /// registry's prior behaviour of skipping the tool entirely.
     pub fn mcp_servers(&self) -> Vec<hotl_mcp::config::ServerConfig> {
-        self.mcp_toml()
+        self.mcp_servers_reporting().0
+    }
+
+    /// `mcp_servers` plus its warnings. Every server is validated (0063 T1:
+    /// `command` xor `url`, the URL rule, no literal `Authorization`); one
+    /// failure loads **no** servers and warns once, naming the server and the
+    /// fix — the "malformed file is ignored whole" posture.
+    pub fn mcp_servers_reporting(&self) -> (Vec<hotl_mcp::config::ServerConfig>, Vec<String>) {
+        let servers = self
+            .mcp_toml()
             .and_then(|t| toml::from_str::<hotl_mcp::config::McpConfig>(&t).ok())
             .map(|c| c.servers)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let errors: Vec<String> = servers.iter().filter_map(|s| s.validate().err()).collect();
+        if errors.is_empty() {
+            return (servers, Vec::new());
+        }
+        (
+            Vec::new(),
+            vec![format!("[[mcp]] loaded no servers: {}", errors.join("; "))],
+        )
     }
 
     /// The `[[retrieval]]` backends as a `[[backend]]`-shaped TOML string
@@ -1706,7 +1735,7 @@ mod tests {
         let servers = cfg.mcp_servers();
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "docs");
-        assert_eq!(servers[0].command, "/bin/docs");
+        assert_eq!(servers[0].command.as_deref(), Some("/bin/docs"));
         let hooks = cfg.hooks_toml().unwrap();
         assert!(hooks.contains("pre_tool") && hooks.contains("cargo check"));
     }
@@ -1716,6 +1745,27 @@ mod tests {
         assert!(cfg_with("[provider]\nmodel = \"x\"\n")
             .mcp_servers()
             .is_empty());
+    }
+
+    #[test]
+    fn an_invalid_mcp_server_loads_no_servers_and_warns_once() {
+        let cfg = cfg_with(
+            "[[mcp]]\nname = \"docs\"\ncommand = \"/bin/docs\"\n\n\
+             [[mcp]]\nname = \"bad\"\ncommand = \"/bin/x\"\nurl = \"https://x.com/mcp\"\n",
+        );
+        let (servers, warnings) = cfg.mcp_servers_reporting();
+        assert!(servers.is_empty(), "one bad entry loads none");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("`bad` sets both"), "{warnings:?}");
+        // A URL server alone loads.
+        let cfg = cfg_with(
+            "[[mcp]]\nname = \"gh\"\nurl = \"https://api.githubcopilot.com/mcp/\"\n\
+             bearer_token_env = \"GITHUB_MCP_TOKEN\"\n",
+        );
+        let (servers, warnings) = cfg.mcp_servers_reporting();
+        assert_eq!(servers.len(), 1);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(servers[0].is_remote());
     }
 
     #[test]

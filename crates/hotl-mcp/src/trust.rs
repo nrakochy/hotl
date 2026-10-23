@@ -54,10 +54,13 @@ impl Fingerprint {
                 p.is_file().then(|| (a.clone(), file_hash(&p)))
             })
             .collect();
+        // T1 interim: a URL server has no program to hash (T2 gives it its
+        // own fingerprint variant).
+        let command = cfg.command.clone().unwrap_or_default();
         Self {
-            command: cfg.command.clone(),
+            hash: binary_hash(&command),
+            command,
             args: cfg.args.clone(),
-            hash: binary_hash(&cfg.command),
             arg_hashes,
             env: cfg.env.clone(),
             cwd: cfg.cwd.clone(),
@@ -385,11 +388,14 @@ mod tests {
     fn cfg(command: &str, args: &[&str]) -> crate::config::ServerConfig {
         crate::config::ServerConfig {
             name: "docs".into(),
-            command: command.into(),
+            command: Some(command.into()),
             args: args.iter().map(|s| s.to_string()).collect(),
             description: String::new(),
             env: Vec::new(),
             cwd: None,
+            url: None,
+            headers: Vec::new(),
+            bearer_token_env: None,
         }
     }
 

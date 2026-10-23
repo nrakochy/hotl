@@ -2428,7 +2428,8 @@ fn build_registry(
     discovery_warnings.extend(plugin_warnings);
     // The shared roster composition: `hotl mcp` renders the same call, so
     // the CLI can never disagree with what a turn loads.
-    let servers = crate::config::all_mcp_servers(cfg, &plugins);
+    let (servers, mcp_warnings) = crate::config::all_mcp_servers_reporting(cfg, &plugins);
+    discovery_warnings.extend(mcp_warnings);
     if !servers.is_empty() {
         let trust = hotl_mcp::trust::TrustStore::load(config_dir);
         registry.register(Box::new(hotl_mcp::McpTool::new(servers, trust)));

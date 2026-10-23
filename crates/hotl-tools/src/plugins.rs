@@ -665,7 +665,7 @@ fn valid_server_name(name: &str) -> bool {
 }
 
 /// An HTTP field-name token (RFC 9110 tchar).
-fn valid_header_name(name: &str) -> bool {
+pub fn valid_header_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
@@ -714,8 +714,10 @@ fn validate_remote(obj: &serde_json::Map<String, Value>) -> Result<(), String> {
 }
 
 /// §7.2.1: absolute http(s), no user information, no fragment; plain
-/// `http` only for `localhost` or a loopback IP literal.
-fn validate_remote_url(url: &str) -> Result<(), String> {
+/// `http` only for `localhost` or a loopback IP literal; a literal private or
+/// cloud-metadata address is refused outright (0063). One URL rule for the
+/// plugin lane and `[[mcp]] url` alike.
+pub fn validate_remote_url(url: &str) -> Result<(), String> {
     let (plain_http, rest) = if let Some(rest) = url.strip_prefix("https://") {
         (false, rest)
     } else if let Some(rest) = url.strip_prefix("http://") {
@@ -732,6 +734,20 @@ fn validate_remote_url(url: &str) -> Result<(), String> {
     }
     if authority.contains('@') {
         return Err("`url` must not contain user information".into());
+    }
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    if matches!(
+        crate::web::address_class(host),
+        crate::web::AddressClass::Private | crate::web::AddressClass::Metadata
+    ) {
+        return Err(format!(
+            "`url` names `{host}`, a private or metadata address; only loopback and public \
+             hosts are reachable"
+        ));
     }
     if plain_http {
         let host = if let Some(v6) = authority.strip_prefix('[') {

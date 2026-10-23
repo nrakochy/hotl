@@ -98,11 +98,14 @@ fn connect_scripted() -> hotl_mcp::Connector {
 fn scripted_tool(trust_dir: &std::path::Path) -> McpTool {
     let cfg = ServerConfig {
         name: "docs".into(),
-        command: "/fake/docs-server".into(),
+        command: Some("/fake/docs-server".into()),
         args: vec![],
         description: "test server".into(),
         env: Vec::new(),
         cwd: None,
+        url: None,
+        headers: Vec::new(),
+        bearer_token_env: None,
     };
     McpTool::with_connector(vec![cfg], TrustStore::load(trust_dir), connect_scripted())
 }
@@ -110,11 +113,14 @@ fn scripted_tool(trust_dir: &std::path::Path) -> McpTool {
 fn docs_cfg_for(bin: &std::path::Path) -> ServerConfig {
     ServerConfig {
         name: "docs".into(),
-        command: bin.to_str().expect("utf-8 tempdir").into(),
+        command: Some(bin.to_str().expect("utf-8 tempdir").into()),
         args: vec![],
         description: "test server".into(),
         env: Vec::new(),
         cwd: None,
+        url: None,
+        headers: Vec::new(),
+        bearer_token_env: None,
     }
 }
 

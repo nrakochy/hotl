@@ -57,18 +57,15 @@ pub fn build(
                     continue;
                 };
                 let trust = hotl_mcp::trust::TrustStore::load(config_dir);
-                out.push(Box::new(McpRetriever::new(
-                    hotl_mcp::config::ServerConfig {
-                        name: b.name,
-                        command,
-                        args: b.args,
-                        description: b.description,
-                        env: Vec::new(),
-                        cwd: None,
-                    },
-                    b.tool.unwrap_or_else(|| "search".into()),
-                    trust,
-                )));
+                let cfg = hotl_mcp::config::ServerConfig {
+                    description: b.description,
+                    args: b.args,
+                    ..hotl_mcp::config::ServerConfig::stdio(&b.name, &command, &[])
+                };
+                match McpRetriever::new(cfg, b.tool.unwrap_or_else(|| "search".into()), trust) {
+                    Ok(r) => out.push(Box::new(r)),
+                    Err(w) => warnings.push(w),
+                }
             }
             other => warnings.push(format!(
                 "[[retrieval]] `{}` skipped: unknown kind \"{other}\" (P1 supports \"mcp\")",

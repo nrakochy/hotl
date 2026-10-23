@@ -323,7 +323,7 @@ fn parse_fetchable(raw: &str) -> Option<(reqwest::Url, String)> {
 const URL_SUMMARY_MAX: usize = 160;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AddressClass {
+pub enum AddressClass {
     Public,
     Private,
     Loopback,
@@ -336,7 +336,7 @@ pub(crate) enum AddressClass {
 /// INVARIANT (unimplemented — see specs/exec-plans/active/0019-remediation-sandbox.md,
 /// Task 7 decision log): DNS names resolving to private addresses are not
 /// classified; only literals and `localhost` are.
-pub(crate) fn address_class(host: &str) -> AddressClass {
+pub fn address_class(host: &str) -> AddressClass {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     if bare.eq_ignore_ascii_case("localhost") || bare.to_ascii_lowercase().ends_with(".localhost") {
         return AddressClass::Loopback;
