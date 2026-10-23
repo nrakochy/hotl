@@ -3511,3 +3511,107 @@ async fn session_children_stop_interrupts_by_id_and_unknown_ids_say_so() {
         false
     );
 }
+
+/// 0076 D6: `initialize` names the dialect, the upstream release it was
+/// checked against, and hotl itself — and keeps the dialect string, never
+/// the integer an ACP v1 agent would send.
+#[tokio::test]
+async fn initialize_stamps_the_dialect_and_the_acp_release_it_was_checked_against() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    let init = next(&mut lines).await;
+    let r = &init["result"];
+    assert_eq!(r["protocolVersion"], "0.1");
+    assert_eq!(r["agentInfo"]["name"], "hotl");
+    assert_eq!(r["agentInfo"]["version"], env!("CARGO_PKG_VERSION"));
+    let meta = &r["agentCapabilities"]["_meta"]["hotl"];
+    assert_eq!(meta["dialect"], acp::PROTOCOL_VERSION);
+    assert_eq!(meta["acpSchema"], acp::ACP_SCHEMA_CHECKED);
+    assert_eq!(
+        meta["extensions"].as_array().unwrap().len(),
+        acp::EXTENSION_METHODS.len()
+    );
+}
+
+/// Every method the handler matches is advertised, and nothing else: the
+/// match arms are read from the source, so a new arm without a roster entry
+/// fails here. Each advertised handler method also answers without
+/// "unknown method".
+#[tokio::test]
+async fn every_handled_method_is_advertised_as_an_extension() {
+    let src = std::fs::read_to_string(
+        std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/acp.rs"),
+    )
+    .unwrap();
+    let mut handled: Vec<String> = Vec::new();
+    for line in src.lines() {
+        let t = line.trim_start();
+        if !(t.ends_with("=> {") || t.ends_with("=>")) {
+            continue;
+        }
+        let mut rest = t;
+        while let Some(i) = rest.find("\"session/") {
+            let tail = &rest[i + 1..];
+            let end = tail.find('"').unwrap();
+            handled.push(tail[..end].to_string());
+            rest = &tail[end..];
+        }
+    }
+    for m in [
+        "session/request_permission",
+        "session/request_question",
+        "session/request_egress",
+    ] {
+        assert!(src.contains(&format!("\"method\": \"{m}\"")), "{m} is sent");
+        handled.push(m.to_string());
+    }
+    handled.sort();
+    let mut advertised: Vec<String> = acp::EXTENSION_METHODS
+        .iter()
+        .map(|m| m.to_string())
+        .collect();
+    advertised.sort();
+    assert_eq!(handled, advertised);
+
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    let mut id = 100;
+    for m in acp::EXTENSION_METHODS
+        .iter()
+        .filter(|m| !m.starts_with("session/request_"))
+    {
+        // No session yet: most answer "requires an open session" — anything
+        // but "unknown method". `new`/`load` would open one; skip them here.
+        if matches!(*m, "session/new" | "session/load" | "session/prompt") {
+            continue;
+        }
+        id += 1;
+        send(&mut cwrite, json!({"jsonrpc":"2.0","id":id,"method":m})).await;
+        let r = read_until_id(&mut lines, id).await;
+        let msg = r["error"]["message"].as_str().unwrap_or("");
+        assert!(!msg.contains("unknown method"), "{m}: {r}");
+    }
+}

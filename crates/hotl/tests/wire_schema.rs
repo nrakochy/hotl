@@ -217,6 +217,20 @@ fn every_acp_payload_validates_against_the_published_schema() {
             default_plan: false,
             context_window: 200_000,
             stream_idle_secs: 90,
+            agent_info: acp::AgentInfo {
+                name: "hotl".into(),
+                title: "hotl".into(),
+                version: "0".into(),
+            },
+            agent_capabilities: acp::AgentCapabilities {
+                meta: acp::CapabilitiesMeta {
+                    hotl: acp::HotlMeta {
+                        dialect: "0.1".into(),
+                        acp_schema: "schema-v1.26.0".into(),
+                        extensions: vec!["session/new".into()],
+                    },
+                },
+            },
         })
         .unwrap(),
     );

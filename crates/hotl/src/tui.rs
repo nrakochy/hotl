@@ -1793,7 +1793,11 @@ mod tests {
 
     #[test]
     fn handshake_reads_the_mode_and_context_window() {
-        let hello = json!({"defaultMode": "auto", "contextWindow": 1_000_000});
+        // The 0076 stamp keys ride `initialize` too; the client reads only
+        // what it renders and ignores the rest.
+        let hello = json!({"defaultMode": "auto", "contextWindow": 1_000_000,
+            "agentInfo": {"name": "hotl", "title": "hotl", "version": "0"},
+            "agentCapabilities": {"_meta": {"hotl": {"dialect": "0.1"}}}});
         let opened = json!({"sessionId": "s", "name": null, "mode": "plan"});
         let (mode, _plan, window, idle) = super::open_settings(&hello, &opened);
         assert_eq!(idle, None);

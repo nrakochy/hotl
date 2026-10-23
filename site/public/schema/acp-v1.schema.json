@@ -272,6 +272,38 @@
       ],
       "description": "Any `session/update` body: a stream frame or an ACP-only kind. The\n`workflows_report` body is the workflow registry's own JSON (untyped here)."
     },
+    "AgentCapabilities": {
+      "description": "Upstream ACP's capability object; hotl's own facts ride under `_meta`, the\nspec's place for extensions (0076 D6). No upstream capability is claimed.",
+      "properties": {
+        "_meta": {
+          "$ref": "#/$defs/CapabilitiesMeta"
+        }
+      },
+      "required": [
+        "_meta"
+      ],
+      "type": "object"
+    },
+    "AgentInfo": {
+      "description": "Upstream ACP's `agentInfo` shape.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "title",
+        "version"
+      ],
+      "type": "object"
+    },
     "Cancelled": {
       "properties": {
         "cancelled": {
@@ -280,6 +312,17 @@
       },
       "required": [
         "cancelled"
+      ],
+      "type": "object"
+    },
+    "CapabilitiesMeta": {
+      "properties": {
+        "hotl": {
+          "$ref": "#/$defs/HotlMeta"
+        }
+      },
+      "required": [
+        "hotl"
       ],
       "type": "object"
     },
@@ -1517,9 +1560,38 @@
       ],
       "type": "string"
     },
+    "HotlMeta": {
+      "description": "hotl speaks its own dialect (`dialect`), shaped after the upstream release\nnamed by `acpSchema`; `extensions` lists every method it speaks.",
+      "properties": {
+        "acpSchema": {
+          "type": "string"
+        },
+        "dialect": {
+          "type": "string"
+        },
+        "extensions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "dialect",
+        "acpSchema",
+        "extensions"
+      ],
+      "type": "object"
+    },
     "InitializeResult": {
       "description": "The `initialize` result.",
       "properties": {
+        "agentCapabilities": {
+          "$ref": "#/$defs/AgentCapabilities"
+        },
+        "agentInfo": {
+          "$ref": "#/$defs/AgentInfo"
+        },
         "contextWindow": {
           "format": "uint64",
           "minimum": 0,
@@ -1566,7 +1638,9 @@
         "defaultMode",
         "defaultPlan",
         "contextWindow",
-        "streamIdleSecs"
+        "streamIdleSecs",
+        "agentInfo",
+        "agentCapabilities"
       ],
       "type": "object"
     },

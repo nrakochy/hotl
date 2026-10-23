@@ -24,6 +24,40 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 pub const UPDATE_SCHEMA_VERSION: u32 = 1;
 pub const PROTOCOL_VERSION: &str = "0.1";
 
+/// The upstream ACP schema release the extension list was last read against
+/// (agentclientprotocol, 2026-10-16). Bumping it is a deliberate edit.
+pub const ACP_SCHEMA_CHECKED: &str = "schema-v1.26.0";
+
+/// Every method this dialect speaks beyond `initialize`: what the handler
+/// answers, then the three requests it sends the client. Advertised under
+/// `agentCapabilities._meta.hotl.extensions` (0076 D6).
+pub const EXTENSION_METHODS: &[&str] = &[
+    "session/new",
+    "session/load",
+    "session/prompt",
+    "session/rename",
+    "session/set_mode",
+    "session/set_plan",
+    "session/set_effort",
+    "session/set_model",
+    "session/set_goal",
+    "session/remember",
+    "session/steer",
+    "session/fold",
+    "session/cancel",
+    "session/reload_config",
+    "session/aside",
+    "session/context",
+    "session/workflows",
+    "session/jobs",
+    "session/children",
+    "session/children/stop",
+    "session/jobs/stop",
+    "session/request_permission",
+    "session/request_question",
+    "session/request_egress",
+];
+
 type Writer = Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
 type Pending = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<AskReply>>>>;
 /// In-flight `session/request_question` round-trips, parallel to `Pending`.
@@ -490,6 +524,14 @@ async fn handle_request(
                     default_plan: info.default_plan,
                     context_window: info.context_window,
                     stream_idle_secs: info.stream_idle_secs,
+                    // `protocolVersion` stays hotl's dialect string: the
+                    // integer `1` would claim ACP v1 conformance (0076 D6).
+                    agent_info: AgentInfo {
+                        name: "hotl".into(),
+                        title: "hotl".into(),
+                        version: env!("CARGO_PKG_VERSION").into(),
+                    },
+                    agent_capabilities: AgentCapabilities::stamp(),
                 }),
             )
             .await;
@@ -2011,6 +2053,53 @@ pub struct InitializeResult {
     pub default_plan: bool,
     pub context_window: u64,
     pub stream_idle_secs: u64,
+    pub agent_info: AgentInfo,
+    pub agent_capabilities: AgentCapabilities,
+}
+
+/// Upstream ACP's `agentInfo` shape.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AgentInfo {
+    pub name: String,
+    pub title: String,
+    pub version: String,
+}
+
+/// Upstream ACP's capability object; hotl's own facts ride under `_meta`, the
+/// spec's place for extensions (0076 D6). No upstream capability is claimed.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AgentCapabilities {
+    #[serde(rename = "_meta")]
+    pub meta: CapabilitiesMeta,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CapabilitiesMeta {
+    pub hotl: HotlMeta,
+}
+
+/// hotl speaks its own dialect (`dialect`), shaped after the upstream release
+/// named by `acpSchema`; `extensions` lists every method it speaks.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HotlMeta {
+    pub dialect: String,
+    pub acp_schema: String,
+    pub extensions: Vec<String>,
+}
+
+impl AgentCapabilities {
+    fn stamp() -> Self {
+        AgentCapabilities {
+            meta: CapabilitiesMeta {
+                hotl: HotlMeta {
+                    dialect: PROTOCOL_VERSION.into(),
+                    acp_schema: ACP_SCHEMA_CHECKED.into(),
+                    extensions: EXTENSION_METHODS.iter().map(|m| m.to_string()).collect(),
+                },
+            },
+        }
+    }
 }
 
 /// `{path, branch}` of a session's worktree.
