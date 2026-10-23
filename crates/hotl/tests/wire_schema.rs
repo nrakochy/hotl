@@ -38,7 +38,10 @@ fn schema_dir() -> PathBuf {
 fn check(file: &str, which: &str) {
     let path = schema_dir().join(file);
     let want = schema_cli::render(which).unwrap();
-    let have = std::fs::read_to_string(&path).unwrap_or_default();
+    // A Windows checkout may carry CRLF.
+    let have = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
     if have == want {
         return;
     }
@@ -266,7 +269,9 @@ fn every_acp_payload_validates_against_the_published_schema() {
 #[test]
 fn the_features_page_matches_the_table() {
     let page = schema_dir().join("../../src/content/docs/features.md");
-    let text = std::fs::read_to_string(&page).unwrap();
+    let text = std::fs::read_to_string(&page)
+        .unwrap()
+        .replace("\r\n", "\n");
     let (begin, end) = ("<!-- features:begin -->\n", "<!-- features:end -->");
     let i = text.find(begin).expect("begin marker") + begin.len();
     let j = text.find(end).expect("end marker");

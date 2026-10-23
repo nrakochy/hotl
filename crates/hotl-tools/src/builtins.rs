@@ -3525,6 +3525,7 @@ mod tests {
 
     /// 0071 T3: format, then check — the formatter's note lands before the
     /// diagnostic's report, and both see the same path.
+    #[cfg(unix)]
     #[test]
     fn the_formatter_runs_before_the_diagnostic() {
         let dir = tempfile::tempdir().unwrap();

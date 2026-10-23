@@ -3546,7 +3546,13 @@ fn worktree_note(
         .strip_prefix(&canon)
         .or_else(|_| path.strip_prefix(cwd))
         .unwrap_or(path);
-    let mut note = format!("working in worktree {} on branch {branch}", rel.display());
+    let rel = rel.display().to_string();
+    let rel = if cfg!(windows) {
+        rel.replace('\\', "/")
+    } else {
+        rel
+    };
+    let mut note = format!("working in worktree {rel} on branch {branch}");
     if let Some(b) = recreated_from {
         note.push_str(&format!(" (recreated from branch {b})"));
     }
@@ -8830,15 +8836,15 @@ mod tests {
         // Not a git repository: the check cannot run and reports clean.
         assert_eq!(plan_exit_code(dir.path()), 0);
         let repo = tempfile::tempdir().unwrap();
-        let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(repo.path())
-                .env("GIT_DIR", repo.path().join(".git"))
-                .output()
-                .expect("git")
-        };
-        git(&["init", "-q"]);
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["init", "-q"])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .expect("git");
+        assert!(init.status.success(), "{init:?}");
         std::fs::write(repo.path().join("new.txt"), "x").unwrap();
         let code = goal_exit_code(0, Some(hotl_engine::GoalVerdictKind::Met));
         let final_code = if code == 0 {
