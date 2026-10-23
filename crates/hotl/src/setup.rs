@@ -66,6 +66,11 @@ mode = \"bypass\"   # no per-action y/N; protected paths + sandbox still guard.
 # acme = \"https://github.com/acme/skills.git\"   # managed: hotl skills add/update
 # team = \"~/work/team-skills\"                   # local path: read in place
 
+# [memory]
+# mode = \"read-only\"   # read-only (default): memory files load, nothing writes;
+                        # read-write: /remember and the remember tool, every write confirmed;
+                        # off: no memory file loads. Takes effect next session.
+
 # [plugins.sources]           # Agent Plugins packages (skills + MCP servers
                               # under one plugin.json): handle = git URL or
                               # local path — hotl plugins add/update/remove.

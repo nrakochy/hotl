@@ -78,6 +78,17 @@ pub enum MemoryMode {
     Off,
 }
 
+impl MemoryMode {
+    /// The config spelling (`[memory] mode`), also the wire's.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::ReadWrite => "read-write",
+            Self::Off => "off",
+        }
+    }
+}
+
 /// Where a session's per-project memory file lives (0069). Injected like
 /// [`PlanFiles`]: tests and children never touch the real data dir.
 #[derive(Debug, Clone)]
@@ -1471,18 +1482,25 @@ impl SessionHandle {
     /// `/remember <note>` (0069): asks the owner through the ordinary
     /// permission ask and resolves when the line is written (`Ok`) or
     /// refused (`Err(reason)`: read-only, declined, over the cap, expired).
-    pub async fn remember(&self, note: String) -> Result<(), String> {
-        let (tx, rx) = oneshot::channel();
-        if self
-            .cmd
-            .send(SessionCmd::Remember { note, reply: tx })
-            .await
-            .is_err()
-        {
-            return Err("the session is gone".into());
-        }
-        rx.await
-            .unwrap_or_else(|_| Err("the session is gone".into()))
+    /// The future borrows nothing: a server must park it off its read loop,
+    /// since the owner's answer arrives through that loop.
+    pub fn remember(
+        &self,
+        note: String,
+    ) -> futures_util::future::BoxFuture<'static, Result<(), String>> {
+        let cmd = self.cmd.clone();
+        Box::pin(async move {
+            let (tx, rx) = oneshot::channel();
+            if cmd
+                .send(SessionCmd::Remember { note, reply: tx })
+                .await
+                .is_err()
+            {
+                return Err("the session is gone".into());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("the session is gone".into()))
+        })
     }
     /// Bare `/remember`: the dial, the file and its entries. `None` when
     /// memory is off or the session is gone. Safe mid-turn.

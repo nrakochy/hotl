@@ -183,6 +183,10 @@ pub struct SessionOpen {
     /// `effort_changed`'s encoding — collapsing the tri-state would make a
     /// cleared setting indistinguishable from one never made.
     pub effort: Option<Option<String>>,
+    /// The memory dial (0069) as its config word, so a console can label it
+    /// and refuse `/remember <note>` locally under `read-only`. `None` on a
+    /// factory that has no dial (tests).
+    pub memory_mode: Option<String>,
     /// The lineage log's model when it differs from the running model (0040) —
     /// resume re-derives the model from config, and a silent switch under an
     /// inherited transcript is a §5.7 lie.
@@ -497,6 +501,7 @@ async fn handle_request(
                     let open_warnings = open.warnings.clone();
                     let open_title = open.title.clone();
                     let open_model = open.model.clone().unwrap_or_else(|| info.model.clone());
+                    let memory_mode = open.memory_mode.clone();
                     let sid = install_session(
                         open,
                         writer,
@@ -575,6 +580,9 @@ async fn handle_request(
                     // The model this session actually runs (a resumed switch
                     // may differ from the process default).
                     obj.insert("model".into(), json!(open_model));
+                    if let Some(m) = memory_mode {
+                        obj.insert("memoryMode".into(), json!(m));
+                    }
                     reply_ok(writer, id, reply).await;
                 }
                 Err(e) => reply_err(writer, id, &e).await,
@@ -809,6 +817,66 @@ async fn handle_request(
             };
             state.handle.set_goal(goal.clone()).await;
             reply_ok(writer, id, json!({"ok": true, "goal": goal})).await;
+        }
+        // `/remember` (0069). With `params.note`: the engine asks the owner
+        // through the ordinary `session/request_permission` while this request
+        // is in flight — a client that answers permission requests needs
+        // nothing new — then replies `{"ok": true}` or the refusal text as an
+        // error (read-only, declined, over the cap). Without a note: a
+        // `memory_report` notification with the dial, the file and its
+        // entries. The write itself reaches every surface as `memory_changed`.
+        "session/remember" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "no session — call session/new first").await;
+            };
+            let raw = msg
+                .pointer("/params/note")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let Some(raw) = raw else {
+                let Some(report) = state.handle.memory_report().await else {
+                    return reply_err(writer, id, "session/remember: memory is off").await;
+                };
+                reply_ok(writer, id, json!({"ok": true})).await;
+                notify(
+                    writer,
+                    &state.id,
+                    json!({
+                        "type": "memory_report",
+                        "mode": report.mode.as_str(),
+                        "path": report.path.display().to_string(),
+                        "bytes": report.bytes,
+                        "cap": report.cap,
+                        "entries": report.entries.iter().map(|e| {
+                            json!({"date": e.date, "note": e.note})
+                        }).collect::<Vec<_>>(),
+                    }),
+                )
+                .await;
+                return;
+            };
+            let Some(note) = hotl_types::normalize_memory_note(raw) else {
+                return reply_err(
+                    writer,
+                    id,
+                    &format!(
+                        "session/remember requires params.note of 1–{} characters on one line",
+                        hotl_types::MEMORY_NOTE_MAX_CHARS
+                    ),
+                )
+                .await;
+            };
+            // Off the read loop: the owner's answer to the confirm arrives
+            // through this very loop, so awaiting here would deadlock it.
+            let pending = state.handle.remember(note);
+            let writer = writer.clone();
+            tokio::spawn(async move {
+                match pending.await {
+                    Ok(()) => reply_ok(&writer, id, json!({"ok": true})).await,
+                    Err(why) => reply_err(&writer, id, &format!("session/remember: {why}")).await,
+                }
+            });
         }
         "session/steer" => {
             let Some(state) = session.as_ref() else {

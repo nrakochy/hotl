@@ -95,6 +95,7 @@ fn scripted_factory_recording(
             ScriptedProvider::text_reply("all done via acp"),
         ]));
         Ok(acp::SessionOpen {
+            memory_mode: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider,
@@ -156,6 +157,7 @@ fn interrupted_factory(seen: Arc<std::sync::Mutex<Vec<String>>>) -> acp::Session
         let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         Ok(acp::SessionOpen {
+            memory_mode: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![
@@ -360,6 +362,7 @@ fn inherited_state_factory(effort: Option<Option<String>>) -> acp::SessionFactor
             ..Default::default()
         }];
         Ok(acp::SessionOpen {
+            memory_mode: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
@@ -531,6 +534,7 @@ async fn the_open_reply_carries_the_title_and_session_titled_is_broadcast() {
             ScriptedProvider::text_reply("Minted title"),
         ]));
         Ok(acp::SessionOpen {
+            memory_mode: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider,
@@ -845,6 +849,7 @@ async fn session_aside_acks_then_broadcasts_the_answer() {
             "it returns a Result",
         )]));
         Ok(acp::SessionOpen {
+            memory_mode: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider,
@@ -1241,6 +1246,7 @@ async fn overlapping_prompts_resolve_in_order() {
             ScriptedProvider::text_reply("second turn"),
         ]));
         Ok(acp::SessionOpen {
+            memory_mode: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider,
@@ -1460,6 +1466,7 @@ async fn prompt_images_are_validated_at_the_wire() {
         let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         Ok(acp::SessionOpen {
+            memory_mode: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![
@@ -1658,6 +1665,7 @@ async fn ask_user_round_trip_via_session_request_question() {
             ScriptedProvider::text_reply("all done via acp"),
         ]));
         Ok(acp::SessionOpen {
+            memory_mode: None,
             handle: hotl_engine::spawn_session_with_channels(
                 SessionDeps {
                     concurrency: Default::default(),
@@ -2224,6 +2232,7 @@ async fn a_resumed_session_runs_its_last_model_set() {
         let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         Ok(acp::SessionOpen {
+            memory_mode: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![])),
@@ -2479,6 +2488,7 @@ async fn the_open_reply_carries_the_resumed_goal_and_a_forks_is_null() {
         let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         Ok(acp::SessionOpen {
+            memory_mode: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![])),
@@ -2804,5 +2814,273 @@ async fn reload_config_without_a_hook_is_an_error_not_a_silent_no_op() {
             .unwrap()
             .contains("not supported"),
         "{m}"
+    );
+}
+
+/// A session with the memory dial set (0069): the `remember` tool is
+/// registered the way the binary does under `read-write`, and the project
+/// file lives under a tempdir that outlives the factory.
+fn memory_factory(
+    mode: hotl_engine::MemoryMode,
+    mem_dir: std::path::PathBuf,
+    script: Vec<Vec<Result<hotl_provider::StreamEvent, hotl_provider::ProviderError>>>,
+) -> acp::SessionFactory {
+    Box::new(move |_spec| {
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
+        let provider = Arc::new(ScriptedProvider::new(script.clone()));
+        let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
+        let (event_tx, event_rx) = hotl_engine::event_channel();
+        let mut registry = Registry::builtin();
+        if mode == hotl_engine::MemoryMode::ReadWrite {
+            registry.register(Box::new(hotl_tools::RememberTool::new(
+                hotl_engine::memory_sink(cmd_tx.downgrade()),
+            )));
+        }
+        let handle = hotl_engine::spawn_session_with_channels(
+            SessionDeps {
+                concurrency: Default::default(),
+                provider,
+                registry: Arc::new(registry),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: std::env::temp_dir(),
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
+                initial_goal: None,
+                config: EngineConfig {
+                    max_turns: 6,
+                    memory_files: Some(hotl_engine::MemoryFiles {
+                        project: "proj".into(),
+                        dir: mem_dir.clone(),
+                        mode,
+                    }),
+                    ..Default::default()
+                },
+            },
+            cmd_tx,
+            cmd_rx,
+            event_tx,
+            event_rx,
+            hotl_engine::hooks::NotificationDrain::new(),
+        );
+        Ok(acp::SessionOpen {
+            handle,
+            name: None,
+            mode: "ask".into(),
+            plan: false,
+            default_effort: None,
+            effort_schedule: None,
+            goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
+            memory_mode: Some(mode.as_str().to_string()),
+            session_id,
+            warnings: Vec::new(),
+            title: None,
+            model: None,
+        })
+    })
+}
+
+async fn open_memory_session(
+    factory: acp::SessionFactory,
+) -> (
+    tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+    Value,
+) {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(sread, swrite, factory, server_info(), None));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 1).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 2).await;
+    (cwrite, lines, opened)
+}
+
+#[tokio::test]
+async fn remember_asks_via_request_permission_then_acks_and_broadcasts_memory_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mem = dir.path().join("memory/proj");
+    let (mut cwrite, mut lines, opened) = open_memory_session(memory_factory(
+        hotl_engine::MemoryMode::ReadWrite,
+        mem.clone(),
+        vec![],
+    ))
+    .await;
+    assert_eq!(opened["result"]["memoryMode"], "read-write");
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/remember",
+               "params":{"note":"  tests need\nnextest  "}}),
+    )
+    .await;
+    let mut asked = false;
+    let mut acked = false;
+    let mut changed = false;
+    for _ in 0..12 {
+        if acked && changed {
+            break;
+        }
+        let m = next(&mut lines).await;
+        match m.get("method").and_then(Value::as_str) {
+            Some("session/request_permission") => {
+                let summary = m["params"]["summary"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                assert!(
+                    summary.contains("remember → project memory: \"tests need nextest\""),
+                    "{summary}"
+                );
+                asked = true;
+                let rid = m["id"].clone();
+                send(
+                    &mut cwrite,
+                    json!({"jsonrpc":"2.0","id":rid,"result":{"allow":true}}),
+                )
+                .await;
+            }
+            Some("session/update") if m["params"]["update"]["type"] == "memory_changed" => {
+                assert_eq!(m["params"]["update"]["note"], "tests need nextest");
+                assert!(m["params"]["update"]["bytes"].as_u64().unwrap() > 0);
+                changed = true;
+            }
+            _ if m["id"] == json!(3) => {
+                assert_eq!(m["result"]["ok"], true, "{m}");
+                acked = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        asked && acked && changed,
+        "asked={asked} acked={acked} changed={changed}"
+    );
+    let file = std::fs::read_to_string(mem.join("MEMORY.md")).unwrap();
+    assert!(file.ends_with(": tests need nextest\n"), "{file}");
+}
+
+#[tokio::test]
+async fn remember_bare_returns_a_memory_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let mem = dir.path().join("memory/proj");
+    std::fs::create_dir_all(&mem).unwrap();
+    std::fs::write(
+        mem.join("MEMORY.md"),
+        "## Notes\n- 2026-10-01: one\n- 2026-10-02: two\n",
+    )
+    .unwrap();
+    let (mut cwrite, mut lines, opened) = open_memory_session(memory_factory(
+        hotl_engine::MemoryMode::ReadOnly,
+        mem.clone(),
+        vec![],
+    ))
+    .await;
+    assert_eq!(opened["result"]["memoryMode"], "read-only");
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/remember","params":{}}),
+    )
+    .await;
+    let mut report = None;
+    for _ in 0..6 {
+        let m = next(&mut lines).await;
+        if m["method"] == "session/update" && m["params"]["update"]["type"] == "memory_report" {
+            report = Some(m["params"]["update"].clone());
+            break;
+        }
+    }
+    let r = report.expect("a memory_report notification");
+    assert_eq!(r["mode"], "read-only");
+    assert_eq!(r["cap"], hotl_context::MEMORY_BUDGET_BYTES);
+    assert_eq!(r["bytes"], 45);
+    assert_eq!(r["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(r["entries"][1]["note"], "two");
+    assert!(r["path"].as_str().unwrap().ends_with("MEMORY.md"));
+}
+
+#[tokio::test]
+async fn remember_rejects_an_empty_or_overlong_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut cwrite, mut lines, _) = open_memory_session(memory_factory(
+        hotl_engine::MemoryMode::ReadWrite,
+        dir.path().join("memory/proj"),
+        vec![],
+    ))
+    .await;
+    // Whitespace-only reads as absent → a report, not an error.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/remember","params":{"note":"   "}}),
+    )
+    .await;
+    let ack = read_until_id(&mut lines, 3).await;
+    assert_eq!(ack["result"]["ok"], true, "{ack}");
+    let long = "x".repeat(hotl_types::MEMORY_NOTE_MAX_CHARS + 1);
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/remember","params":{"note":long}}),
+    )
+    .await;
+    let err = read_until_id(&mut lines, 4).await;
+    let text = err["error"]["message"].as_str().unwrap_or_default();
+    assert!(text.contains("1–2000 characters"), "{err}");
+    assert!(!dir.path().join("memory/proj/MEMORY.md").exists());
+}
+
+#[tokio::test]
+async fn remember_in_read_only_mode_errors_without_a_permission_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut cwrite, mut lines, _) = open_memory_session(memory_factory(
+        hotl_engine::MemoryMode::ReadOnly,
+        dir.path().join("memory/proj"),
+        vec![],
+    ))
+    .await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/remember","params":{"note":"x"}}),
+    )
+    .await;
+    let mut err = None;
+    for _ in 0..6 {
+        let m = next(&mut lines).await;
+        assert_ne!(
+            m.get("method").and_then(Value::as_str),
+            Some("session/request_permission"),
+            "read-only must not ask"
+        );
+        if m["id"] == json!(3) {
+            err = Some(m);
+            break;
+        }
+    }
+    let err = err.expect("an error reply");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("memory is read-only ([memory] mode)"),
+        "{err}"
     );
 }

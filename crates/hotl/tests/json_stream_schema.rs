@@ -315,6 +315,23 @@ fn budget_notice_is_tagged_and_carries_its_numbers() {
 }
 
 /// 0034: the goal frames are additive (`JSON_STREAM_SCHEMA_VERSION` stands).
+/// `memory_changed` (0069) is additive: note, date, the file's size and path.
+#[test]
+fn memory_frames_carry_their_payloads() {
+    let f = wire::update_frame(&EngineEvent::MemoryChanged {
+        note: "tests need nextest".into(),
+        date: "2026-10-22".into(),
+        bytes: 128,
+        path: "/data/memory/p/MEMORY.md".into(),
+    })
+    .unwrap();
+    assert_eq!(f["type"], "memory_changed");
+    assert_eq!(f["note"], "tests need nextest");
+    assert_eq!(f["date"], "2026-10-22");
+    assert_eq!(f["bytes"], 128);
+    assert_eq!(f["path"], "/data/memory/p/MEMORY.md");
+}
+
 /// `goal_changed` carries the condition or an explicit `null` on clear;
 /// `goal_verdict` carries a stable snake_case tag, never a Debug rendering.
 #[test]

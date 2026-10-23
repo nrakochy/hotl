@@ -48,6 +48,8 @@ pub struct Config {
     pub sandbox: SandboxCfg,
     #[serde(default)]
     pub plan: PlanCfg,
+    #[serde(default)]
+    pub memory: MemoryCfg,
     /// Raw document, for reserializing the domain sections to their loaders.
     #[serde(skip)]
     raw: Option<toml::Value>,
@@ -60,6 +62,30 @@ pub struct PlanCfg {
     /// Directory to mirror `current.md` into as `hotl-plan.md`, relative to
     /// the workspace unless absolute.
     pub repo_dir: Option<String>,
+}
+
+/// `[memory]` (0069). The dial for the per-project memory file: `read-only`
+/// (default — both memory files load, nothing writes), `read-write` (the
+/// `remember` tool and `/remember <note>` work, every write confirmed), or
+/// `off` (no memory file loads). Read at session start, never mid-session.
+#[derive(Debug, Default, Deserialize)]
+pub struct MemoryCfg {
+    pub mode: Option<String>,
+}
+
+impl MemoryCfg {
+    /// The dial, or the error naming the three words.
+    pub fn mode(&self) -> Result<hotl_engine::MemoryMode, String> {
+        match self.mode.as_deref().map(str::trim) {
+            None | Some("read-only") => Ok(hotl_engine::MemoryMode::ReadOnly),
+            Some("read-write") => Ok(hotl_engine::MemoryMode::ReadWrite),
+            Some("off") => Ok(hotl_engine::MemoryMode::Off),
+            Some(other) => Err(format!(
+                "[memory] mode = \"{other}\" is not one of \"read-only\", \"read-write\", \"off\"; \
+                 using read-only"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2616,6 +2642,32 @@ path_prefix = "/Volumes/secrets"
         // different home than `expand_home` resolved.
         let home = home_dir().expect("a home directory");
         assert_eq!(cfg.history.resolved_path(data), home.join("notes/h.jsonl"));
+    }
+
+    #[test]
+    fn memory_mode_parses_three_words_and_rejects_the_rest() {
+        use hotl_engine::MemoryMode;
+        assert_eq!(cfg_with("").memory.mode(), Ok(MemoryMode::ReadOnly));
+        assert_eq!(
+            cfg_with("[memory]\nmode = \"read-only\"\n").memory.mode(),
+            Ok(MemoryMode::ReadOnly)
+        );
+        assert_eq!(
+            cfg_with("[memory]\nmode = \"read-write\"\n").memory.mode(),
+            Ok(MemoryMode::ReadWrite)
+        );
+        assert_eq!(
+            cfg_with("[memory]\nmode = \"off\"\n").memory.mode(),
+            Ok(MemoryMode::Off)
+        );
+        let err = cfg_with("[memory]\nmode = \"rw\"\n")
+            .memory
+            .mode()
+            .unwrap_err();
+        assert!(
+            err.contains("\"read-only\", \"read-write\", \"off\""),
+            "{err}"
+        );
     }
 
     #[test]

@@ -51,6 +51,7 @@ fn scripted_factory() -> acp::SessionFactory {
             ScriptedProvider::text_reply("all done via tui"),
         ]));
         Ok(acp::SessionOpen {
+            memory_mode: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider,
@@ -119,6 +120,7 @@ fn scripted_ask_user_factory() -> acp::SessionFactory {
             ScriptedProvider::text_reply("all done via tui"),
         ]));
         Ok(acp::SessionOpen {
+            memory_mode: None,
             handle: hotl_engine::spawn_session_with_channels(
                 SessionDeps {
                     concurrency: Default::default(),

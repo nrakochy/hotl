@@ -68,7 +68,7 @@ pub fn doctor_main() -> i32 {
         &std::env::current_dir().unwrap_or_default(),
     ));
     checks.extend([
-        memory_check(&config_dir),
+        memory_check(&config_dir, &std::env::current_dir().unwrap_or_default()),
         audit_check(&sessions_dir),
         key_helper,
         gateway,
@@ -601,15 +601,37 @@ fn sessions_check(sessions_dir: &Path) -> Check {
     }
 }
 
-fn memory_check(config_dir: &Path) -> Check {
-    match hotl_context::load_memory(config_dir) {
-        Some((_, Some(notice))) => ok(format!("memory: loads, but is cut — {notice}")),
-        Some((_, None)) => ok("memory: memory/MEMORY.md loads at session start".into()),
-        None => ok(format!(
-            "memory: none (create {}/memory/MEMORY.md to enable)",
-            config_dir.display()
-        )),
+/// The dial, the per-user file and the project file for this cwd (0069).
+fn memory_check(config_dir: &Path, cwd: &Path) -> Check {
+    let cfg = crate::config::Config::load(config_dir);
+    let mode = match cfg.memory.mode() {
+        Ok(m) => m,
+        Err(w) => return warn(format!("memory: {w}")),
+    };
+    if mode == hotl_engine::MemoryMode::Off {
+        return ok("memory: off ([memory] mode) — no memory file loads".into());
     }
+    let user = match hotl_context::load_memory(config_dir) {
+        Some((_, Some(notice))) => format!("user file loads, but is cut — {notice}"),
+        Some((_, None)) => "user file loads".into(),
+        None => format!("no user file ({}/memory/MEMORY.md)", config_dir.display()),
+    };
+    let project = hotl_store::project::id(cwd);
+    let dir = crate::agent::data_dir().join("memory").join(&project);
+    let path = dir.join(hotl_context::memory::MEMORY_FILE);
+    let project_line = match std::fs::metadata(&path) {
+        Ok(m) => format!(
+            "project file {} ({} of {} B)",
+            path.display(),
+            m.len(),
+            hotl_context::MEMORY_BUDGET_BYTES
+        ),
+        Err(_) => format!("no project file yet ({})", path.display()),
+    };
+    ok(format!(
+        "memory: {} · {user} · {project_line}",
+        mode.as_str()
+    ))
 }
 
 fn audit_check(sessions_dir: &Path) -> Check {

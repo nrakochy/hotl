@@ -574,14 +574,18 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
         &scaffold.model,
         &hotl_context::civil_date_utc(scaffold.clock.now_ms()),
         scaffold.config.instructions_max_bytes,
+        scaffold.config.memory_files.as_ref(),
     );
     print_warnings(&notices);
     items.push(crate::structured::contract_item(&schema));
     record_fresh_seed(&mut log, &items, scaffold.clock.now_ms());
     let session_id = log.session_id.clone();
+    // Headless never writes memory (0069 decision 6).
+    let mut spawn_reg = scaffold.spawn_registration(session_id.clone());
+    spawn_reg.memory_write = false;
     let mut handle = spawn_session_with_todos(
         (*scaffold.registry).clone(),
-        Some(scaffold.spawn_registration(session_id.clone())),
+        Some(spawn_reg),
         Some(scaffold.recall_registration(session_id)),
         scaffold.hooks.clone(),
         scaffold.plan_artifact_path(),
@@ -595,6 +599,7 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
                 None,
             );
             deps.registry = registry;
+            clamp_headless_memory(&mut deps.config);
             deps
         },
     );
@@ -962,6 +967,11 @@ pub(crate) async fn build_acp() -> Result<
             todos: todos_wire,
             effort: effort_wire,
             previous_model,
+            memory_mode: scaffold
+                .config
+                .memory_files
+                .as_ref()
+                .map(|f| f.mode.as_str().to_string()),
             // Display-only: what a bare `/effort` reports as the session
             // default. The engine already holds the same resolved value.
             default_effort: scaffold.config.effort.map(|e| e.as_str().to_string()),
@@ -1269,6 +1279,11 @@ async fn scaffold(
     };
     let workflow_gate = Arc::new(tokio::sync::Semaphore::new(wf_concurrency));
     let plan_files = plan_files_for(&cfg, &cwd);
+    // The memory dial (0069): on the session config, read once here.
+    let (memory_files, memory_warning) = memory_files_for(&cfg, &cwd);
+    warnings.extend(memory_warning.map(|w| format!("WARNING — {w}")));
+    config.memory_files = memory_files;
+    config.ask_expiry = cfg.behavior.ask_expiry();
     Ok(Scaffold {
         plan_files,
         provider,
@@ -1340,6 +1355,11 @@ impl Scaffold {
     fn spawn_registration(&self, session_id: String) -> SpawnRegistration {
         SpawnRegistration {
             builder: self.spawn_builder.clone() as Arc<dyn crate::spawn::ChildBuilder>,
+            memory_write: self
+                .config
+                .memory_files
+                .as_ref()
+                .is_some_and(|f| f.mode == hotl_engine::MemoryMode::ReadWrite),
             prefix_stagger: self.prefix_stagger,
             child_deadlines: self.child_deadlines,
             concurrency: self.concurrency.clone(),
@@ -1468,6 +1488,39 @@ impl Scaffold {
             initial_goal,
             config,
             concurrency: self.concurrency.clone(),
+        }
+    }
+}
+
+/// The per-project memory file (0069): `<data>/memory/<project id>`, same key
+/// as the plan artifact, plus the `[memory] mode` dial. A bad dial word warns
+/// and reads as `read-only`.
+fn memory_files_for(
+    cfg: &crate::config::Config,
+    cwd: &std::path::Path,
+) -> (Option<hotl_engine::MemoryFiles>, Option<String>) {
+    let (mode, warning) = match cfg.memory.mode() {
+        Ok(m) => (m, None),
+        Err(w) => (hotl_engine::MemoryMode::ReadOnly, Some(w)),
+    };
+    let project = hotl_store::project::id(cwd);
+    (
+        Some(hotl_engine::MemoryFiles {
+            dir: data_dir().join("memory").join(&project),
+            project,
+            mode,
+        }),
+        warning,
+    )
+}
+
+/// Headless `-p` never writes memory (0069 decision 6): `/remember` is not
+/// parsed there and every ask is denied, so the tool could only ever fail.
+/// The dial is clamped to `read-only` and the tool stays unregistered.
+fn clamp_headless_memory(config: &mut EngineConfig) {
+    if let Some(files) = config.memory_files.as_mut() {
+        if files.mode == hotl_engine::MemoryMode::ReadWrite {
+            files.mode = hotl_engine::MemoryMode::ReadOnly;
         }
     }
 }
@@ -1886,9 +1939,12 @@ async fn run_session(
         .as_ref()
         .and_then(|l| l.effort.clone())
         .map(|raw| raw.and_then(|s| s.parse::<Effort>().ok()));
+    // Headless never writes memory (0069 decision 6).
+    let mut spawn_reg = scaffold.spawn_registration(session_id.clone());
+    spawn_reg.memory_write = false;
     let handle = spawn_session_with_todos(
         (*scaffold.registry).clone(),
-        Some(scaffold.spawn_registration(session_id.clone())),
+        Some(spawn_reg),
         Some(scaffold.recall_registration(session_id.clone())),
         scaffold.hooks.clone(),
         scaffold.plan_artifact_path(),
@@ -1907,6 +1963,7 @@ async fn run_session(
                 goal,
             );
             deps.registry = registry;
+            clamp_headless_memory(&mut deps.config);
             deps
         },
     );
@@ -1974,6 +2031,9 @@ async fn run_session(
 /// children never get a `spawn` tool at all.
 struct SpawnRegistration {
     builder: Arc<dyn crate::spawn::ChildBuilder>,
+    /// Register the `remember` tool (0069): only a top-level session under
+    /// `[memory] mode = "read-write"`, never headless, never a child.
+    memory_write: bool,
     /// `[agents] prefix_stagger_ms` — how long identical siblings queue
     /// behind the first one's first byte.
     prefix_stagger: std::time::Duration,
@@ -2128,6 +2188,7 @@ fn spawn_session_inner(
     }
     if let Some(SpawnRegistration {
         builder,
+        memory_write,
         prefix_stagger,
         child_deadlines,
         concurrency,
@@ -2139,6 +2200,13 @@ fn spawn_session_inner(
         data_dir,
     }) = spawn
     {
+        // `remember` (0069): its gate is the confirm, so the sink goes
+        // straight to the actor's one writer. Top-level `read-write` only.
+        if memory_write {
+            registry.register(Box::new(hotl_tools::RememberTool::new(
+                hotl_engine::memory_sink(cmd_tx.downgrade()),
+            )));
+        }
         let snapshot = snapshot_provider(Arc::clone(&head_cell), session_id);
         // `.with_events`: children never get `spawn` at all, so there is no
         // recursive wiring to worry about — one hop, child to parent.
@@ -2916,6 +2984,7 @@ fn session_context(
             plan,
             scaffold.plan_files.as_ref(),
             scaffold.config.instructions_max_bytes,
+            scaffold.config.memory_files.as_ref(),
         ),
     }
 }
@@ -2941,11 +3010,13 @@ fn fresh_context(
         plan,
         plan_files,
         hotl_context::INSTRUCTIONS_BUDGET_BYTES,
+        None,
     )
     .0
 }
 
 /// `fresh_context` with the instruction cap and the truncation notices.
+#[allow(clippy::too_many_arguments)]
 fn fresh_context_capped(
     config_dir: &std::path::Path,
     cwd: &std::path::Path,
@@ -2954,8 +3025,10 @@ fn fresh_context_capped(
     plan: bool,
     plan_files: Option<&hotl_engine::PlanFiles>,
     instructions_max: usize,
+    memory: Option<&hotl_engine::MemoryFiles>,
 ) -> (Vec<hotl_types::Item>, Vec<String>) {
-    let (mut items, notices) = initial_items_capped(config_dir, cwd, model, date, instructions_max);
+    let (mut items, notices) =
+        initial_items_capped(config_dir, cwd, model, date, instructions_max, memory);
     if plan {
         items.push(hotl_types::Item::User {
             text: format!(
@@ -3788,6 +3861,7 @@ fn initial_items(
         model,
         date,
         hotl_context::INSTRUCTIONS_BUDGET_BYTES,
+        None,
     )
     .0
 }
@@ -3800,15 +3874,27 @@ fn initial_items_capped(
     model: &str,
     date: &str,
     instructions_max: usize,
+    memory: Option<&hotl_engine::MemoryFiles>,
 ) -> (Vec<hotl_types::Item>, Vec<String>) {
     let mut items = vec![hotl_context::environment(cwd, model, date)];
     let mut notices = Vec::new();
     if let Some(orientation) = workspace_orientation_item(cwd) {
         items.push(orientation);
     }
-    if let Some((memory, notice)) = load_memory(config_dir) {
-        items.push(memory);
-        notices.extend(notice);
+    // Two memory files, two caps (0069 decision 11): the per-user one as
+    // before, then the project's. `off` loads neither.
+    let memory_off = memory.is_some_and(|m| m.mode == hotl_engine::MemoryMode::Off);
+    if !memory_off {
+        if let Some((memory, notice)) = load_memory(config_dir) {
+            items.push(memory);
+            notices.extend(notice);
+        }
+        if let Some((item, notice)) =
+            memory.and_then(|m| hotl_context::memory::load_project_memory(&m.dir, &m.project))
+        {
+            items.push(item);
+            notices.extend(notice);
+        }
     }
     if let Some((instructions, notice)) = project_instructions(cwd, instructions_max) {
         items.push(instructions);
@@ -5359,6 +5445,37 @@ mod tests {
     /// `/`-dispatch names come out of the registry's own discovery walk.
     /// If this ever needs a second `SkillTool::new`, the roster is being
     /// scanned twice per start again.
+    /// 0069 decision 6: `-p` cannot confirm, so the dial reads `read-only`
+    /// however config spells it, and the tool is never registered.
+    #[test]
+    fn headless_clamps_memory_to_read_only() {
+        use hotl_engine::{MemoryFiles, MemoryMode};
+        let mut config = EngineConfig {
+            memory_files: Some(MemoryFiles {
+                project: "p".into(),
+                dir: std::path::PathBuf::from("/nowhere"),
+                mode: MemoryMode::ReadWrite,
+            }),
+            ..Default::default()
+        };
+        clamp_headless_memory(&mut config);
+        assert_eq!(
+            config.memory_files.as_ref().map(|f| f.mode),
+            Some(MemoryMode::ReadOnly)
+        );
+        // `off` stays off: clamping only ever narrows.
+        config.memory_files.as_mut().unwrap().mode = MemoryMode::Off;
+        clamp_headless_memory(&mut config);
+        assert_eq!(
+            config.memory_files.as_ref().map(|f| f.mode),
+            Some(MemoryMode::Off)
+        );
+        // No dial at all is left alone.
+        let mut none = EngineConfig::default();
+        clamp_headless_memory(&mut none);
+        assert!(none.memory_files.is_none());
+    }
+
     #[test]
     fn build_registry_yields_the_skill_names_it_discovered() {
         let dir = tempfile::tempdir().unwrap();
