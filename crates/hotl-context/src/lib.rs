@@ -8,6 +8,7 @@
 pub mod breakdown;
 pub mod compaction;
 pub mod goal;
+pub mod memory;
 pub mod tokens;
 
 pub use tokens::TokenProfile;
@@ -134,7 +135,7 @@ pub fn clip_with_notice<'a>(
 
 /// `envelope` over a capped body. The notice is appended after `defang`, so a
 /// file cannot forge it, and `envelope` adds nothing else.
-fn envelope_capped(source: &str, content: &str, max: usize) -> (String, Option<String>) {
+pub(crate) fn envelope_capped(source: &str, content: &str, max: usize) -> (String, Option<String>) {
     let (body, notice) = clip_with_notice(source, content, max);
     let text = match &notice {
         None => envelope(source, &body),
@@ -264,7 +265,7 @@ pub const PLAN_OFF_REMINDER: &str = "Plan mode is off: write and edit are availa
 /// Auto-memory (M2): `<config>/memory/MEMORY.md`, budget-capped, enveloped.
 /// Owner-authored, but it still rides in the envelope — memory files quote
 /// repo content and past sessions, so the same defense applies.
-pub const MEMORY_BUDGET_BYTES: usize = 16 * 1024;
+pub use memory::MEMORY_BUDGET_BYTES;
 
 pub fn load_memory(config_dir: &Path) -> Option<(Item, Option<String>)> {
     let path = config_dir.join("memory/MEMORY.md");

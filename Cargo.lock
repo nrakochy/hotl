@@ -1024,6 +1024,7 @@ dependencies = [
 name = "hotl-context"
 version = "0.28.0"
 dependencies = [
+ "hotl-platform",
  "hotl-types",
  "serde_json",
  "tempfile",
