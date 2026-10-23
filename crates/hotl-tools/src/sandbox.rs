@@ -721,6 +721,47 @@ pub fn build_argv(
     apply_child_env(cmd, egress)
 }
 
+/// [`build_argv`] with `extra_write` added to the floor's write roots, for
+/// one long-lived child that needs its own state dirs writable (an external
+/// ACP agent, 0077 D5). Built per call, never cached: the extras are per
+/// child. Every other grant, denial and the env scrub are `build_argv`'s.
+pub fn build_argv_with(
+    program: &str,
+    args: &[String],
+    status: &SandboxStatus,
+    egress: &EgressState,
+    extra_write: &[PathBuf],
+) -> tokio::process::Command {
+    #[cfg(unix)]
+    let writable: Vec<PathBuf> = extra_writable()
+        .iter()
+        .chain(extra_write)
+        .cloned()
+        .collect();
+    let cmd = match status {
+        #[cfg(target_os = "macos")]
+        SandboxStatus::Enforced("seatbelt") => {
+            let mut cmd = seatbelt_base_with(egress, &writable, &spawn_read_deny());
+            cmd.arg(program).args(args);
+            cmd
+        }
+        #[cfg(target_os = "linux")]
+        SandboxStatus::Enforced("landlock") | SandboxStatus::Enforced("landlock(partial)") => {
+            let mut cmd = tokio::process::Command::new(program);
+            cmd.args(args);
+            apply_landlock_with(cmd, egress, &writable, &spawn_read_deny())
+        }
+        _ => {
+            #[cfg(unix)]
+            let _ = &writable;
+            let mut cmd = tokio::process::Command::new(program);
+            cmd.args(args);
+            cmd
+        }
+    };
+    apply_child_env(cmd, egress)
+}
+
 /// Credentials the *harness* holds. A child process — a model-authored bash
 /// command, `rg`, a diagnostic, an owner hook — has no legitimate need for
 /// any of them, and an auto-approved `bash` can otherwise read them with

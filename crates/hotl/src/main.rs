@@ -18,6 +18,7 @@
 //!   update        install the latest release (or report one, with --check)
 
 mod acp;
+mod acp_child;
 mod agent;
 mod approve_cli;
 mod arg_audit;

@@ -122,6 +122,52 @@ impl ChildSession for SessionHandle {
     }
 }
 
+/// An external agent (0077): the same events, by translation. It cannot be
+/// steered mid-turn or narrowed to a wrap-up roster; both are no-ops.
+impl ChildSession for crate::acp_child::AcpChild {
+    fn events(&mut self) -> &mut tokio::sync::mpsc::Receiver<EngineEvent> {
+        crate::acp_child::AcpChild::events(self)
+    }
+    fn prompt(&self, text: String) -> BoxFuture<'_, ()> {
+        crate::acp_child::AcpChild::prompt(self, text);
+        Box::pin(std::future::ready(()))
+    }
+    fn prompt_tagged(
+        &self,
+        text: String,
+        _synthetic: hotl_types::SyntheticReason,
+    ) -> BoxFuture<'_, ()> {
+        ChildSession::prompt(self, text)
+    }
+    fn prompt_structured(
+        &self,
+        text: String,
+        _synthetic: hotl_types::SyntheticReason,
+        _schema: Arc<Value>,
+    ) -> BoxFuture<'_, ()> {
+        ChildSession::prompt(self, text)
+    }
+    fn continue_turn(&self) -> BoxFuture<'_, ()> {
+        crate::acp_child::AcpChild::continue_turn(self);
+        Box::pin(std::future::ready(()))
+    }
+    fn steer(&self, _text: String) -> BoxFuture<'_, ()> {
+        Box::pin(std::future::ready(()))
+    }
+    fn interrupt(&self) {
+        crate::acp_child::AcpChild::interrupt(self)
+    }
+    fn set_wrapup(&self, _on: bool) -> BoxFuture<'_, ()> {
+        Box::pin(std::future::ready(()))
+    }
+    fn start(&mut self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(crate::acp_child::AcpChild::start(self))
+    }
+    fn finish(self: Box<Self>, grace: std::time::Duration) -> BoxFuture<'static, ()> {
+        Box::pin((*self).finish(grace))
+    }
+}
+
 /// A boxed child as a plain type, for a caller generic over the session
 /// (the structured loop): the `dyn`'s object lifetime, once erased, trips the
 /// async closure's higher-ranked bound; a struct has no lifetime to erase.
@@ -561,6 +607,15 @@ impl SpawnTool {
             ));
         };
 
+        let external = def.backend == hotl_tools::agents::Backend::Acp;
+        if fork && external {
+            return ToolOutcome::err(format!(
+                "`fork` is refused for `{agent_type}`: it is an external agent, and an \
+                 external agent cannot inherit your context. Spawn it without `fork` and put \
+                 what it needs in `task`."
+            ));
+        }
+
         // The registry (0072): per session, reached through the task-local
         // the turn scopes around this call. Absent in a standalone test.
         let children = hotl_tools::children::registry();
@@ -665,7 +720,6 @@ impl SpawnTool {
         // inline copy is what makes the first turn actionable without one.
         let child_ulid = hotl_types::new_ulid();
         let scratch = self.spawn_dir.join(&child_ulid);
-        let external = def.backend == hotl_tools::agents::Backend::Acp;
         let brief = match write_task_md(
             &scratch,
             task,
@@ -753,7 +807,10 @@ impl SpawnTool {
         let frame_id = entry
             .as_ref()
             .map_or_else(|| child_ulid.clone(), |e| e.id.clone());
-        let summary = format!("{agent_type} · {}", short_task(task));
+        let summary = match external {
+            true => format!("{agent_type} · {} · external", short_task(task)),
+            false => format!("{agent_type} · {}", short_task(task)),
+        };
         let forward = self.events.clone().zip(parent_id);
         // The `agent` **start** frame (D12), before the child's first tool:
         // the band's row exists from here and settles at the done frame.
@@ -780,6 +837,7 @@ impl SpawnTool {
             steer_rx,
             resume_rx,
             shared_tree_guard,
+            external,
         };
 
         if background {
@@ -805,6 +863,7 @@ impl SpawnTool {
                 model: &run.child.model,
                 attrs: "",
                 enveloped_errors: false,
+                external: run.external,
             },
         )
         .await;
@@ -816,7 +875,7 @@ impl SpawnTool {
             &run.id,
             run.summary.clone(),
             Some(finished.ok),
-            Some(finished.tokens()),
+            run.tokens(&finished),
         )
         .await;
         let facts = hotl_tools::OutcomeFacts {
@@ -887,9 +946,17 @@ struct ChildRun {
     steer_rx: tokio::sync::mpsc::Receiver<String>,
     resume_rx: tokio::sync::mpsc::Receiver<hotl_tools::children::ResumeRequest>,
     shared_tree_guard: Option<tokio::sync::MutexGuard<'static, ()>>,
+    /// An external (ACP) agent: no token count on its card (D6).
+    external: bool,
 }
 
 impl ChildRun {
+    /// The agent frame's token total; none for an external agent, whose
+    /// spend hotl does not see.
+    fn tokens(&self, finished: &Finished) -> Option<u64> {
+        (!self.external).then(|| finished.tokens())
+    }
+
     /// One turn of the child, to its typed result.
     async fn drive(&mut self, start: Start, cancel: &CancellationToken) -> Ran {
         run_child(
@@ -1039,6 +1106,7 @@ async fn child_task(mut run: ChildRun, start: Start) {
                 model: &run.child.model,
                 attrs: &attrs,
                 enveloped_errors: true,
+                external: run.external,
             },
         )
         .await;
@@ -1047,7 +1115,7 @@ async fn child_task(mut run: ChildRun, start: Start) {
             &run.id,
             run.summary.clone(),
             Some(finished.ok),
-            Some(finished.tokens()),
+            run.tokens(&finished),
         )
         .await;
         run.deliver(finished, secs).await;
@@ -1085,6 +1153,7 @@ async fn child_task(mut run: ChildRun, start: Start) {
                 model: &run.child.model,
                 attrs: &attrs,
                 enveloped_errors: req.reply.is_none(),
+                external: run.external,
             },
         )
         .await;
@@ -1093,7 +1162,7 @@ async fn child_task(mut run: ChildRun, start: Start) {
             &run.id,
             run.summary.clone(),
             Some(finished.ok),
-            Some(finished.tokens()),
+            run.tokens(&finished),
         )
         .await;
         match req.reply {
@@ -1238,6 +1307,8 @@ struct FinishOpts<'a> {
     /// notification is never an empty success; the foreground result keeps
     /// the bare reason it always had.
     enveloped_errors: bool,
+    /// An external agent: the result says its spend is uncounted (D6).
+    external: bool,
 }
 
 /// The rendered result, for every reader at once (D3).
@@ -1363,13 +1434,21 @@ async fn finish_child(
         model: opts.model.to_string(),
         tool_calls,
     };
+    // hotl's word, outside the envelope, like the merge-back line.
+    let spend = opts
+        .external
+        .then_some("\nExternal agent: its spend is not counted against `max_cost_usd`.");
     let dress = |text: String| {
         let text = match note {
             Some(n) => format!("{n}\n{text}"),
             None => text,
         };
-        match &checked {
+        let text = match &checked {
             Some(c) => format!("{text}{c}"),
+            None => text,
+        };
+        match spend {
+            Some(s) => format!("{text}{s}"),
             None => text,
         }
     };
@@ -1862,7 +1941,8 @@ impl Tool for SpawnTool {
          It runs to completion and returns only its final result. Choose an `agent_type`: \
          `general-purpose` (full access, the default), `explore` or `plan` (read-only, safe to \
          fan out in parallel), `review` (read-only second opinion on a diff or file, findings \
-         with path:line and severity), or one defined in agents/*.md. Use for focused, separable work \
+         with path:line and severity), or one defined in agents/*.md (which may also name an \
+         external ACP agent). Use for focused, separable work \
          (research a question, summarize a large file) that would otherwise crowd your context. \
          Set `fork: true` to seed the child with your own current context (a history-inheriting \
          continuation) instead of a fresh one — use this when the sub-agent needs what you've \
@@ -1926,8 +2006,12 @@ impl Tool for SpawnTool {
             Some(true) => " (background)",
             _ => "",
         };
+        // D9: an external agent's program is named in the ask, every time.
+        let via = hotl_tools::agents::resolve(&self.config_dir, self.include_claude, agent_type)
+            .and_then(|d| d.program().map(|p| format!(" via {p}")))
+            .unwrap_or_default();
         Permission::Ask {
-            summary: format!("spawn {agent_type} sub-agent: {short}{check}{bg}"),
+            summary: format!("spawn {agent_type} sub-agent{via}: {short}{check}{bg}"),
         }
     }
     /// Children are isolated engines with their own logs; several may run
@@ -4574,5 +4658,406 @@ mod nested_permit_tests {
             waited.is_err(),
             "a background child keeps its parent sampling, so it queues for its own permit"
         );
+    }
+}
+
+/// 0077: an external (ACP) agent driven through the unchanged spawn path.
+#[cfg(test)]
+mod acp_tests {
+    use super::tests::{scratch_repo, test_concurrency};
+    use super::*;
+    use crate::acp_child::tests::{
+        chunk, fake, handshake, method, note_stderr, reply, spec, update, Fake, Handler, VALID,
+    };
+    use crate::acp_child::AcpChild;
+    use std::sync::Mutex;
+
+    type MakeHandler = Box<dyn Fn() -> Handler + Send + Sync>;
+
+    /// Builds a real `AcpChild` over a duplex pipe to a scripted agent. With
+    /// `workspace`, the child gets a worktree and `writes` lands in it.
+    struct AcpFixture {
+        handler: MakeHandler,
+        fakes: Mutex<Vec<Fake>>,
+        workspace: Option<PathBuf>,
+        writes: Option<(String, String)>,
+        stderr: Option<String>,
+    }
+
+    impl AcpFixture {
+        fn new(handler: MakeHandler) -> Self {
+            Self {
+                handler,
+                fakes: Mutex::new(Vec::new()),
+                workspace: None,
+                writes: None,
+                stderr: None,
+            }
+        }
+        fn seen(&self) -> Vec<Value> {
+            self.fakes
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(Fake::seen)
+                .collect()
+        }
+    }
+
+    impl ChildBuilder for AcpFixture {
+        fn build(
+            &self,
+            _def: &AgentDef,
+            _brief: &str,
+            report: Option<&Path>,
+        ) -> Result<Child, String> {
+            let worktree = match &self.workspace {
+                Some(ws) => Some(
+                    hotl_store::worktree::Worktree::create(ws, &hotl_types::new_ulid())
+                        .ok_or("no worktree")?,
+                ),
+                None => None,
+            };
+            if let (Some(wt), Some((name, body))) = (&worktree, &self.writes) {
+                std::fs::write(wt.path().join(name), body).unwrap();
+            }
+            let root = worktree
+                .as_ref()
+                .map_or_else(std::env::temp_dir, |w| w.path().to_path_buf());
+            let report_path = report.map(|d| d.join(hotl_tools::report_tool::RESPONSE_FILE));
+            let (f, client) = fake((self.handler)());
+            self.fakes.lock().unwrap().push(f);
+            let (r, w) = tokio::io::split(client);
+            let child = AcpChild::from_streams(r, w, spec(&root, report_path.clone()));
+            if let Some(line) = &self.stderr {
+                note_stderr(&child, line);
+            }
+            Ok(Child {
+                handle: Box::new(child),
+                model: "external".into(),
+                worktree,
+                isolation_unavailable: false,
+                report_path,
+            })
+        }
+        fn build_fork(
+            &self,
+            _: &AgentDef,
+            _: &str,
+            _: Option<&Path>,
+            _: ForkSeed,
+        ) -> Result<Child, String> {
+            Err("an external agent cannot inherit your context".into())
+        }
+    }
+
+    fn acp_tool(builder: Arc<AcpFixture>) -> SpawnTool {
+        let config = tempfile::tempdir().unwrap().keep();
+        std::fs::create_dir_all(config.join("agents")).unwrap();
+        std::fs::write(
+            config.join("agents/ext.md"),
+            "---\nname: ext\ndescription: an external reviewer\nbackend: acp\ncommand: fake-agent --acp\n---\n",
+        )
+        .unwrap();
+        SpawnTool::new(
+            builder,
+            config,
+            tempfile::tempdir().unwrap().keep(),
+            false,
+            test_concurrency(),
+        )
+    }
+
+    /// Prompts answered with `chunks`, then `end_turn`.
+    fn answering(chunks: Vec<Value>) -> MakeHandler {
+        Box::new(move || {
+            let chunks = chunks.clone();
+            Box::new(move |m: &Value| {
+                handshake(m).unwrap_or_else(|| match method(m) {
+                    "session/prompt" => {
+                        let mut out = chunks.clone();
+                        out.push(reply(m, json!({"stopReason": "end_turn"})));
+                        out
+                    }
+                    _ => Vec::new(),
+                })
+            })
+        })
+    }
+
+    async fn run(tool: &SpawnTool, input: Value, cancel: CancellationToken) -> ToolOutcome {
+        hotl_tools::CURRENT_CALL_ID
+            .scope("spawn_1".into(), tool.run(input, cancel))
+            .await
+    }
+
+    fn reporting() -> Vec<Value> {
+        vec![
+            chunk("looking. "),
+            update(
+                json!({"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Reading agents.rs", "kind": "read", "status": "pending"}),
+            ),
+            update(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed"}),
+            ),
+            chunk(VALID),
+        ]
+    }
+
+    #[tokio::test]
+    async fn an_acp_child_streams_into_the_band_like_a_native_child() {
+        let (event_tx, mut event_rx) = hotl_engine::event_channel();
+        let tool = acp_tool(Arc::new(AcpFixture::new(answering(reporting()))))
+            .with_events(event_tx.downgrade());
+        let out = run(
+            &tool,
+            json!({"agent_type": "ext", "task": "list fns"}),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        drop(event_tx);
+        let (mut text, mut rows) = (String::new(), Vec::new());
+        while let Some(e) = event_rx.recv().await {
+            match e {
+                EngineEvent::ChildText { parent_id, text: t } => {
+                    assert_eq!(parent_id, "spawn_1");
+                    text.push_str(&t);
+                }
+                EngineEvent::ChildTool {
+                    parent_id,
+                    name,
+                    summary,
+                    ok,
+                    ..
+                } => {
+                    assert_eq!(parent_id, "spawn_1");
+                    rows.push((name, summary, ok));
+                }
+                _ => {}
+            }
+        }
+        assert!(text.contains("looking"), "{text:?}");
+        assert!(
+            rows.contains(&("read".into(), "Reading agents.rs".into(), None)),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|(n, _, ok)| n == "read" && *ok == Some(true)),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|(n, _, ok)| n == "report_result" && *ok == Some(true)),
+            "{rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_acp_childs_fenced_report_reaches_the_parent_typed() {
+        let tool = acp_tool(Arc::new(AcpFixture::new(answering(reporting()))));
+        let out = run(
+            &tool,
+            json!({"agent_type": "ext", "task": "list fns"}),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("typed=\"true\""), "{}", out.content);
+        assert!(out.content.contains("listed them"), "{}", out.content);
+        let close = out.content.find("</subagent-result>").unwrap();
+        let note = out
+            .content
+            .find("External agent: its spend is not counted against `max_cost_usd`.")
+            .expect("the external-spend line");
+        assert!(note > close, "hotl's word stays outside the envelope");
+        let d = out.facts.delegation.unwrap();
+        assert_eq!(d.model, "external");
+        assert_eq!(d.usage, Default::default());
+    }
+
+    #[tokio::test]
+    async fn an_acp_child_that_never_reports_is_reprompted_then_unverifiable() {
+        let builder = Arc::new(AcpFixture::new(answering(vec![chunk("I looked around.")])));
+        let tool = acp_tool(builder.clone());
+        let out = run(
+            &tool,
+            json!({"agent_type": "ext", "task": "look"}),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("\"unverifiable\""), "{}", out.content);
+        let prompts: Vec<String> = builder
+            .seen()
+            .iter()
+            .filter(|m| method(m) == "session/prompt")
+            .map(|m| {
+                m["params"]["prompt"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(prompts.len(), 1 + MAX_REPORT_RETRIES, "{prompts:?}");
+        assert!(
+            prompts[0].contains("```json"),
+            "the brief names the block: {}",
+            prompts[0]
+        );
+        assert!(
+            prompts[1].contains("no fenced ```json block"),
+            "{}",
+            prompts[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_is_refused_for_an_external_def() {
+        let builder = Arc::new(AcpFixture::new(answering(vec![])));
+        let tool = acp_tool(builder.clone());
+        let out = run(
+            &tool,
+            json!({"agent_type": "ext", "task": "t", "fork": true}),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("cannot inherit your context"),
+            "{}",
+            out.content
+        );
+        assert!(builder.seen().is_empty(), "nothing was started");
+    }
+
+    #[test]
+    fn the_ask_names_the_program() {
+        let tool = acp_tool(Arc::new(AcpFixture::new(answering(vec![]))));
+        match tool.permission(&json!({"agent_type": "ext", "task": "review the diff"})) {
+            Permission::Ask { summary } => {
+                assert_eq!(
+                    summary,
+                    "spawn ext sub-agent via fake-agent: review the diff"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        match tool.permission(&json!({"agent_type": "explore", "task": "t"})) {
+            Permission::Ask { summary } => assert_eq!(summary, "spawn explore sub-agent: t"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_agent_frame_is_marked_external_with_no_token_count() {
+        let (event_tx, mut event_rx) = hotl_engine::event_channel();
+        let tool = acp_tool(Arc::new(AcpFixture::new(answering(reporting()))))
+            .with_events(event_tx.downgrade());
+        let out = run(
+            &tool,
+            json!({"agent_type": "ext", "task": "list fns"}),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        drop(event_tx);
+        let mut frames = Vec::new();
+        while let Some(e) = event_rx.recv().await {
+            if let EngineEvent::ChildTool {
+                name,
+                summary,
+                ok,
+                tokens,
+                ..
+            } = e
+            {
+                if name == "agent" {
+                    frames.push((summary, ok, tokens));
+                }
+            }
+        }
+        assert_eq!(
+            frames,
+            vec![
+                ("ext · list fns · external".to_string(), None, None),
+                ("ext · list fns · external".to_string(), Some(true), None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_cancel_reaches_the_acp_child_as_session_cancel() {
+        // Never answers the prompt.
+        let builder = Arc::new(AcpFixture::new(Box::new(|| {
+            Box::new(|m: &Value| handshake(m).unwrap_or_default())
+        })));
+        let tool = acp_tool(builder.clone());
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            c2.cancel();
+        });
+        let out = run(&tool, json!({"agent_type": "ext", "task": "t"}), cancel).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("cancelled"), "{}", out.content);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !builder.seen().iter().any(|m| method(m) == "session/cancel") {
+            assert!(std::time::Instant::now() < deadline, "no session/cancel");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_isolated_acp_child_merges_back_like_a_native_one() {
+        let Some(repo) = scratch_repo() else { return };
+        let mut fixture = AcpFixture::new(answering(vec![chunk(VALID)]));
+        fixture.workspace = Some(repo.path().to_path_buf());
+        fixture.writes = Some(("ext.txt".into(), "from the agent\n".into()));
+        let tool = acp_tool(Arc::new(fixture));
+        let out = run(
+            &tool,
+            json!({"agent_type": "ext", "task": "write ext.txt"}),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("Applied the sub-agent's changes"),
+            "{}",
+            out.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("ext.txt")).unwrap(),
+            "from the agent\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_is_a_plain_tool_error_with_the_agents_stderr() {
+        let mut fixture = AcpFixture::new(Box::new(|| {
+            Box::new(|m: &Value| match method(m) {
+                "initialize" => vec![reply(m, json!({"protocolVersion": 2}))],
+                _ => Vec::new(),
+            })
+        }));
+        fixture.stderr = Some("codex-acp: not logged in".into());
+        let tool = acp_tool(Arc::new(fixture));
+        let out = run(
+            &tool,
+            json!({"agent_type": "ext", "task": "t"}),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(out.is_error);
+        assert!(
+            out.content
+                .starts_with("Could not start sub-agent: the agent speaks ACP v2"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("not logged in"), "{}", out.content);
     }
 }

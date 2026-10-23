@@ -3175,6 +3175,87 @@ impl HotlChildBuilder {
     }
 }
 
+impl HotlChildBuilder {
+    /// What an external (`backend: acp`) child is started with (0077 D5):
+    /// the child's rules and hooks as a native child gets them, the program
+    /// resolved on `PATH` now so a missing one is a start failure.
+    fn acp_spawn(
+        &self,
+        def: &hotl_tools::agents::AgentDef,
+        root: &std::path::Path,
+        report_path: Option<PathBuf>,
+        ulid: &str,
+    ) -> Result<crate::acp_child::AcpSpawn, String> {
+        let Some((program, args)) = def.command.split_first() else {
+            return Err(format!("agent def `{}` has no `command:`", def.name));
+        };
+        let resolved = crate::acp_child::resolve_program(program)?;
+        let hooks = self
+            .hooks
+            .clone()
+            .map(|h| -> Arc<dyn hotl_engine::hooks::Hooks> {
+                Arc::new(hotl_engine::hooks::ChildHooks::nested(h, &self.actor, ulid))
+            });
+        Ok(crate::acp_child::AcpSpawn {
+            program: resolved.to_string_lossy().into_owned(),
+            args: args.to_vec(),
+            // Canonical, as the gate's path classification expects.
+            root: dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
+            state_dirs: def.state_dirs.clone(),
+            timeout: std::time::Duration::from_secs(
+                def.timeout
+                    .unwrap_or(hotl_tools::agents::DEFAULT_ACP_TIMEOUT_SECS),
+            ),
+            mode: def.mode.clone(),
+            rules: child_rules(&self.rules),
+            hooks,
+            sandbox_enforced: self.sandbox_enforced,
+            sandbox: hotl_tools::sandbox::probe(),
+            egress: None,
+            report_path,
+            grace: crate::acp_child::CANCEL_GRACE,
+        })
+    }
+
+    /// An external child: the worktree exactly as `spawn_child` makes it,
+    /// then an unstarted `AcpChild` (the spawn tool runs its handshake).
+    /// It has no hotl actor and no `SessionLog`: the parent's log records the
+    /// spawn call and its enveloped result, and nothing new is written.
+    fn spawn_acp(
+        &self,
+        def: &hotl_tools::agents::AgentDef,
+        report: Option<&std::path::Path>,
+    ) -> Result<crate::spawn::Child, String> {
+        let ulid = hotl_types::new_ulid();
+        let isolate = self.wants_isolation(def);
+        let worktree = isolate
+            .then(|| hotl_store::worktree::Worktree::create(&self.cwd, &ulid))
+            .flatten();
+        let isolation_unavailable = isolate && worktree.is_none();
+        let root = worktree
+            .as_ref()
+            .map_or(self.cwd.as_path(), hotl_store::worktree::Worktree::path)
+            .to_path_buf();
+        let report_path = report.map(|d| d.join(hotl_tools::report_tool::RESPONSE_FILE));
+        let spec = match self.acp_spawn(def, &root, report_path.clone(), &ulid) {
+            Ok(s) => s,
+            Err(e) => {
+                if let Some(wt) = worktree {
+                    wt.remove();
+                }
+                return Err(e);
+            }
+        };
+        Ok(crate::spawn::Child {
+            handle: Box::new(crate::acp_child::AcpChild::new(spec)),
+            model: "external".into(),
+            worktree,
+            isolation_unavailable,
+            report_path,
+        })
+    }
+}
+
 impl crate::spawn::ChildBuilder for HotlChildBuilder {
     fn isolates(&self, def: &hotl_tools::agents::AgentDef) -> bool {
         self.wants_isolation(def)
@@ -3186,6 +3267,9 @@ impl crate::spawn::ChildBuilder for HotlChildBuilder {
         _brief: &str,
         report: Option<&std::path::Path>,
     ) -> Result<crate::spawn::Child, String> {
+        if def.backend == hotl_tools::agents::Backend::Acp {
+            return self.spawn_acp(def, report);
+        }
         self.spawn_child(def, Vec::new(), None, report)
     }
 
@@ -3196,6 +3280,9 @@ impl crate::spawn::ChildBuilder for HotlChildBuilder {
         report: Option<&std::path::Path>,
         seed: crate::spawn::ForkSeed,
     ) -> Result<crate::spawn::Child, String> {
+        if def.backend == hotl_tools::agents::Backend::Acp {
+            return Err("an external agent cannot inherit your context".into());
+        }
         let crate::spawn::ForkSeed {
             history,
             parent_session_id,
@@ -6178,6 +6265,79 @@ mod tests {
             nested: None,
         };
         (cb, store)
+    }
+
+    /// 0077: an `acp` def is built as an external child — the child's rules
+    /// (dontask) and the parent's hooks under the child's actor, the program
+    /// resolved on PATH, no hotl session at all.
+    #[tokio::test]
+    async fn build_routes_an_acp_def_to_the_acp_child_with_child_rules_and_child_hooks() {
+        use crate::spawn::ChildBuilder as _;
+        struct Actors(std::sync::Mutex<Vec<String>>);
+        impl hotl_engine::hooks::Hooks for Actors {
+            fn pre_tool<'a>(
+                &'a self,
+                actor: &'a str,
+                _name: &'a str,
+                _input: &'a serde_json::Value,
+            ) -> futures_util::future::BoxFuture<'a, hotl_engine::hooks::PreToolDecision>
+            {
+                self.0.lock().unwrap().push(actor.to_string());
+                Box::pin(async { hotl_engine::hooks::PreToolDecision::Continue })
+            }
+            fn post_tool<'a>(
+                &'a self,
+                _actor: &'a str,
+                _name: &'a str,
+                _result: &'a str,
+            ) -> futures_util::future::BoxFuture<'a, Option<String>> {
+                Box::pin(async { None })
+            }
+        }
+        let (mut cb, _store) = test_child_builder();
+        let actors = Arc::new(Actors(std::sync::Mutex::new(Vec::new())));
+        cb.hooks = Some(actors.clone());
+        let def = hotl_tools::agents::parse_def(
+            "---\nname: ext\nbackend: acp\ncommand: sh --acp\nmode: ask\n---\n",
+            hotl_tools::agents::AgentSource::User,
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let spec = cb
+            .acp_spawn(&def, root.path(), None, "ULID1")
+            .expect("sh is on PATH");
+        assert!(spec.program.ends_with("sh"), "{}", spec.program);
+        assert_eq!(spec.args, vec!["--acp"]);
+        assert_eq!(spec.mode.as_deref(), Some("ask"));
+        assert_eq!(
+            spec.timeout.as_secs(),
+            hotl_tools::agents::DEFAULT_ACP_TIMEOUT_SECS
+        );
+        assert_eq!(
+            spec.rules.mode(),
+            hotl_tools::rules::PermissionMode::DontAsk
+        );
+        spec.hooks
+            .as_ref()
+            .unwrap()
+            .pre_tool("ignored", "bash", &serde_json::json!({}))
+            .await;
+        assert_eq!(*actors.0.lock().unwrap(), vec!["child:ULID1".to_string()]);
+
+        let child = cb.build(&def, "brief", None).expect("built unstarted");
+        assert_eq!(child.model, "external");
+        assert!(child.report_path.is_none());
+        let seed = crate::spawn::ForkSeed {
+            history: Vec::new(),
+            parent_session_id: "p".into(),
+            parent_tip_entry_id: None,
+        };
+        assert!(cb.build_fork(&def, "b", None, seed).is_err());
+
+        let mut missing = def.clone();
+        missing.command = vec!["hotl-no-such-agent".into()];
+        let err = cb.build(&missing, "b", None).err().unwrap();
+        assert!(err.contains("not on PATH"), "{err}");
     }
 
     /// `[agents] review_model` reaches the built-in reviewer and nothing else.
