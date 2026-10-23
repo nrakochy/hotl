@@ -534,6 +534,9 @@ pub struct State {
     /// its result arrives and decrements this — the phase belongs to the
     /// user now, and nothing the dead turn says may take it back.
     pub detached_turns: u32,
+    /// The ask on screen arrived while idle (a `/remember` confirm, 0069),
+    /// so answering it returns to idle — a tool ask resumes the turn.
+    pub ask_from_idle: bool,
     /// `tool_auto_allowed` arrives before its `tool_start`; each rule parks
     /// here, keyed by call id, until its card exists — a parallel chunk
     /// resolves every gate before any call starts, so several can be pending
@@ -580,6 +583,10 @@ pub struct State {
     /// The server's stream idle watchdog in seconds (0071 T2), so the strip
     /// can say when a stalled stream will be retried. `None` = not advertised.
     pub stream_idle_secs: Option<u64>,
+    /// The memory dial (0069) as the server spelled it (`read-only`,
+    /// `read-write`, `off`); `None` on an older server. `/remember <note>`
+    /// refuses locally unless it reads `read-write`.
+    pub memory_mode: Option<String>,
     /// What the last turn actually cost the provider — the exact figure a
     /// `/context` report shows beside its estimate. `on_prompt_result`
     /// computes it for the strip's `% ctx` segment and used to discard it.
@@ -731,6 +738,7 @@ impl State {
             queued_submit: false,
             interrupt_sent: false,
             detached_turns: 0,
+            ask_from_idle: false,
             pending_auto_rules: std::collections::HashMap::new(),
             session_name: None,
             session_title: None,
@@ -755,6 +763,7 @@ impl State {
             measure: 110,
             todos: Vec::new(),
             goal: None,
+            memory_mode: None,
             goal_ticks: 0,
             goal_turns: 0,
             goal_last_reason: None,
@@ -883,6 +892,11 @@ pub enum Msg {
     ModelAck {
         result: Result<serde_json::Value, String>,
     },
+    /// `session/remember`'s ack (0069): `Ok` is silent (the `memory_changed`
+    /// frame carries the notice); `Err` is the refusal text.
+    RememberAck {
+        result: Result<(), String>,
+    },
     Key(KeyEvent),
     /// Bracketed-paste payload. Literal text, never keys — see `Msg::Key`.
     /// A multi-line paste used to arrive as one `Enter` per line and submit
@@ -951,6 +965,10 @@ pub enum Cmd {
     /// engine's `goal_changed` broadcast is what corrects the optimism).
     /// `None` clears.
     SetGoal(Option<String>),
+    /// Send `session/remember` (0069): `None` asks for the report, `Some`
+    /// proposes a note. The ack comes back as `Msg::RememberAck`; the confirm
+    /// arrives as an ordinary `Msg::PermissionRequest`.
+    Remember(Option<String>),
     /// Send `session/aside` (0071 T5); the answer comes back as
     /// `aside_result`.
     Aside(String),
@@ -1039,6 +1057,7 @@ fn from_wire(msg: &Msg) -> bool {
             | Msg::PromptResult { .. }
             | Msg::SteerRejected { .. }
             | Msg::ModelAck { .. }
+            | Msg::RememberAck { .. }
     )
 }
 
@@ -1087,6 +1106,10 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                         | "todos_changed"
                         | "goal_changed"
                         | "goal_verdict"
+                        // A confirmed memory write and a report are the
+                        // owner's own doing, not the dead turn's.
+                        | "memory_changed"
+                        | "memory_report"
                         // A plan presented while detached must be on screen
                         // when you come back: it is waiting on you.
                         | "plan_presented"
@@ -1115,6 +1138,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             protected_why,
             diff,
         } => {
+            state.ask_from_idle = state.phase == Phase::Idle;
             state.phase = Phase::WaitingAsk {
                 req_id,
                 summary,
@@ -1161,6 +1185,12 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             usage,
             finished_at,
         } => on_prompt_result(state, &outcome_kind, outcome_text, &usage, finished_at),
+        Msg::RememberAck { result } => {
+            if let Err(e) = result {
+                notice(state, e);
+            }
+            Vec::new()
+        }
         Msg::ModelAck { result } => {
             match result {
                 Ok(v) => {
@@ -1736,6 +1766,47 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 };
             }
             state.goal = goal;
+        }
+        // Memory (0069) rides as notices too: a confirmed write, and the
+        // bare `/remember` report — one line per entry, then the file.
+        "memory_changed" => {
+            notice(
+                state,
+                format!("remembered — loads next session: {}", text_of("note")),
+            );
+        }
+        "memory_report" => {
+            let entries: Vec<(String, String)> = v
+                .get("entries")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .map(|e| {
+                            let s = |k: &str| {
+                                e.get(k).and_then(Value::as_str).unwrap_or("").to_string()
+                            };
+                            (s("date"), s("note"))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if entries.is_empty() {
+                notice(state, "no notes yet".into());
+            }
+            for (date, note) in entries {
+                notice(state, format!("- {date}: {note}"));
+            }
+            let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+            notice(
+                state,
+                format!(
+                    "{} · {}/{} B · mode {}",
+                    text_of("path"),
+                    n("bytes"),
+                    n("cap"),
+                    text_of("mode")
+                ),
+            );
         }
         // The verdict rides as a Notice — no new view arms, and the reason
         // is worth keeping in the transcript. `turns` comes from the event,
@@ -2940,6 +3011,43 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
         // `/goal <condition>` sets/replaces, bare reports, and any of the
         // clear words ends it early. Optimistic like `/mode`; the engine's
         // `goal_changed` broadcast is the correction channel.
+        // `/remember` (0069): bare any time (a read); with a note only idle
+        // and only under `read-write` — the confirm uses the same modal a
+        // tool ask does, and the dial is a session-start fact.
+        "remember" => match arg.trim() {
+            "" => vec![Cmd::Remember(None)],
+            raw => match hotl_types::normalize_memory_note(raw) {
+                None => {
+                    notice(
+                        state,
+                        format!(
+                            "usage: /remember <note> — one line, 1–{} characters",
+                            hotl_types::MEMORY_NOTE_MAX_CHARS
+                        ),
+                    );
+                    Vec::new()
+                }
+                Some(_) if state.memory_mode.as_deref() != Some("read-write") => {
+                    notice(
+                        state,
+                        "memory is read-only — set `[memory] mode = \"read-write\"` in \
+                         config.toml; takes effect next session"
+                            .into(),
+                    );
+                    Vec::new()
+                }
+                Some(_) if state.phase != Phase::Idle => {
+                    notice(
+                        state,
+                        "wait for the turn to end — the confirm uses the same prompt a tool \
+                         ask does"
+                            .into(),
+                    );
+                    Vec::new()
+                }
+                Some(note) => vec![Cmd::Remember(Some(note))],
+            },
+        },
         "goal" => match arg.trim() {
             "" => {
                 let report = match (&state.goal, &state.goal_resolved) {
@@ -3089,11 +3197,16 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                 Some(_) => " · ◎ goal active",
                 None => "",
             };
+            let memory = state
+                .memory_mode
+                .as_deref()
+                .map(|m| format!(" · memory {m}"))
+                .unwrap_or_default();
             notice(
                 state,
                 format!(
                     "{name} · model {} · mode {}{plan} · effort {} · context {} tok · \
-                     {todos} todo(s){goal}",
+                     {todos} todo(s){goal}{memory}",
                     state.model,
                     state.mode,
                     effort_report(state),
@@ -3490,13 +3603,19 @@ fn resume_after_ask(
     secret_reads: bool,
     message: Option<String>,
 ) -> Vec<Cmd> {
-    state.phase = Phase::Sampling { ticks: 0 };
-    let mut cmds = vec![Cmd::ReplyPermission {
+    let cmds = vec![Cmd::ReplyPermission {
         req_id,
         allow,
         secret_reads,
         message,
     }];
+    if std::mem::take(&mut state.ask_from_idle) {
+        // An idle confirm (`/remember`): no turn to resume.
+        state.phase = Phase::Idle;
+        return cmds;
+    }
+    state.phase = Phase::Sampling { ticks: 0 };
+    let mut cmds = cmds;
     cmds.extend(title_cmds(state, " — working"));
     cmds
 }
@@ -7165,13 +7284,13 @@ mod tests {
     fn typing_a_slash_opens_the_popup_and_narrows_as_you_type() {
         let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/");
-        // Seventeen built-ins plus the one skill.
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(18));
+        // Eighteen built-ins plus the one skill.
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(19));
         type_str(&mut s, "re");
         assert_eq!(selected(&s), "reload");
-        // `reload`, `rename` and `review` prefix-match, then the `refactor`
-        // skill; no other built-in contains "re".
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(4));
+        // `reload`, `rename`, `review` and `remember` prefix-match, then the
+        // `refactor` skill; no other built-in contains "re".
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(5));
     }
 
     #[test]
@@ -8034,6 +8153,181 @@ mod tests {
 
     /// Durable session state, like `mode_changed`: a detached turn's goal
     /// updates still land — the engine may resolve the goal mid-detach.
+    #[test]
+    fn an_idle_confirm_returns_to_idle_when_answered() {
+        let mut s = State::test_default();
+        update(
+            &mut s,
+            Msg::PermissionRequest {
+                req_id: 9,
+                summary: "remember → project memory: \"x\"".into(),
+                protected_why: None,
+                diff: Vec::new(),
+            },
+        );
+        assert!(matches!(s.phase, Phase::WaitingAsk { .. }));
+        let cmds = press(&mut s, KeyCode::Char('y'));
+        assert!(matches!(
+            cmds[..],
+            [Cmd::ReplyPermission {
+                req_id: 9,
+                allow: true,
+                ..
+            }]
+        ));
+        assert_eq!(s.phase, Phase::Idle, "no turn to resume");
+        // A tool ask mid-turn still resumes the turn.
+        s.phase = Phase::Sampling { ticks: 0 };
+        update(
+            &mut s,
+            Msg::PermissionRequest {
+                req_id: 10,
+                summary: "bash: ls".into(),
+                protected_why: None,
+                diff: Vec::new(),
+            },
+        );
+        press(&mut s, KeyCode::Char('y'));
+        assert_eq!(s.phase, Phase::Sampling { ticks: 0 });
+    }
+
+    #[test]
+    fn remember_bare_requests_a_report_any_time() {
+        let mut s = State::test_default();
+        assert_eq!(
+            type_and_submit(&mut s, "/remember"),
+            vec![Cmd::Remember(None)]
+        );
+        s.phase = Phase::Sampling { ticks: 0 };
+        assert_eq!(
+            type_and_submit(&mut s, "/remember   "),
+            vec![Cmd::Remember(None)],
+            "a read is safe mid-turn"
+        );
+    }
+
+    #[test]
+    fn remember_with_text_is_refused_mid_turn_and_in_read_only_mode() {
+        let mut s = State::test_default();
+        // No dial known / read-only: refused locally, nothing sent.
+        assert!(type_and_submit(&mut s, "/remember x").is_empty());
+        assert!(
+            last_notice(&s).contains("memory is read-only"),
+            "{}",
+            last_notice(&s)
+        );
+        s.memory_mode = Some("read-only".into());
+        assert!(type_and_submit(&mut s, "/remember x").is_empty());
+        assert!(
+            last_notice(&s).contains("[memory] mode"),
+            "{}",
+            last_notice(&s)
+        );
+        // read-write but a turn is running: wait.
+        s.memory_mode = Some("read-write".into());
+        s.phase = Phase::Sampling { ticks: 0 };
+        assert!(type_and_submit(&mut s, "/remember x").is_empty());
+        assert!(
+            last_notice(&s).contains("wait for the turn to end"),
+            "{}",
+            last_notice(&s)
+        );
+    }
+
+    #[test]
+    fn remember_with_text_sends_the_normalized_note_when_idle() {
+        let mut s = State::test_default();
+        s.memory_mode = Some("read-write".into());
+        let cmds = type_and_submit(&mut s, "/remember   the tests   need nextest  ");
+        assert_eq!(
+            cmds,
+            vec![Cmd::Remember(Some("the tests need nextest".into()))]
+        );
+        // The ack: an error is a notice, a success is silent (memory_changed speaks).
+        update(
+            &mut s,
+            Msg::RememberAck {
+                result: Err("not saved".into()),
+            },
+        );
+        assert_eq!(last_notice(&s), "not saved");
+        let before = s.transcript.len();
+        update(&mut s, Msg::RememberAck { result: Ok(()) });
+        assert_eq!(s.transcript.len(), before);
+    }
+
+    #[test]
+    fn memory_changed_and_memory_report_become_notices() {
+        let mut s = State::test_default();
+        upd(
+            &mut s,
+            json!({"type": "memory_changed", "note": "tests need nextest", "bytes": 80}),
+        );
+        assert_eq!(
+            last_notice(&s),
+            "remembered — loads next session: tests need nextest"
+        );
+        upd(
+            &mut s,
+            json!({"type": "memory_report", "mode": "read-only", "path": "/d/MEMORY.md",
+                   "bytes": 45, "cap": 16384,
+                   "entries": [{"date": "2026-10-01", "note": "one"}, {"date": "2026-10-02", "note": "two"}]}),
+        );
+        let n = s.transcript.len();
+        let texts: Vec<String> = s.transcript[n - 3..]
+            .iter()
+            .map(|t| match t {
+                TranscriptItem::Notice { text } => text.as_str().to_string(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(texts[0], "- 2026-10-01: one");
+        assert_eq!(texts[1], "- 2026-10-02: two");
+        assert_eq!(texts[2], "/d/MEMORY.md · 45/16384 B · mode read-only");
+        upd(
+            &mut s,
+            json!({"type": "memory_report", "mode": "read-write", "path": "/d/MEMORY.md",
+                   "bytes": 0, "cap": 16384, "entries": []}),
+        );
+        let n = s.transcript.len();
+        assert!(
+            matches!(&s.transcript[n - 2], TranscriptItem::Notice { text } if text.as_str() == "no notes yet")
+        );
+    }
+
+    #[test]
+    fn memory_updates_are_not_absorbed_by_a_detached_turn() {
+        let mut s = State::test_default();
+        s.detached_turns = 1;
+        upd(
+            &mut s,
+            json!({"type": "memory_changed", "note": "kept", "bytes": 10}),
+        );
+        assert!(last_notice(&s).contains("kept"), "{}", last_notice(&s));
+        upd(
+            &mut s,
+            json!({"type": "memory_report", "mode": "read-write", "path": "/p", "bytes": 0, "cap": 1, "entries": []}),
+        );
+        assert!(last_notice(&s).contains("mode read-write"));
+    }
+
+    #[test]
+    fn status_line_shows_the_memory_dial() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "/status");
+        assert!(
+            !last_notice(&s).contains("memory"),
+            "unknown dial stays silent"
+        );
+        s.memory_mode = Some("read-write".into());
+        type_and_submit(&mut s, "/status");
+        assert!(
+            last_notice(&s).contains("· memory read-write"),
+            "{}",
+            last_notice(&s)
+        );
+    }
+
     #[test]
     fn goal_updates_survive_a_detached_turn() {
         let mut s = State::test_default();

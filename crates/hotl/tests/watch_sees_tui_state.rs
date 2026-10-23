@@ -61,6 +61,9 @@ fn session() -> State {
 }
 
 fn ask(state: &mut State) -> Vec<Cmd> {
+    // A tool ask only ever arrives mid-turn; an ask from idle is a
+    // `/remember` confirm, which returns to idle instead (0069).
+    state.phase = hotl_tui::app::Phase::Sampling { ticks: 0 };
     update(
         state,
         Msg::PermissionRequest {

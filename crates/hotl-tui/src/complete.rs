@@ -27,7 +27,7 @@ pub struct Completion {
 
 /// The TUI's own commands, in `slash_command`'s dispatch order. Descriptions
 /// are hand-written here because built-ins have no roster to read them from.
-const BUILTINS: [(&str, &str); 17] = [
+const BUILTINS: [(&str, &str); 18] = [
     ("rename", "name this session"),
     ("plan", "toggle plan mode (file edits always ask)"),
     ("mode", "set the permission mode"),
@@ -41,6 +41,7 @@ const BUILTINS: [(&str, &str); 17] = [
     ("help", "show the key bindings"),
     ("status", "what this session is running"),
     ("context", "what is filling the context window"),
+    ("remember", "keep a note for future sessions here"),
     ("compact", "fold history now, with an optional focus"),
     ("workflows", "runs of the workflow tool, with progress"),
     ("cost", "token and cost breakdown"),
@@ -250,6 +251,7 @@ mod tests {
                 "status",
                 "compact",
                 "context",
+                "remember",
                 "workflows",
                 "run",
                 "refactor",
@@ -269,7 +271,14 @@ mod tests {
         let c = recompute(&cmds, "/re", (0, 3), false).expect("open");
         assert_eq!(
             names(&cmds, &c),
-            vec!["reload", "rename", "review", "refactor", "rag-recall"],
+            vec![
+                "reload",
+                "rename",
+                "review",
+                "remember",
+                "refactor",
+                "rag-recall"
+            ],
             "`rag-recall` contains `re` (at \"rag-\"[re]\"call\") and must sort below the prefix hits; \
              `mode` has no `r` at all and must not appear"
         );

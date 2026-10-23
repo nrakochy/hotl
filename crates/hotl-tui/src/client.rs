@@ -340,6 +340,7 @@ pub fn translate(
     prompt_ids: &mut VecDeque<u64>,
     steer_ids: &mut VecDeque<u64>,
     model_ids: &mut VecDeque<u64>,
+    remember_ids: &mut VecDeque<u64>,
 ) -> Option<Msg> {
     match msg {
         ServerMsg::Update(v) => Some(Msg::Update(v)),
@@ -366,6 +367,12 @@ pub fn translate(
             if let Some(pos) = model_ids.iter().position(|&p| p == id) {
                 model_ids.remove(pos);
                 return Some(Msg::ModelAck { result });
+            }
+            if let Some(pos) = remember_ids.iter().position(|&p| p == id) {
+                remember_ids.remove(pos);
+                return Some(Msg::RememberAck {
+                    result: result.map(|_| ()),
+                });
             }
             let pos = steer_ids.iter().position(|&p| p == id)?;
             steer_ids.remove(pos);
@@ -418,6 +425,7 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
     prompt_ids: &mut VecDeque<u64>,
     steer_ids: &mut VecDeque<u64>,
     model_ids: &mut VecDeque<u64>,
+    remember_ids: &mut VecDeque<u64>,
 ) -> io::Result<Option<Cmd>> {
     match cmd {
         Cmd::SendPrompt(p) => {
@@ -459,6 +467,14 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
                     .request("session/set_model", json!({"model": spec}))
                     .await?,
             );
+        }
+        // The ack carries information (the refusal text), unlike set_goal's.
+        Cmd::Remember(note) => {
+            let params = match note {
+                Some(n) => json!({"note": n}),
+                None => json!({}),
+            };
+            remember_ids.push_back(client.request("session/remember", params).await?);
         }
         // The ack is noise like set_mode: the engine's `goal_changed`
         // broadcast is what corrects the optimistic update. `None` rides as
@@ -568,7 +584,13 @@ mod tests {
                 outcome_kind,
                 outcome_text,
                 ..
-            }) = translate(msg, &mut ids, &mut steer_ids, &mut VecDeque::new())
+            }) = translate(
+                msg,
+                &mut ids,
+                &mut steer_ids,
+                &mut VecDeque::new(),
+                &mut VecDeque::new(),
+            )
             else {
                 panic!("not a prompt result")
             };
@@ -588,7 +610,14 @@ mod tests {
             id: 99,
             result: Ok(json!({"ok": true})),
         };
-        assert!(translate(ack, &mut ids, &mut steer_ids, &mut VecDeque::new()).is_none());
+        assert!(translate(
+            ack,
+            &mut ids,
+            &mut steer_ids,
+            &mut VecDeque::new(),
+            &mut VecDeque::new()
+        )
+        .is_none());
         assert_eq!(ids.len(), 1, "an unrelated ack consumes no prompt id");
     }
 
@@ -600,9 +629,13 @@ mod tests {
             id: 7,
             result: Err("images[0] is empty".into()),
         };
-        let Some(Msg::SteerRejected { why }) =
-            translate(msg, &mut prompt_ids, &mut steer_ids, &mut VecDeque::new())
-        else {
+        let Some(Msg::SteerRejected { why }) = translate(
+            msg,
+            &mut prompt_ids,
+            &mut steer_ids,
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+        ) else {
             panic!("a steer error must become a message");
         };
         assert!(why.contains("images[0]"));
@@ -617,7 +650,14 @@ mod tests {
             id: 7,
             result: Ok(Value::Null),
         };
-        assert!(translate(msg, &mut prompt_ids, &mut steer_ids, &mut VecDeque::new()).is_none());
+        assert!(translate(
+            msg,
+            &mut prompt_ids,
+            &mut steer_ids,
+            &mut VecDeque::new(),
+            &mut VecDeque::new()
+        )
+        .is_none());
         assert!(steer_ids.is_empty(), "the id is consumed either way");
     }
 
@@ -665,6 +705,7 @@ mod tests {
             &mut client,
             &mut ids,
             &mut steer_ids,
+            &mut VecDeque::new(),
             &mut VecDeque::new(),
         )
         .await
@@ -1045,7 +1086,8 @@ mod tests {
                 &mut client,
                 &mut ids,
                 &mut steer_ids,
-                &mut VecDeque::new()
+                &mut VecDeque::new(),
+                &mut VecDeque::new(),
             )
             .await
             .expect("the write succeeded")
@@ -1079,7 +1121,8 @@ mod tests {
                 &mut client,
                 &mut ids,
                 &mut steer_ids,
-                &mut VecDeque::new()
+                &mut VecDeque::new(),
+                &mut VecDeque::new(),
             )
             .await
             .expect("the write succeeded"),

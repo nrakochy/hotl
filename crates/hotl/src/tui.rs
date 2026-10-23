@@ -147,8 +147,10 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         previous_model,
         warnings,
         title,
+        memory_mode,
     } = opened;
     state.model = model;
+    state.memory_mode = memory_mode;
     state.session_name = session_name;
     state.session_title = title;
     // Server-side truth, seeded before the post-open loop's first draw: the
@@ -416,6 +418,9 @@ struct Opened {
     /// worth a transcript notice. The strip is untouched: `state.model`
     /// stays the config model, which IS what runs.
     previous_model: Option<String>,
+    /// The memory dial (0069) as the server spelled it; `None` on an older
+    /// server.
+    memory_mode: Option<String>,
 }
 
 /// initialize + session/new|load before entering raw mode, so wiring errors
@@ -486,6 +491,10 @@ async fn handshake(
         todos,
         effort,
         previous_model,
+        memory_mode: v
+            .get("memoryMode")
+            .and_then(Value::as_str)
+            .map(String::from),
         warnings: v
             .get("warnings")
             .and_then(Value::as_array)
@@ -540,6 +549,7 @@ async fn run_loop(
     let mut prompt_ids: VecDeque<u64> = VecDeque::new();
     let mut steer_ids: VecDeque<u64> = VecDeque::new();
     let mut model_ids: VecDeque<u64> = VecDeque::new();
+    let mut remember_ids: VecDeque<u64> = VecDeque::new();
     // The animation's own rate, armed only while a turn runs — idle schedules
     // no wakeups, which is also why the idle wave is a frozen frame.
     let mut ticker = tokio::time::interval(Duration::from_millis(1_000 / hotl_tui::anim::TICK_HZ));
@@ -573,8 +583,15 @@ async fn run_loop(
                 Cmd::SendSteer(p) => Cmd::SendSteer(outbound(p).await),
                 other => other,
             };
-            let Some(cmd) =
-                exec_wire_cmd(cmd, client, &mut prompt_ids, &mut steer_ids, &mut model_ids).await?
+            let Some(cmd) = exec_wire_cmd(
+                cmd,
+                client,
+                &mut prompt_ids,
+                &mut steer_ids,
+                &mut model_ids,
+                &mut remember_ids,
+            )
+            .await?
             else {
                 continue;
             };
@@ -670,7 +687,13 @@ async fn run_loop(
                 )),
             },
             sm = read_server_msg(reader) => match sm {
-                Some(m) => translate(m, &mut prompt_ids, &mut steer_ids, &mut model_ids),
+                Some(m) => translate(
+                    m,
+                    &mut prompt_ids,
+                    &mut steer_ids,
+                    &mut model_ids,
+                    &mut remember_ids,
+                ),
                 None => return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "the session server closed the connection",
