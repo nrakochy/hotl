@@ -52,6 +52,17 @@ Look up the message you saw. Text in `code` is what hotl prints; find yours by g
 | `preapproved rules at … refused` | The admin file isn't root-owned, or is group/world-writable. | `sudo chown root /etc/hotl/preapproved.toml && sudo chmod 644 /etc/hotl/preapproved.toml` |
 | `permissions.mode=auto requested, but this is a security-enforced build` | Expected on enforced builds; per-action asks are the build's contract. | None. |
 
+## External agents (`backend: acp`)
+
+| Message or symptom | Cause | Fix |
+|---|---|---|
+| `Could not start sub-agent: the agent speaks ACP vN, hotl speaks v1` | The binary speaks a different major version of the Agent Client Protocol. | Use a release of the agent (or adapter) that speaks ACP v1. |
+| `Could not start sub-agent: \`X\` is not on PATH` | The def's `command:` names a program the shell running hotl can't find. | Install it, or give `command:` an absolute path. |
+| Every action of the external agent is `(denied)` | No allow rule covers it, or the agent offered no `allow_once` option (hotl never picks an "always" option). | Add an `[[allow]]` rule for what it needs — a shell command is judged as `bash`, an edit as `edit`/`write`. If the agent offers only "always" options, its requests are cancelled; pick another `mode:`. |
+| `The sub-agent did not finish: Error { message: "timed out after Ns" }` | The agent's prompt ran past the def's `timeout:` (default 900 s). It was cancelled, then killed. | Raise `timeout:` in the def, or give it a smaller task. |
+| An `npx` adapter can't reach your package registry | `~/.npmrc` is a credential file the sandbox denies to every sub-process. | By design. Set the registry in the adapter's own config, or install the adapter globally so `npx` has nothing to fetch. |
+| `Could not start sub-agent: … agent stderr: … not logged in` | The agent found no login or key of its own; hotl passes it none. | Log in or set the agent's own key variable as its vendor documents, outside hotl. |
+
 ## Minified reads and edits
 
 | Message or symptom | Cause | Fix |

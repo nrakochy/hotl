@@ -76,6 +76,17 @@ Frontmatter fields:
 | `effort` | Reasoning depth for this child: `low` \| `medium` \| `high` \| `xhigh` \| `max`. Replaces the parent's for that child only. Omit to inherit. An unrecognized value warns and the def still loads. |
 | `isolation` | `worktree` gives this def's children their own git worktree to work in; `none` (default) shares your working directory. See [Worktree isolation](#worktree-isolation) below. Beats the `[agents] isolation` default. |
 | `max_turns` | A ceiling on the child's turns, replacing the engine default for that child only. A non-numeric value warns and the def still loads. |
+| `backend` | `hotl` (default) runs the child on hotl's own engine. `acp` runs an external agent binary instead — see [External agents over ACP](#external-agents-over-acp-backend-acp). An unknown value drops the def. |
+| `command` | Required with `backend: acp`: the agent's command line, split like a shell would but never run through one (`gemini --acp`). The program is looked up on `PATH` when the child starts. |
+| `state_dirs` | With `backend: acp`: a comma list of the agent's own state directories (`~/.gemini`) it may write besides its working directory. Never a credential directory. |
+| `timeout` | With `backend: acp`: a wall clock in seconds for each prompt the agent gets (default 900). |
+| `mode` | With `backend: acp`: the agent's session mode to switch to after it starts, by the id the agent lists. If the agent does not list it, the spawn fails. |
+
+An `acp` def is honoured only from your own `agents/` directory, never from
+`~/.claude/agents` — a cloned repo must not be able to name a program hotl
+runs. It may not set `tools`, `model`, `effort` or `max_turns`: hotl cannot
+apply them to another program, so a def that sets one is dropped with a
+warning rather than letting you believe the roster was narrowed.
 
 A def's `effort` is what makes the depth ladder compose with fan-out: a
 read-only searcher can run cheap under a parent thinking hard.
@@ -261,6 +272,7 @@ ever narrows:
 | `workflow` | never present | a batch runner under a batch runner is fan-out squared with one ask; naming it in `tools:` does nothing at any depth |
 | Worktree isolation | the def's `isolation:`, then `[agents] isolation` | not a call argument; `spawn {isolation: …}` is refused as an unknown key |
 | Hooks | inherited | they run inside children too, under `actor: "child:<id>"` — and, as everywhere, a hook can only deny |
+| `backend: acp` | the def | the agent's permission requests are decided by your rules; anything it does without asking is bounded by the sandbox floor |
 
 So a mutating call inside a child runs only if one of your own allow rules
 already covered it. Anything else is denied with a message the sub-agent can
@@ -367,6 +379,87 @@ you deal with it.
 **Without git** — no `git` on `PATH`, or a workspace that is not a git
 worktree — the child runs in your working directory as usual and the
 `spawn` result says so.
+
+## External agents over ACP (`backend: acp`)
+
+A def can hand its subtask to another agent you already run, instead of to
+hotl's own engine. hotl starts that agent as a sub-process, speaks the
+[Agent Client Protocol](https://agentclientprotocol.com) to it over stdio,
+and treats it as one more child: the same `spawn` call, the same ask, the
+same agent band, the same typed result, the same merge-back.
+
+```
+---
+name: gemini
+description: Gemini CLI as a read-mostly reviewer
+backend: acp
+command: gemini --acp
+state_dirs: ~/.gemini
+isolation: worktree
+timeout: 600
+---
+```
+
+The ask names the program every time: `spawn gemini sub-agent via gemini: …`.
+Nothing is allowed automatically because of the backend.
+
+**What hotl decides, and what the floor bounds.** Every permission request
+the agent sends is answered by hotl's rules, never by a person — the same
+forced `dontask` a native child runs under. A shell command is judged as
+`bash`, an edit as `edit`/`write`, a read or search as `read`/`grep`, a fetch
+as `web_fetch`, each against the child's working directory; your allow rules
+and hooks apply, and anything else is rejected once. hotl never picks the
+agent's "always" options, so no grant outlives the call. What the agent does
+without asking is not seen by hotl's rules: writes outside the child's root
+and non-allowlisted egress fail at the OS, not at the protocol, because the
+agent runs under the same sandbox floor as `bash`. Pick the agent's
+ask-before-acting mode with `mode:` if it has one; an agent in an
+auto-approve mode asks nothing.
+
+**The return contract.** An external agent has no `report_result` tool, so
+its brief asks it to end its final message with one fenced ```` ```json ````
+block holding the same fields. hotl takes the last such block, checks it with
+the same rules as `report_result`, and records it; an invalid or missing
+block gets the same two re-prompts (led by what was wrong), and then the
+parent gets `{"outcome": "unverifiable", …}` as for any child.
+
+**Cost.** ACP carries no per-request bill, so an external agent's spend is
+**not counted** against `max_cost_usd`. The card shows ` · external` and no
+token count, the result says so outside the envelope, and a spend figure the
+agent reports itself appears in the band as text only. The bound an external
+agent does have is time: `timeout:` per prompt, on top of the usual idle
+clock.
+
+**Cancel.** Stopping the parent sends the agent `session/cancel`, waits five
+seconds for it to wind down, then kills its whole process group.
+
+**What it never gets.** An external agent is never hotl's main model and has
+no hotl tool registry: no `spawn`, no `recall`, no MCP servers, no skills.
+`fork: true` is refused — it cannot inherit your context. `send` cannot steer
+it mid-turn.
+
+Agents that speak ACP themselves, checked 2026-10-22:
+
+| Agent | Def (the `state_dirs` are the usual locations — check where yours keeps its state) |
+| --- | --- |
+| Gemini CLI | `command: gemini --acp`, `state_dirs: ~/.gemini` |
+| OpenCode | `command: opencode acp`, `state_dirs: ~/.config/opencode, ~/.local/share/opencode` |
+| Goose | `command: goose acp`, `state_dirs: ~/.config/goose, ~/.local/share/goose` |
+
+Codex and Claude Code do not speak ACP themselves. They are reachable through
+the `@agentclientprotocol/codex-acp` and `@agentclientprotocol/claude-agent-acp`
+adapters, which you install and authenticate yourself under that vendor's
+terms. hotl strips its own provider keys (`ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, …) from every sub-process, these included, so an agent
+authenticates from its own config directory or from its own variables
+(`GEMINI_API_KEY`, `CODEX_API_KEY`).
+
+This is a way to delegate a subtask to another agent you already run. It is
+not a way to spend a subscription through hotl: hotl passes no credential,
+documents no login, and the external agent is billed by its own vendor under
+its own terms — see
+[Can I use my Claude Pro or Max subscription?](../gateway/#can-i-use-my-claude-pro-or-max-subscription).
+An external agent is never hotl's main model.
 
 See [Configuration → Concurrency](../configuration/#concurrency-concurrency)
 for the full `[concurrency]` reference, and

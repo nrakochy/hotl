@@ -236,6 +236,10 @@ Child processes used to inherit hotl's whole environment, so `ANTHROPIC_API_KEY`
 
 The scrub is deliberately narrow. The tempting rule — strip anything named like a secret — would also take `GITHUB_TOKEN`, `CARGO_REGISTRY_TOKEN` and `NPM_TOKEN`, breaking `gh`, `cargo publish` and `npm publish` in ways that look like unrelated bugs. Add names with `HOTL_SCRUB_ENV=A,B,C`, or take the broad rule knowingly with `HOTL_SCRUB_ENV_STRICT=1`.
 
+### External agents run under the same floor
+
+An external sub-agent (`backend: acp`, see [agents.md](../agents/#external-agents-over-acp-backend-acp)) is started the way `bash` runs a command: under the same floor, in the child's working directory, with hotl's provider keys stripped from its environment like any other sub-process. Its def's `state_dirs:` is the only widening — the agent's own home state, such as `~/.gemini` — and a credential directory is refused there. hotl's rules answer what the agent asks permission for; the floor bounds what it does without asking.
+
 ## Opting out of open egress
 
 `[network].egress` in `config.toml` closes the door the previous section describes as open. Set it to `"off"` and an approved command can reach only your own machine — loopback and unix-domain sockets; the kernel refuses everything else. Set it to `"allowlist"` and you add whatever hosts the agent needs beyond the ones hotl already ships:

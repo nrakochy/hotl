@@ -242,7 +242,7 @@ These are fixed for the life of the process; restart to change them:
 | `system-prompt.md` | Replaces the built-in agent instructions (prose). |
 | `memory/MEMORY.md` | Per user, hand-written; loaded into every session's starting context (capped at 16 KB), enveloped. The per-project file `/remember` writes lives in the data dir — see [Memory](#memory-memory). |
 | `skills/*.md` | One procedure per file; the `skill` tool lists and loads them by name. See [skills.md](../skills/). |
-| `agents/*.md` | One sub-agent definition per file — `tools`/`model`/`effort`/`isolation` frontmatter, body = system prompt. See [agents.md](../agents/). |
+| `agents/*.md` | One sub-agent definition per file — `tools`/`model`/`effort`/`isolation`/`max_turns` frontmatter, body = system prompt. `backend: acp` with `command`, `state_dirs`, `timeout` and `mode` runs an external ACP agent instead; such a def is read from this directory only, and is dropped if it also sets `tools`/`model`/`effort`/`max_turns`. See [agents.md](../agents/#external-agents-over-acp-backend-acp). |
 | `trust.toml` | Written by hotl, not you: approved MCP server fingerprints — `fp3:` for a program (binary hash, args, env, cwd), `fpu1:` for a URL server (address, headers, the token's variable name). |
 
 ### Skills (`[skills]`)

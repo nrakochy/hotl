@@ -31,7 +31,18 @@ semver promise of their own.
   schema it was checked against, and every method it answers. hotl's dialect
   is still not ACP v1; a ready ACP Registry entry sits in `.acp-registry/` but
   is not filed.
-
+- **External agents as sub-agents over ACP.** An agent def with
+  `backend: acp` and `command:` runs any agent binary that speaks the Agent
+  Client Protocol (Gemini CLI, OpenCode and Goose speak it themselves; Codex
+  and Claude Code through the `@agentclientprotocol` adapters you install and
+  authenticate yourself) as a sub-agent. hotl answers its permission requests
+  with your rules, runs it in the child's worktree under the sandbox floor
+  with hotl's own keys stripped, streams its work into the agent band, names
+  the program in the spawn ask, and requires the same typed result (a fenced
+  JSON block, checked like `report_result`). It is never the main model, and
+  its spend is not counted against `max_cost_usd` — the card and the result
+  say so; `timeout:` bounds it instead. Such a def loads only from your own
+  `agents/` directory.
 - **`: why did that fail` now carries the failure.** The zsh plugin remembers
   the last command, its exit status and its duration, and inside tmux the last
   200 lines it printed; a `: ` prompt attaches them as `--shell-trace FILE`

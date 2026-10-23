@@ -189,6 +189,11 @@ right to act "without prior notice." The account at risk is yours, and hotl
 cannot shield it. That is why no such bridge is named anywhere in these docs
 or defaults.
 
+The same holds for [external sub-agents](../agents/#external-agents-over-acp-backend-acp):
+running another agent through `backend: acp` delegates a subtask to a program
+you already run and authenticate yourself. It is not a route to subscription
+use, and hotl passes it no credential.
+
 If per-token billing is the actual objection, hotl is provider-neutral by
 design and the alternatives are one env var away: a local model through
 [Ollama](https://ollama.com) costs nothing per token, and any
