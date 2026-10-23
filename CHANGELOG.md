@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-10-23
+
 ### Internal
 
 - The testkit gained a scripted Anthropic SSE server (`hotl_testkit::fake_anthropic`,
