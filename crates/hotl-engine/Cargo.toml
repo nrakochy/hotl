@@ -18,6 +18,7 @@ default = ["minify"]
 minify = ["hotl-retrieval/minify", "hotl-tools/minify"]
 
 [dependencies]
+schemars = { workspace = true }
 hotl-types = { path = "../hotl-types", version = "0.28.0" }
 hotl-platform = { path = "../hotl-platform", version = "0.28.0" }
 hotl-provider = { path = "../hotl-provider", version = "0.28.0" }

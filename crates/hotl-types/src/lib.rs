@@ -120,7 +120,19 @@ pub struct UserImage {
 ///
 /// Declaration order IS display order — `Ord` is derived, and both the engine
 /// and the TUI sort by it, so reordering these variants reorders the report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextKind {
     SystemPrompt,
@@ -144,7 +156,7 @@ pub enum ContextKind {
 
 /// One row of a `/context` breakdown. `kind` is a stable wire tag, never a
 /// display string — the client owns the label.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContextRow {
     pub kind: ContextKind,
     pub tokens: u64,
@@ -152,7 +164,7 @@ pub struct ContextRow {
 
 /// The whole `/context` payload. `window` rides along so the client never has
 /// to reconcile its handshake value against the engine's live config.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContextBreakdown {
     pub window: u64,
     pub rows: Vec<ContextRow>,
@@ -182,7 +194,9 @@ pub const IMAGE_B64_BUDGET: usize = 24 * 1024 * 1024;
 /// `Failed`/`NeedsMoreSteps` (0056 T1) sit **before** the `#[serde(other)]`
 /// arm, so an older binary reads them as `Unknown` — which every renderer
 /// already tolerates — rather than failing the whole entry.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
     #[default]
@@ -210,7 +224,7 @@ output_matches(\"<command>\", \"<glob>\") · no_edits_since_verify · turns <= N
 /// A plan node. Everything past `active_form` is 0056 T1 — all defaulted and
 /// skipped when empty, so a v0.25 `Todos` entry still deserializes and a list
 /// that uses none of it serializes to the same bytes it always did.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Todo {
     pub content: String,
     pub status: TodoStatus,
@@ -307,7 +321,9 @@ fn is_zero_u64(n: &u64) -> bool {
 }
 
 /// Normalized usage; fields absent from a provider response default to zero.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub struct TokenUsage {
     #[serde(default)]
     pub input_tokens: u64,
@@ -683,7 +699,7 @@ where
 /// One selectable choice in a structured [`Question`] (`ask_user`, tier-1
 /// gap #4). `description` is an optional one-line elaboration shown under
 /// the label.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct QuestionOption {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -695,7 +711,7 @@ pub struct QuestionOption {
 /// always-available free-text "other" the surfaces provide, not encoded
 /// here). `multi` reserves multi-select for a future surface; today's
 /// surfaces treat every question as single-select.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Question {
     pub header: String,
     pub prompt: String,
@@ -1483,5 +1499,19 @@ mod tests {
             bare_model("anthropic.claude-opus-5"),
             "anthropic.claude-opus-5"
         );
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    /// 0076: the payload types the wire frames carry describe themselves.
+    #[test]
+    fn payload_types_produce_a_schema() {
+        let todo = serde_json::to_value(schemars::schema_for!(super::Todo)).unwrap();
+        assert!(todo["properties"]["content"].is_object(), "{todo}");
+        let usage = serde_json::to_value(schemars::schema_for!(super::TokenUsage)).unwrap();
+        assert!(usage["properties"]["input_tokens"].is_object(), "{usage}");
+        let q = serde_json::to_value(schemars::schema_for!(super::Question)).unwrap();
+        assert!(q["properties"]["options"].is_object(), "{q}");
     }
 }

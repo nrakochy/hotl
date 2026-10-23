@@ -52,6 +52,7 @@ security-enforced = ["hotl-tools/security-enforced"]
 minify = ["hotl-mcp/minify", "hotl-retrieval/minify", "hotl-engine/minify", "hotl-tui/minify", "hotl-tools/minify"]
 
 [dependencies]
+schemars = { workspace = true }
 dunce = { workspace = true }
 hotl_theme = { package = "hotl-theme", path = "../hotl-theme", version = "0.28.0", features = ["ratatui"] }
 watch_types = { package = "hotl-watch-types", path = "../watch-types", version = "0.28.0" }

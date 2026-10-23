@@ -36,7 +36,7 @@ use std::time::Instant;
 /// and it is legitimately near zero. ([`width`] saturates either way, so an
 /// out-of-order pair reports `0` rather than wrapping.)
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub enum Phase {
     BoundaryStart,
     SnapshotReady,
@@ -137,7 +137,7 @@ fn percentile(sorted: &[u64], p: u64) -> u64 {
 }
 
 /// One attributable stage's timing across every sample in a flush.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct PhaseDeltaSummary {
     pub from: Phase,
     pub to: Phase,
@@ -147,7 +147,7 @@ pub struct PhaseDeltaSummary {
 
 /// What gets flushed at `TurnFinished` (as an [`crate::EngineEvent::LedgerReport`],
 /// never the canon log) and what a CI regression gate consumes.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct LedgerSummary {
     /// Samples actually taken this turn, capped at 64 — past the cap this is
     /// `64`, not the true (dropped) count.
