@@ -1826,6 +1826,7 @@ pub(crate) mod tests {
     fn a_program_not_on_path_is_named() {
         let err = resolve_program("hotl-no-such-agent-binary").unwrap_err();
         assert!(err.contains("not on PATH"), "{err}");
+        #[cfg(unix)]
         assert!(resolve_program("sh").is_ok());
     }
 

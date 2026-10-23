@@ -6270,6 +6270,7 @@ mod tests {
     /// 0077: an `acp` def is built as an external child — the child's rules
     /// (dontask) and the parent's hooks under the child's actor, the program
     /// resolved on PATH, no hotl session at all.
+    #[cfg(unix)] // resolves `sh` on PATH
     #[tokio::test]
     async fn build_routes_an_acp_def_to_the_acp_child_with_child_rules_and_child_hooks() {
         use crate::spawn::ChildBuilder as _;
