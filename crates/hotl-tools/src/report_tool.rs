@@ -58,6 +58,25 @@ pub fn unverifiable_because(reason: &str, summary: &str) -> Value {
     json!({"outcome": "unverifiable", "reason": reason, "summary": summary})
 }
 
+/// The brief's "## Return" section. A native child reports through the
+/// tool; an external (ACP) one has no tool, so it ends on a fenced block.
+pub fn return_section(external: bool) -> String {
+    match external {
+        false => format!(
+            "## Return\n\nEnd by calling `report_result` exactly once with \
+             `outcome` (completed | blocked | needs_input | unverifiable), a `summary` of at most \
+             {MAX_SUMMARY_CHARS} characters, `files_touched`, `commits` and `citations` \
+             (`path:line`). Prose after that call is not read.\n"
+        ),
+        true => format!(
+            "## Return\n\nEnd your final message with one fenced ```json block containing \
+             exactly: `outcome` (completed | blocked | needs_input | unverifiable), `summary` (at \
+             most {MAX_SUMMARY_CHARS} characters), `files_touched`, `commits` and `citations` \
+             (`path:line`); add `question` with needs_input. Text after the block is not read.\n"
+        ),
+    }
+}
+
 /// What a parent tells a child that finished without reporting.
 pub const REPROMPT: &str = "Call report_result now with what you have.";
 
@@ -76,6 +95,89 @@ fn string_list(input: &Value, field: &str) -> Result<Vec<String>, String> {
                 .ok_or_else(|| format!("`{field}` must be an array of strings."))
         })
         .collect()
+}
+
+/// The checks `report_result` runs, as a value: the normalized result, or
+/// the message the tool would have returned. Shared with an external
+/// agent's fenced report (0077 D4) so both answers mean the same thing.
+pub fn validate(input: &Value) -> Result<Value, String> {
+    let Some(outcome) = input.get("outcome").and_then(Value::as_str) else {
+        return Err(format!(
+            "`outcome` is required and must be one of: {}.",
+            OUTCOMES.join(", ")
+        ));
+    };
+    if !OUTCOMES.contains(&outcome) {
+        return Err(format!(
+            "`outcome` was `{outcome}`, which is not one of: {}. Pick the one that \
+             describes what actually happened and call report_result again.",
+            OUTCOMES.join(", ")
+        ));
+    }
+    let Some(summary) = input.get("summary").and_then(Value::as_str) else {
+        return Err("`summary` is required: what you found or did.".into());
+    };
+    let len = summary.chars().count();
+    if len > MAX_SUMMARY_CHARS {
+        return Err(format!(
+            "`summary` is {len} characters against a cap of {MAX_SUMMARY_CHARS}. \
+             Cut it to the findings the caller has to act on and call report_result \
+             again — nothing was recorded."
+        ));
+    }
+    let question = input.get("question").and_then(Value::as_str);
+    if outcome == "needs_input" && question.is_none() {
+        return Err(
+            "`needs_input` needs a `question`: the one thing a human must decide. \
+             Add it and call report_result again."
+                .into(),
+        );
+    }
+    let lists = ["files_touched", "commits", "citations"]
+        .into_iter()
+        .map(|f| string_list(input, f).map(|v| (f, v)))
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut value = json!({"outcome": outcome, "summary": summary});
+    for (field, items) in lists {
+        value[field] = json!(items);
+    }
+    if let Some(q) = question {
+        value["question"] = json!(q);
+    }
+    Ok(value)
+}
+
+/// The **last** fenced ```` ```json ```` block in `text` (or, with no fence,
+/// a trailing line that is a bare `{…}` object), validated. `None` when there
+/// is no candidate at all.
+pub fn extract_fenced_report(text: &str) -> Option<Result<Value, String>> {
+    let candidate = last_json_fence(text).or_else(|| {
+        let line = text.trim_end().lines().last()?.trim();
+        (line.starts_with('{') && line.ends_with('}')).then(|| line.to_string())
+    })?;
+    Some(match serde_json::from_str::<Value>(&candidate) {
+        Ok(v) if v.is_object() => validate(&v),
+        Ok(_) => Err("the fenced block is not a JSON object.".into()),
+        Err(e) => Err(format!("the fenced block is not valid JSON: {e}.")),
+    })
+}
+
+fn last_json_fence(text: &str) -> Option<String> {
+    let mut found = None;
+    let mut open: Option<Vec<&str>> = None;
+    for line in text.lines() {
+        let t = line.trim();
+        match &mut open {
+            None if t.starts_with("```json") || t == "```JSON" => open = Some(Vec::new()),
+            Some(body) if t == "```" => {
+                found = Some(body.join("\n"));
+                open = None;
+            }
+            Some(body) => body.push(line),
+            None => {}
+        }
+    }
+    found
 }
 
 impl Tool for ReportResultTool {
@@ -145,53 +247,10 @@ impl Tool for ReportResultTool {
     }
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
-            let Some(outcome) = input.get("outcome").and_then(Value::as_str) else {
-                return ToolOutcome::err(format!(
-                    "`outcome` is required and must be one of: {}.",
-                    OUTCOMES.join(", ")
-                ));
-            };
-            if !OUTCOMES.contains(&outcome) {
-                return ToolOutcome::err(format!(
-                    "`outcome` was `{outcome}`, which is not one of: {}. Pick the one that \
-                     describes what actually happened and call report_result again.",
-                    OUTCOMES.join(", ")
-                ));
-            }
-            let Some(summary) = input.get("summary").and_then(Value::as_str) else {
-                return ToolOutcome::err("`summary` is required: what you found or did.");
-            };
-            let len = summary.chars().count();
-            if len > MAX_SUMMARY_CHARS {
-                return ToolOutcome::err(format!(
-                    "`summary` is {len} characters against a cap of {MAX_SUMMARY_CHARS}. \
-                     Cut it to the findings the caller has to act on and call report_result \
-                     again — nothing was recorded."
-                ));
-            }
-            let question = input.get("question").and_then(Value::as_str);
-            if outcome == "needs_input" && question.is_none() {
-                return ToolOutcome::err(
-                    "`needs_input` needs a `question`: the one thing a human must decide. \
-                     Add it and call report_result again.",
-                );
-            }
-            let lists = ["files_touched", "commits", "citations"]
-                .into_iter()
-                .map(|f| string_list(&input, f).map(|v| (f, v)))
-                .collect::<Result<Vec<_>, String>>();
-            let lists = match lists {
-                Ok(l) => l,
+            let value = match validate(&input) {
+                Ok(v) => v,
                 Err(e) => return ToolOutcome::err(e),
             };
-            let mut value = json!({"outcome": outcome, "summary": summary});
-            for (field, items) in lists {
-                value[field] = json!(items);
-            }
-            if let Some(q) = question {
-                value["question"] = json!(q);
-            }
-
             if let Some(parent) = self.path.parent() {
                 if let Err(e) = hotl_platform::PRIVATE_FS.create_dir_all(parent) {
                     return ToolOutcome::err(format!("Could not record the result: {e}"));
@@ -297,5 +356,78 @@ mod tests {
         assert!(t.read_only());
         assert!(matches!(t.permission(&json!({})), Permission::None));
         assert!(!t.edits_files());
+    }
+
+    /// The factored validator and the tool agree on every input, error
+    /// strings included.
+    #[tokio::test]
+    async fn validate_matches_the_tool_byte_for_byte() {
+        let cases = [
+            json!({"summary": "s"}),
+            json!({"outcome": "vibes", "summary": "s"}),
+            json!({"outcome": "completed"}),
+            json!({"outcome": "completed", "summary": "x".repeat(MAX_SUMMARY_CHARS + 1)}),
+            json!({"outcome": "needs_input", "summary": "s"}),
+            json!({"outcome": "completed", "summary": "s", "commits": "abc"}),
+            json!({"outcome": "completed", "summary": "s", "citations": [1]}),
+        ];
+        for input in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let out = tool(dir.path())
+                .run(input.clone(), CancellationToken::new())
+                .await;
+            assert!(out.is_error);
+            assert_eq!(validate(&input).unwrap_err(), out.content, "{input}");
+        }
+        let ok = json!({"outcome": "needs_input", "summary": "s", "question": "q?", "files_touched": ["a"]});
+        let dir = tempfile::tempdir().unwrap();
+        let out = tool(dir.path())
+            .run(ok.clone(), CancellationToken::new())
+            .await;
+        assert!(!out.is_error);
+        assert_eq!(
+            read_response(&dir.path().join(RESPONSE_FILE)).unwrap(),
+            validate(&ok).unwrap()
+        );
+    }
+
+    #[test]
+    fn the_last_fenced_json_block_wins() {
+        let text = "first:\n```json\n{\"outcome\": \"blocked\", \"summary\": \"old\"}\n```\nthen:\n```json\n{\"outcome\": \"completed\", \"summary\": \"new\", \"citations\": [\"a.rs:1\"]}\n```\ntrailing prose";
+        let v = extract_fenced_report(text).unwrap().unwrap();
+        assert_eq!(v["summary"], "new");
+        assert_eq!(v["commits"], json!([]));
+        assert!(extract_fenced_report("no report here").is_none());
+    }
+
+    #[test]
+    fn an_unfenced_trailing_object_is_accepted() {
+        let text = "done.\n{\"outcome\": \"completed\", \"summary\": \"ok\"}\n";
+        let v = extract_fenced_report(text).unwrap().unwrap();
+        assert_eq!(v["outcome"], "completed");
+    }
+
+    #[test]
+    fn an_invalid_block_reports_the_validation_error() {
+        let text = "```json\n{\"outcome\": \"vibes\", \"summary\": \"s\"}\n```";
+        let err = extract_fenced_report(text).unwrap().unwrap_err();
+        assert_eq!(
+            err,
+            validate(&json!({"outcome": "vibes", "summary": "s"})).unwrap_err()
+        );
+        let err = extract_fenced_report("```json\n{not json\n```")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains("not valid JSON"), "{err}");
+    }
+
+    #[test]
+    fn the_return_sections_differ_only_in_how_to_return() {
+        assert!(return_section(false).contains("`report_result`"));
+        let ext = return_section(true);
+        assert!(
+            ext.contains("```json") && !ext.contains("report_result"),
+            "{ext}"
+        );
     }
 }

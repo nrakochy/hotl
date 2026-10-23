@@ -542,11 +542,20 @@ impl SpawnTool {
         // inline copy is what makes the first turn actionable without one.
         let child_ulid = hotl_types::new_ulid();
         let scratch = self.spawn_dir.join(&child_ulid);
-        let brief = match write_task_md(&scratch, task, self.plan.as_ref().and_then(|p| p())) {
+        let external = def.backend == hotl_tools::agents::Backend::Acp;
+        let brief = match write_task_md(
+            &scratch,
+            task,
+            self.plan.as_ref().and_then(|p| p()),
+            external,
+        ) {
             Ok(path) => format!(
-                "Your brief is in {}. Read it before doing anything else; end by calling \
-                 report_result.\n\n{task}",
-                path.display()
+                "Your brief is in {}. Read it before doing anything else; {}.\n\n{task}",
+                path.display(),
+                match external {
+                    true => "end your final message with the fenced ```json result it describes",
+                    false => "end by calling report_result",
+                }
             ),
             // A scratch dir we cannot write is not worth failing a subtask
             // over — the child still gets the brief, just not the file.
@@ -1341,6 +1350,7 @@ fn write_task_md(
     scratch: &Path,
     brief: &str,
     plan: Option<hotl_engine::plan_state::PlanState>,
+    external: bool,
 ) -> std::io::Result<PathBuf> {
     use hotl_platform::PrivateFs;
     use std::io::Write;
@@ -1359,14 +1369,7 @@ fn write_task_md(
             md.replacen("# Plan\n", "## Plan\n", 1)
         )?;
     }
-    write!(
-        f,
-        "\n## Return\n\nEnd by calling `report_result` exactly once with \
-         `outcome` (completed | blocked | needs_input | unverifiable), a `summary` of at most \
-         {} characters, `files_touched`, `commits` and `citations` (`path:line`). Prose after \
-         that call is not read.\n",
-        hotl_tools::report_tool::MAX_SUMMARY_CHARS
-    )?;
+    write!(f, "\n{}", hotl_tools::report_tool::return_section(external))?;
     Ok(path)
 }
 
@@ -2189,6 +2192,25 @@ pub(crate) mod tests {
             "report_result",
             json!({"outcome": outcome, "summary": summary, "citations": ["a.rs:1"]}),
         )
+    }
+
+    #[test]
+    fn task_md_for_an_external_def_asks_for_a_fenced_block_not_report_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = std::fs::read_to_string(
+            write_task_md(&dir.path().join("e"), "do it", None, true).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            ext.contains("```json") && !ext.contains("report_result"),
+            "{ext}"
+        );
+        let native = std::fs::read_to_string(
+            write_task_md(&dir.path().join("n"), "do it", None, false).unwrap(),
+        )
+        .unwrap();
+        assert!(native.contains("`report_result` exactly once"), "{native}");
+        assert!(!native.contains("```json"));
     }
 
     /// The brief goes to disk *and* inline, and the child is told where the
