@@ -266,6 +266,8 @@ pub enum TranscriptItem {
     WorkflowsReport(Vec<WorkflowRun>),
     /// `/jobs` (0064): this session's background jobs, one row each.
     JobsReport(Vec<JobRow>),
+    /// `/agents` (0072): this session's sub-agents, one row each.
+    ChildrenReport(Vec<ChildRow>),
     /// A plan the model handed over (`present_plan`, 0056 T3). Its own item
     /// rather than a `Notice`: it carries the two answers, and a plan the
     /// human is meant to act on must not read as muted chatter.
@@ -309,6 +311,20 @@ pub struct PlanStep {
 }
 
 /// One `workflow` run as `/workflows` shows it.
+/// One `/agents` row (0072), parsed from the `children_report` payload.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChildRow {
+    pub id: String,
+    pub agent_type: String,
+    /// `running` | `done` | `closed`, verbatim from the wire.
+    pub state: String,
+    /// How a done child ended.
+    pub ok: Option<bool>,
+    pub secs: u64,
+    pub summary: String,
+    pub background: bool,
+}
+
 /// One `/jobs` row (0064), parsed from the `jobs_report` payload.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct JobRow {
@@ -350,6 +366,14 @@ pub const CHILD_TEXT_CAP: usize = 4000;
 /// shows. Three sites test this; one helper keeps them agreeing.
 pub fn is_agent_card(name: &str) -> bool {
     matches!(name, "spawn" | "workflow")
+}
+
+/// A card with a sub-agent still working under it (0072 D12): a background
+/// spawn's own call settled the moment it started, but its `agent` row stays
+/// open until the child's done frame — the band keeps the row and the marker
+/// keeps walking until then.
+pub fn has_live_child(children: &[ChildCall]) -> bool {
+    children.iter().any(|c| c.name == "agent" && c.ok.is_none())
 }
 
 /// A `/context` answer, ready to render. Everything a row needs is here; the
@@ -811,8 +835,8 @@ impl State {
     }
 
     /// The agent band's spawn rows (0043 D1), transcript order: running while
-    /// the turn is live, plus the shown and the highlighted spawn, pinned
-    /// until left.
+    /// the turn is live, a background child still working (0072 D12), plus
+    /// the shown and the highlighted spawn, pinned until left.
     pub fn band_spawns(&self) -> Vec<&TranscriptItem> {
         let live = self.phase != Phase::Idle;
         let pinned = |id: &str| {
@@ -822,9 +846,10 @@ impl State {
         self.transcript
             .iter()
             .filter(|i| {
-                matches!(i, TranscriptItem::Tool { id, name, status, .. }
+                matches!(i, TranscriptItem::Tool { id, name, status, children, .. }
                     if is_agent_card(name)
                         && ((live && matches!(status, ToolStatus::Running | ToolStatus::AutoAllowed { .. }))
+                            || has_live_child(children)
                             || pinned(id)))
             })
             .collect()
@@ -1036,6 +1061,12 @@ pub enum Cmd {
     /// Send `session/jobs/stop` for one job id (0064); the `job_done` frame
     /// is the outcome.
     StopJob(String),
+    /// Send `session/children` (0072); the report comes back as
+    /// `children_report`.
+    RequestChildren,
+    /// Send `session/children/stop` for one sub-agent id (0072); its `agent`
+    /// done frame is the outcome.
+    StopChild(String),
     /// Re-read the client-side half of `config.toml` — theme, density, vim
     /// mode, mouse. The runtime owns this one: `hotl-tui` never touches the
     /// filesystem.
@@ -1139,6 +1170,8 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                         | "job_started"
                         | "job_done"
                         | "jobs_report"
+                        // A background sub-agent too (0072 D6).
+                        | "children_report"
                         // A plan presented while detached must be on screen
                         // when you come back: it is waiting on you.
                         | "plan_presented"
@@ -1617,14 +1650,20 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         // phase.
         "child_tool" => {
             let parent_id = text_of("parent_id");
+            let mut finished: Option<(String, String, bool)> = None;
             if let Some(TranscriptItem::Tool {
-                ticks, children, ..
+                ticks,
+                children,
+                status,
+                ..
             }) = state
                 .transcript
                 .iter_mut()
                 .rev()
                 .find(|i| matches!(i, TranscriptItem::Tool { id, .. } if *id == parent_id))
             {
+                let card_running =
+                    matches!(status, ToolStatus::Running | ToolStatus::AutoAllowed { .. });
                 let id = text_of("id");
                 match v.get("ok").and_then(Value::as_bool) {
                     None => children.push(ChildCall {
@@ -1646,6 +1685,12 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                             c.ok = Some(ok);
                             c.settled_at = Some(*ticks);
                             c.tokens = tokens;
+                            // A background child's end (0072 D12): its card
+                            // settled long ago, so the row leaving the band
+                            // is not enough — say so.
+                            if c.name == "agent" && !card_running {
+                                finished = Some((id.clone(), c.summary.clone(), ok));
+                            }
                         } else {
                             // Settled in one frame — a denied child never
                             // got a start.
@@ -1661,6 +1706,15 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                         }
                     }
                 }
+            }
+            if let Some((id, summary, ok)) = finished {
+                notice(
+                    state,
+                    format!(
+                        "sub-agent {id} finished · {} · {summary}",
+                        if ok { "completed" } else { "failed" }
+                    ),
+                );
             }
         }
         // A child's own words (0058 T2): appended to its spawn card's tail
@@ -2058,6 +2112,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             );
         }
         "jobs_report" => push_jobs_report(state, v),
+        "children_report" => push_children_report(state, v),
         // 0056 T3. Only one plan is ever live: a second `present_plan`
         // supersedes the first, so the old card loses its keys.
         "plan_presented" => {
@@ -2238,6 +2293,39 @@ pub fn fmt_secs(secs: u64) -> String {
     } else {
         format!("{secs}s")
     }
+}
+
+/// Turn a `children_report` payload into a `TranscriptItem::ChildrenReport`
+/// (0072).
+fn push_children_report(state: &mut State, v: &Value) {
+    let Some(children) = v.get("children").and_then(Value::as_array) else {
+        notice(
+            state,
+            "could not read the sub-agent report the engine sent".into(),
+        );
+        return;
+    };
+    if children.is_empty() {
+        notice(state, "no sub-agents in this session".into());
+        return;
+    }
+    let str_of = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("?").to_string();
+    let rows = children
+        .iter()
+        .map(|c| ChildRow {
+            id: str_of(c, "id"),
+            agent_type: str_of(c, "agent_type"),
+            state: str_of(c, "state"),
+            ok: c.get("ok").and_then(Value::as_bool),
+            secs: c.get("secs").and_then(Value::as_u64).unwrap_or(0),
+            summary: str_of(c, "summary"),
+            background: c
+                .get("background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+        .collect();
+    state.transcript.push(TranscriptItem::ChildrenReport(rows));
 }
 
 /// Turn a `jobs_report` payload into a `TranscriptItem::JobsReport` (0064).
@@ -3331,6 +3419,17 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
         // Every run of the `workflow` tool this process has started, with
         // per-phase progress — read-only, safe mid-turn like `/context`.
         "workflows" => vec![Cmd::RequestWorkflows],
+        // `/agents` lists, `/agents stop <id>` interrupts (0072 D12).
+        "agents" => match arg.trim().split_once(char::is_whitespace) {
+            None if arg.trim().is_empty() => vec![Cmd::RequestChildren],
+            Some(("stop", id)) if !id.trim().is_empty() => {
+                vec![Cmd::StopChild(id.trim().into())]
+            }
+            _ => {
+                notice(state, "usage: /agents | /agents stop <id>".into());
+                Vec::new()
+            }
+        },
         // `/jobs` lists, `/jobs stop <id>` kills (0064 D10).
         "jobs" => match arg.trim().split_once(char::is_whitespace) {
             None if arg.trim().is_empty() => vec![Cmd::RequestJobs],
@@ -3736,10 +3835,11 @@ fn on_tick(state: &mut State) {
     // The animation's whole-turn clock advances only while the turn is moving —
     // the same phases that animate. A blocked prompt pauses the cycle where it
     // stood; a fresh turn restarts it from 0 (reset on entry to `Idle`).
-    if matches!(
+    let working = matches!(
         state.phase,
         Phase::Sampling { .. } | Phase::Streaming { .. } | Phase::Tool { .. }
-    ) {
+    );
+    if working {
         state.work_ticks += 1;
         // Silence only counts while a turn is running: waiting on you is not
         // the engine being quiet.
@@ -3747,19 +3847,30 @@ fn on_tick(state: &mut State) {
         if let Some(retry) = &mut state.retry {
             retry.ticks += 1;
         }
-        // EVERY running card ticks (0037), not just the newest: a sibling's
-        // tool_done keeps the phase in `Tool` on the oldest card's clock
-        // (0049 T1b); running cards tick regardless. Bounded to this turn:
-        // running cards cannot predate the last prompt.
-        for item in state.transcript.iter_mut().rev() {
-            if matches!(item, TranscriptItem::User { .. }) {
-                break;
-            }
-            if let TranscriptItem::Tool {
-                ticks,
-                status: ToolStatus::Running | ToolStatus::AutoAllowed { .. },
-                ..
-            } = item
+    }
+    // EVERY running card ticks (0037), not just the newest: a sibling's
+    // tool_done keeps the phase in `Tool` on the oldest card's clock (0049
+    // T1b); running cards tick regardless. Bounded to this turn: running
+    // cards cannot predate the last prompt. A background child's card can
+    // (0072 D12) — it ticks while its `agent` row is open, idle or not, from
+    // wherever it sits.
+    let mut this_turn = true;
+    for item in state.transcript.iter_mut().rev() {
+        if matches!(item, TranscriptItem::User { .. }) {
+            this_turn = false;
+            continue;
+        }
+        if let TranscriptItem::Tool {
+            ticks,
+            status,
+            name,
+            children,
+            ..
+        } = item
+        {
+            let running = matches!(status, ToolStatus::Running | ToolStatus::AutoAllowed { .. });
+            if (working && this_turn && running)
+                || (is_agent_card(name) && has_live_child(children))
             {
                 *ticks += 1;
             }
@@ -7380,8 +7491,8 @@ mod tests {
     fn typing_a_slash_opens_the_popup_and_narrows_as_you_type() {
         let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/");
-        // Nineteen built-ins plus the one skill.
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(20));
+        // Twenty built-ins plus the one skill.
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(21));
         type_str(&mut s, "re");
         assert_eq!(selected(&s), "reload");
         // `reload`, `rename`, `review` and `remember` prefix-match, then the
@@ -9539,5 +9650,253 @@ mod tests {
         drag_to(&mut s, 9, 3);
         update(&mut s, Msg::Copied { lines: 3 });
         assert_eq!(s.copy_notice, Some(3));
+    }
+
+    // ---- 0072 T7: background sub-agents in the band, `/agents` ----
+
+    fn agent_start(s: &mut State, parent: &str, child: &str) {
+        upd(
+            s,
+            json!({"type":"child_tool","parent_id":parent,"id":child,"name":"agent","summary":"explore · look","phase":"start"}),
+        );
+    }
+
+    fn agent_done(s: &mut State, parent: &str, child: &str, ok: bool) {
+        upd(
+            s,
+            json!({"type":"child_tool","parent_id":parent,"id":child,"name":"agent","summary":"explore · look","phase":"done","ok":ok,"tokens":345}),
+        );
+    }
+
+    /// 0072 D12: a background spawn's card settles the moment the child
+    /// starts, but its `agent` row is open — the band keeps it, idle or not.
+    #[test]
+    fn a_background_spawn_card_stays_in_the_band_after_its_tool_done() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        agent_start(&mut s, "s1", "a1b2c3");
+        settle(&mut s, "s1");
+        assert_eq!(band_ids(&s), vec!["s1"], "settled, but its child works");
+        s.phase = Phase::Idle;
+        assert_eq!(band_ids(&s), vec!["s1"], "across idle too");
+    }
+
+    #[test]
+    fn the_card_leaves_the_band_on_the_agent_done_frame() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        agent_start(&mut s, "s1", "a1b2c3");
+        settle(&mut s, "s1");
+        s.phase = Phase::Idle;
+        assert_eq!(band_ids(&s), vec!["s1"]);
+        agent_done(&mut s, "s1", "a1b2c3", true);
+        assert!(
+            band_ids(&s).is_empty(),
+            "the done frame is the end of the row"
+        );
+    }
+
+    /// The foreground shape is untouched: start, agent start, agent done,
+    /// then the card settles and leaves at idle as before.
+    #[test]
+    fn a_foreground_card_still_leaves_at_idle() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        agent_start(&mut s, "s1", "a1b2c3");
+        agent_done(&mut s, "s1", "a1b2c3", true);
+        assert_eq!(band_ids(&s), vec!["s1"], "its own call still runs");
+        settle(&mut s, "s1");
+        assert!(band_ids(&s).is_empty());
+        assert!(
+            !last_notice_opt(&s).is_some_and(|n| n.contains("sub-agent")),
+            "a foreground finish is the card's own result, not a notice"
+        );
+    }
+
+    #[test]
+    fn band_tidy_keeps_a_cursor_on_a_background_row_across_turn_end() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        agent_start(&mut s, "s1", "a1b2c3");
+        settle(&mut s, "s1");
+        press(&mut s, KeyCode::Esc); // Insert → Normal
+        press(&mut s, KeyCode::Down);
+        assert_eq!(s.band_cursor, Some(BandRow::Spawn("s1".into())));
+        update(
+            &mut s,
+            Msg::PromptResult {
+                outcome_kind: "end_turn".into(),
+                outcome_text: None,
+                usage: json!({}),
+                finished_at: None,
+            },
+        );
+        assert_eq!(s.phase, Phase::Idle);
+        assert_eq!(
+            s.band_cursor,
+            Some(BandRow::Spawn("s1".into())),
+            "the row is still there, so is the cursor"
+        );
+        agent_done(&mut s, "s1", "a1b2c3", true);
+        assert_eq!(band_ids(&s), vec!["s1"], "pinned by the cursor (0043 D1)");
+        press(&mut s, KeyCode::Up);
+        assert!(band_ids(&s).is_empty());
+        assert_eq!(s.band_cursor, None);
+    }
+
+    /// A background child's tools and prose keep landing on its card while
+    /// the parent is idle — the drill-in is live for as long as the child is.
+    #[test]
+    fn the_drill_in_of_a_background_child_keeps_streaming_while_idle() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        agent_start(&mut s, "s1", "a1b2c3");
+        settle(&mut s, "s1");
+        update(
+            &mut s,
+            Msg::PromptResult {
+                outcome_kind: "end_turn".into(),
+                outcome_text: None,
+                usage: json!({}),
+                finished_at: None,
+            },
+        );
+        assert_eq!(s.phase, Phase::Idle);
+        upd(
+            &mut s,
+            json!({"type":"child_tool","parent_id":"s1","id":"c1","name":"read","summary":"read a.rs","phase":"start"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"child_text","parent_id":"s1","text":"still reading"}),
+        );
+        let ticks_before = card_ticks(&s, "s1");
+        update(&mut s, Msg::Tick);
+        let Some(TranscriptItem::Tool {
+            children,
+            child_text,
+            ticks,
+            ..
+        }) = s
+            .transcript
+            .iter()
+            .find(|i| matches!(i, TranscriptItem::Tool { id, .. } if id == "s1"))
+        else {
+            panic!()
+        };
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[1].name, "read");
+        assert_eq!(child_text, "still reading");
+        assert_eq!(*ticks, ticks_before + 1, "a live card ticks while idle");
+        assert_eq!(s.phase, Phase::Idle, "none of it moved the parent's phase");
+    }
+
+    fn card_ticks(s: &State, want: &str) -> u64 {
+        s.transcript
+            .iter()
+            .find_map(|i| match i {
+                TranscriptItem::Tool { id, ticks, .. } if id == want => Some(*ticks),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn last_notice_opt(s: &State) -> Option<String> {
+        s.transcript.iter().rev().find_map(|i| match i {
+            TranscriptItem::Notice { text } => Some(text.to_string()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn slash_agents_requests_the_report_and_stop_sends_the_id() {
+        let mut s = State::test_default();
+        assert_eq!(
+            type_and_submit(&mut s, "/agents"),
+            vec![Cmd::RequestChildren]
+        );
+        assert_eq!(
+            type_and_submit(&mut s, "/agents stop a1b2c3"),
+            vec![Cmd::StopChild("a1b2c3".into())]
+        );
+        assert!(type_and_submit(&mut s, "/agents frob").is_empty());
+        assert!(
+            last_notice(&s).contains("usage: /agents"),
+            "{}",
+            last_notice(&s)
+        );
+        assert!(type_and_submit(&mut s, "/agents stop").is_empty());
+        assert!(
+            crate::complete::builtins()
+                .iter()
+                .any(|c| c.name == "agents"),
+            "the builtin is in the popup"
+        );
+    }
+
+    #[test]
+    fn a_children_report_renders_one_row_per_child_and_malformed_or_empty_ones_notice() {
+        let mut s = State::test_default();
+        upd(
+            &mut s,
+            json!({"type": "children_report", "children": [
+                {"id": "a1b2c3", "call_id": "t1", "agent_type": "explore", "summary": "find every place", "started_ms": 1, "background": true, "isolated": false, "state": "running", "ok": null, "secs": 130},
+                {"id": "d4e5f6", "call_id": "t2", "agent_type": "general-purpose", "summary": "fix it", "started_ms": 1, "background": false, "isolated": true, "state": "done", "ok": false, "secs": 7}
+            ]}),
+        );
+        let Some(TranscriptItem::ChildrenReport(rows)) = s.transcript.last() else {
+            panic!("{:?}", s.transcript.last());
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            ChildRow {
+                id: "a1b2c3".into(),
+                agent_type: "explore".into(),
+                state: "running".into(),
+                ok: None,
+                secs: 130,
+                summary: "find every place".into(),
+                background: true,
+            }
+        );
+        assert_eq!(rows[1].ok, Some(false));
+        assert!(!rows[1].background);
+        upd(&mut s, json!({"type": "children_report", "children": []}));
+        assert_eq!(last_notice(&s), "no sub-agents in this session");
+        upd(&mut s, json!({"type": "children_report"}));
+        assert!(
+            last_notice(&s).contains("could not read"),
+            "{}",
+            last_notice(&s)
+        );
+    }
+
+    #[test]
+    fn a_background_finish_pushes_a_notice() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        agent_start(&mut s, "s1", "a1b2c3");
+        settle(&mut s, "s1");
+        s.phase = Phase::Idle;
+        agent_done(&mut s, "s1", "a1b2c3", true);
+        assert_eq!(
+            last_notice(&s),
+            "sub-agent a1b2c3 finished · completed · explore · look"
+        );
+        start_spawn(&mut s, "s2");
+        agent_start(&mut s, "s2", "d4e5f6");
+        settle(&mut s, "s2");
+        agent_done(&mut s, "s2", "d4e5f6", false);
+        assert_eq!(
+            last_notice(&s),
+            "sub-agent d4e5f6 finished · failed · explore · look"
+        );
     }
 }

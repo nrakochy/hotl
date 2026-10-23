@@ -314,6 +314,7 @@ fn item_fingerprint(item: &TranscriptItem, thinking_expanded: bool, band_keys: b
         TranscriptItem::Error { text } => (7u8, text_key(text)).hash(&mut h),
         TranscriptItem::WorkflowsReport(runs) => (8u8, runs).hash(&mut h),
         TranscriptItem::JobsReport(rows) => (10u8, rows).hash(&mut h),
+        TranscriptItem::ChildrenReport(rows) => (12u8, rows).hash(&mut h),
         TranscriptItem::Plan(plan) => (9u8, plan).hash(&mut h),
         TranscriptItem::TurnSummary {
             secs,
@@ -705,6 +706,7 @@ fn speaker(item: &TranscriptItem) -> Speaker {
         | TranscriptItem::Report(_)
         | TranscriptItem::WorkflowsReport(_)
         | TranscriptItem::JobsReport(_)
+        | TranscriptItem::ChildrenReport(_)
         | TranscriptItem::TurnSummary { .. }
         | TranscriptItem::Plan(_) => Speaker::Harness,
     }
@@ -1147,8 +1149,14 @@ fn item_block<'a>(
             child_text: _,
             progress,
         } => {
-            let running = matches!(status, ToolStatus::Running | ToolStatus::AutoAllowed { .. });
-            let (marker, color) = status_glyph(status, *ticks, p);
+            // An agent card with a background child still working reads as
+            // running (0072 D12): the wanderer walks and the row names the
+            // child, though its own call settled when the child started.
+            let agent = crate::app::is_agent_card(name);
+            let live = agent && crate::app::has_live_child(children);
+            let running =
+                live || matches!(status, ToolStatus::Running | ToolStatus::AutoAllowed { .. });
+            let (marker, color) = card_glyph(name, status, children, *ticks, p);
             let (body, mut details) = split_summary(name, summary);
             // The `cd` prefix is identical on every call in a session and eats
             // the summary; the directory it lands in is the informative part.
@@ -1174,7 +1182,6 @@ fn item_block<'a>(
             // title row, and everything about the delegation drops to a
             // second row under a bar. Every other card stays one line plus
             // its result row.
-            let agent = crate::app::is_agent_card(name);
             if !agent {
                 // Elapsed rides the header only while the tool is still
                 // running; a settled card moves it to the result row (T3).
@@ -1327,6 +1334,17 @@ fn item_block<'a>(
                 cont_style: Style::new().fg(p.muted),
             },
             full(workflow_lines(runs, p)),
+        ),
+        // An `/agents` report (0072): one row per sub-agent.
+        TranscriptItem::ChildrenReport(rows) => (
+            Spine {
+                indent: 0,
+                marker: "·",
+                cont: "·",
+                marker_style: Style::new().fg(p.muted),
+                cont_style: Style::new().fg(p.muted),
+            },
+            full(child_lines(rows, p)),
         ),
         // A `/jobs` report (0064): one row per job.
         TranscriptItem::JobsReport(rows) => (
@@ -1524,6 +1542,43 @@ fn plan_lines<'a>(plan: &crate::app::PresentedPlan, p: &Palette) -> Vec<Line<'a>
             "a approve · r revise (or just say what to change)",
             Style::new().fg(p.accent).bold(),
         ));
+    }
+    out
+}
+
+/// `a1b2c3 · explore · running · 2m10s · find every place …`, one row per
+/// sub-agent (0072).
+fn child_lines<'a>(rows: &[crate::app::ChildRow], p: &Palette) -> Vec<Line<'a>> {
+    let mut out = vec![Line::styled(
+        format!(
+            "Sub-agents — {} child{}",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "ren" }
+        ),
+        Style::new().fg(p.ink).bold(),
+    )];
+    for r in rows {
+        let (state, color) = match (r.state.as_str(), r.ok) {
+            ("running", _) => ("running".to_string(), p.active),
+            ("done", Some(true)) => ("completed".to_string(), p.idle),
+            ("done", Some(false)) => ("failed".to_string(), p.blocked),
+            ("closed", _) => ("closed".to_string(), p.faint),
+            _ => (r.state.clone(), p.muted),
+        };
+        let background = if r.background { "" } else { " · foreground" };
+        out.push(Line::from(vec![
+            Span::styled(r.id.clone(), Style::new().fg(p.ink).bold()),
+            Span::styled(format!(" · {}", r.agent_type), Style::new().fg(p.muted)),
+            Span::styled(format!(" · {state}"), Style::new().fg(color)),
+            Span::styled(
+                format!(
+                    " · {}{background} · {}",
+                    crate::app::fmt_secs(r.secs),
+                    r.summary
+                ),
+                Style::new().fg(p.muted),
+            ),
+        ]));
     }
     out
 }
@@ -2065,6 +2120,21 @@ fn status_glyph(status: &ToolStatus, ticks: u64, p: &Palette) -> (&'static str, 
     }
 }
 
+/// [`status_glyph`], except that an agent card with a background child still
+/// working wears the wanderer (0072 D12) whatever its own status says.
+fn card_glyph(
+    name: &str,
+    status: &ToolStatus,
+    children: &[crate::app::ChildCall],
+    ticks: u64,
+    p: &Palette,
+) -> (&'static str, Color) {
+    if crate::app::is_agent_card(name) && crate::app::has_live_child(children) {
+        return (WORKING_FRAMES[marker_frame(ticks)], p.active);
+    }
+    status_glyph(status, ticks, p)
+}
+
 /// The spawn card `selected_agent` names, when it still exists — a dangling
 /// id renders the main transcript instead.
 fn selected_spawn(state: &State) -> Option<&TranscriptItem> {
@@ -2129,6 +2199,7 @@ fn render_selector(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     let end = (start + SELECTOR_MAX_SPAWNS).min(spawns.len());
     for (i, item) in spawns.iter().enumerate().take(end).skip(start) {
         let TranscriptItem::Tool {
+            name,
             summary,
             status,
             ticks,
@@ -2139,7 +2210,7 @@ fn render_selector(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
             continue;
         };
         let on = sel_idx == i + 1;
-        let (glyph, _) = status_glyph(status, *ticks, p);
+        let (glyph, _) = card_glyph(name, status, children, *ticks, p);
         let mut text = format!(
             "{} {glyph} {summary} · {}s",
             if on { "●" } else { "○" },
@@ -5565,6 +5636,35 @@ mod tests {
             !text(&settled, true).contains("↑↓ agents"),
             "a finished agent is not somewhere to go"
         );
+        // 0072 D12: a settled card whose background child still works is.
+        let mut background = spawn_with_children(ToolStatus::Done, 1);
+        if let TranscriptItem::Tool { children, .. } = &mut background {
+            children.push(crate::app::ChildCall {
+                id: "a1b2c3".into(),
+                name: "agent".into(),
+                summary: "explore · look".into(),
+                ok: None,
+                started_at: 0,
+                settled_at: None,
+                tokens: None,
+            });
+        }
+        assert!(text(&background, true).contains("↑↓ agents"));
+        let (glyph, color) = match &background {
+            TranscriptItem::Tool {
+                name,
+                status,
+                children,
+                ticks,
+                ..
+            } => card_glyph(name, status, children, *ticks, &p),
+            _ => unreachable!(),
+        };
+        assert!(
+            WORKING_FRAMES.contains(&glyph),
+            "the wanderer walks: {glyph}"
+        );
+        assert_eq!(color, p.active);
     }
 
     /// A spawn's `tool_done` carries counts like any other tool, but a line
@@ -6936,6 +7036,36 @@ mod tests {
                 9 => s.selected_agent = Some("nonexistent".into()),
                 11 => s.selected_agent = None,
                 _ => {}
+            }
+            // 0072 D12: the agent card settles while its `agent` row stays
+            // open (a background child), then the row settles — the card
+            // reads as live in between, and the cache must follow both edges.
+            if matches!(step, 27 | 33) {
+                if let Some(TranscriptItem::Tool {
+                    status, children, ..
+                }) = s
+                    .transcript
+                    .iter_mut()
+                    .find(|i| matches!(i, TranscriptItem::Tool { id, .. } if id == "s1"))
+                {
+                    if step == 27 {
+                        *status = ToolStatus::Done;
+                        children.push(crate::app::ChildCall {
+                            id: "a1b2c3".into(),
+                            name: "agent".into(),
+                            summary: "explore · look".into(),
+                            ok: None,
+                            started_at: step,
+                            settled_at: None,
+                            tokens: None,
+                        });
+                    } else {
+                        let c = children.last_mut().unwrap();
+                        c.ok = Some(true);
+                        c.settled_at = Some(step);
+                        c.tokens = Some(345);
+                    }
+                }
             }
             if step == 7 {
                 if let Some(TranscriptItem::Tool { status, .. }) = s

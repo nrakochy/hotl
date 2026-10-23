@@ -518,6 +518,14 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
                 .request("session/jobs/stop", json!({"job": job}))
                 .await?;
         }
+        Cmd::RequestChildren => {
+            client.request("session/children", json!({})).await?;
+        }
+        Cmd::StopChild(child) => {
+            client
+                .request("session/children/stop", json!({"child": child}))
+                .await?;
+        }
         Cmd::ReplyPermission {
             req_id,
             allow,
