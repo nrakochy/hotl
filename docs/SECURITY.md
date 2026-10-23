@@ -267,6 +267,8 @@ Everything that flows into the model's context from a source other than the user
 
 **Trust store — first-use screen.** The first call to a server raises a *protected* ask (never auto-allowable): server name, binary path, SHA-256 of the binary, and what approval means ("this program will run on your machine and its output will enter the model's context"). Approval is recorded in `~/.config/hotl/trust.toml` keyed by server name → binary hash; a changed hash re-raises the screen. An unreadable binary is recorded honestly as having no integrity check; a failed trust-store write keeps the grant in memory only and re-asks next session. Server binaries run **outside** the bash sandbox floor — they are user-installed programs, not model-directed commands; installing one is the trust decision.
 
+**Remote servers (Streamable HTTP).** A `[[mcp]]` entry with a `url` has no binary to hash, so its trust key is `(url, headers-hash, bearer env name)` under its own `fpu1:` key space — a URL server can never match a program's grant, and the origin shown on the screen *is* the decision ("hotl will send tool calls to https://… with a token from $VAR"). The token is read by name from the environment at connect time and lives only in the adapter task: never in config, the trust file, a log, an error or the screen; a server echoing it back has it scrubbed from the error. The connector makes `web_fetch`'s two egress checks in-process before any socket (`host_allowed`, then the session ask for a denied host), refuses every redirect, accepts plain `http://` for loopback only, refuses literal private and metadata addresses at load, and drops the server's `initialize` `instructions` at the transport so third-party text never reaches the system prompt. Tool listings and results pass the sanitizer exactly as for a program.
+
 **`hotl mcp` cannot grant.** The inspection command is read-mostly by construction, and both limits are load-bearing rather than incidental:
 
 | Capability | Where it lives | Why |
@@ -346,7 +348,7 @@ Installs owned by a package manager (cargo, Nix, Homebrew) and source builds are
 ## Known gaps (planned, not shipped)
 
 - **`egress = "off"` has no ask, and will not get one.** The confinement is at the kernel, with no proxy in the path to intercept a connection, so there is nothing to ask about. Documented as a limitation, not deferred as debt. (The `allowlist` ask shipped in 0.10 — see "Network egress" above.)
-- **The egress ask does not cover MCP servers.** They are spawned outside the floor, so the proxy never sees their traffic. Same non-goal as the read carve's.
+- **The egress ask does not cover stdio MCP servers.** They are spawned outside the floor, so the proxy never sees their traffic. Same non-goal as the read carve's. URL servers are covered: their connector makes the same checks `web_fetch` does, in-process.
 - **The prompt cannot make a grant permanent.** By design (a durable grant reachable by one keypress inverts the threat model), but if the paste-a-line flow proves annoying in practice this is the thing to revisit.
 - **Egress restriction is still opt-in.** The remaining blocker to flipping the default is evidence, not machinery; the gate is recorded in OPEN.md.
 - **The read carve does not reach in-tree secrets.** `.env` and `config/secrets.yml` inside the working directory stay readable to `bash`, and cannot be carved without breaking the agent's actual job. This is a deliberate non-goal, not a deferral — with egress open by default, the approval prompt remains the exfiltration boundary for them.

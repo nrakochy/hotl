@@ -8,6 +8,16 @@ semver promise of their own.
 
 ### Added
 
+- **Remote MCP servers over HTTP.** A `[[mcp]]` entry may name a `url`
+  instead of a program, with a bearer token read from an environment
+  variable you name (`bearer_token_env`) — never from the config file. The
+  first use shows the server's address and header names, and changing either
+  asks again. Remote servers obey `[network] egress` like `web_fetch` does,
+  follow no redirects, and what a server says about itself never reaches the
+  prompt. Plugins may declare `streamable-http` servers. `hotl mcp add <name>
+  --url …`, `hotl mcp list/show/test` and `hotl doctor` understand them. An
+  invalid `[[mcp]]` entry now warns by name instead of silently loading
+  nothing. OAuth login is not in this release.
 - **`/remember <note>` keeps a note for future sessions.** Off unless
   `[memory] mode = "read-write"`; every write is confirmed with the same y/n a
   tool ask uses, appended as one dated line to a per-project `MEMORY.md` in

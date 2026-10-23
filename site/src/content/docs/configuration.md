@@ -237,7 +237,7 @@ These are fixed for the life of the process; restart to change them:
 | `memory/MEMORY.md` | Per user, hand-written; loaded into every session's starting context (capped at 16 KB), enveloped. The per-project file `/remember` writes lives in the data dir — see [Memory](#memory-memory). |
 | `skills/*.md` | One procedure per file; the `skill` tool lists and loads them by name. See [skills.md](../skills/). |
 | `agents/*.md` | One sub-agent definition per file — `tools`/`model`/`effort`/`isolation` frontmatter, body = system prompt. See [agents.md](../agents/). |
-| `trust.toml` | Written by hotl, not you: approved MCP server binary hashes. |
+| `trust.toml` | Written by hotl, not you: approved MCP server fingerprints — `fp3:` for a program (binary hash, args, env, cwd), `fpu1:` for a URL server (address, headers, the token's variable name). |
 
 ### Skills (`[skills]`)
 
@@ -393,7 +393,18 @@ to run anything. They still deny in-process.
 
 ### MCP servers (`[[mcp]]`)
 
-Declare external tool servers. Each is exposed to the model through one `mcp` tool; the **first** use of a server prompts you to approve its binary (shown with its SHA-256), and a changed binary re-prompts. Server output is sanitized before it reaches the model. Full guide: [mcp.md](../mcp/).
+Declare external tool servers. Each is exposed to the model through one `mcp` tool; the **first** use of a server prompts you to approve it — a program is shown with its SHA-256, a remote server with its address and header names — and a change re-prompts. Server output is sanitized before it reaches the model. Full guide: [mcp.md](../mcp/).
+
+| Key | Effect |
+|---|---|
+| `name` | How the model and `hotl mcp` refer to it. |
+| `command`, `args`, `env`, `cwd` | A program to start and speak to over stdio. |
+| `url` | A Streamable HTTP endpoint instead of a program — exactly one of `command` and `url`. Absolute `https://`; plain `http://` for loopback only. |
+| `bearer_token_env` | The **name** of an environment variable holding the bearer token for a `url` server. Read at connect time; never written to any file hotl owns. |
+| `headers` | `[["Name", "value"], …]` literal headers for a `url` server. A literal `Authorization` is refused — use `bearer_token_env`. |
+| `description` | What the server is for; the model reads it to decide when to use it. |
+
+One invalid entry loads **no** servers and warns once naming it and the fix.
 
 ### Post-edit formatters (`[formatters]`), diagnostics (`[diagnostics]`) and hooks (`[[hook]]`)
 
@@ -784,6 +795,7 @@ Inspects the servers declared in `[[mcp]]` and the grants recorded in `trust.tom
 | `hotl mcp [list]` | Every configured server, its command line, and what the trust gate will do with it. Also warns about a corrupt `trust.toml` and about grants whose server has left the config. |
 | `hotl mcp show <name>` | The exact fingerprint text the in-session approval screen shows, plus the recorded key. Reads the binary; never starts it. |
 | `hotl mcp add <name> <command> [args...]` | Prints a `[[mcp]]` block to paste into `config.toml`. **Writes nothing.** |
+| `hotl mcp add <name> --url <url> [--bearer-env VAR] [--header NAME=VALUE]…` | The same block for a remote server; the token is named by its environment variable, never pasted. |
 | `hotl mcp untrust <name>\|--all` | Drops the grant, so the server is screened again on next use. |
 | `hotl mcp test <name>` | Starts the server, does the MCP handshake, lists its tools. Screens first if it is not already trusted, and records nothing either way. |
 

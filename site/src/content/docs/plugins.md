@@ -20,7 +20,7 @@ my-plugin/
 ├── skills/
 │   └── summarize/
 │       └── SKILL.md     # one skill per immediate child directory
-├── mcp.json             # optional MCP servers (stdio)
+├── mcp.json             # optional MCP servers (stdio or Streamable HTTP)
 └── com.example.client/  # client extension dirs — ignored by hotl
 ```
 
@@ -111,11 +111,13 @@ the same first-use trust screen, listing, and sandbox posture as any
 other server. `hotl mcp list` and the in-session roster always agree —
 both read one composition.
 
-hotl connects over **stdio only**. A valid `streamable-http` or `sse`
-entry is fully validated, then skipped with a `skipped — unsupported
-transport` report in `hotl plugins list`; that wording (as opposed to
-`entry invalid`) means the entry is well-formed and would load in a
-client with remote transport support.
+hotl connects over stdio and **Streamable HTTP**: a valid `streamable-http`
+entry loads as a URL server (`<plugin>:<server>`, screened by its address
+and header names, carrying no token — a manifest has no place for one, and
+a literal `Authorization` header invalidates the entry). A valid `sse` entry
+is validated, then skipped with a `skipped — sse transport: SSE is
+deprecated upstream` report in `hotl plugins list`; that wording (as opposed
+to `entry invalid`) means the entry is well-formed.
 
 Two placeholders — `${PLUGIN_ROOT}` (the plugin directory) and
 `${PLUGIN_DATA}` (a per-plugin writable state directory under
