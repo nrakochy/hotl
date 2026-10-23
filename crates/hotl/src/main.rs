@@ -20,6 +20,7 @@
 mod acp;
 mod agent;
 mod approve_cli;
+mod arg_audit;
 mod attach;
 mod bg;
 mod children_tools;
@@ -257,6 +258,7 @@ fn help_text() -> &'static str {
          hotl acp             serve the ACP protocol over stdio (for editors and orchestrators)\n  \
          hotl init <shell>    zsh: the `:` prefix plugin + completion (eval it in ~/.zshrc); bash/fish: completion\n  \
          hotl doctor          check provider keys, sandbox, config, session store\n  \
+         hotl doctor --args [--days N]  count tool-argument shape mismatches in recent sessions\n  \
          hotl setup           write default config (safe defaults)\n  \
          hotl gc [--dry-run]  prune old sessions/blobs per [retention]; sweeps session worktrees when run in a repo\n  \
          hotl export <s>      print a session's transcript as Markdown (--html for a page); s = id, name, @last\n  \

@@ -46,6 +46,26 @@ fn fail(line: String) -> Check {
 pub fn doctor_main() -> i32 {
     let config_dir = crate::agent::config_dir();
     let sessions_dir = crate::agent::sessions_dir();
+    // `hotl doctor --args [--days N]` (0075 T1): the offline argument audit
+    // instead of the checks — a number the owner reads before coercion exists.
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    if args.iter().any(|a| a == "--args") {
+        let days = args
+            .iter()
+            .position(|a| a == "--days")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        print!(
+            "{}",
+            crate::arg_audit::run(&sessions_dir, days, now_ms).render()
+        );
+        return 0;
+    }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

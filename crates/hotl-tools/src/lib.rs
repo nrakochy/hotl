@@ -10,6 +10,7 @@ pub mod ask;
 pub mod b64;
 mod builtins;
 pub mod children;
+pub mod coerce;
 pub mod concurrency;
 pub mod diagnostics;
 pub mod formatters;
