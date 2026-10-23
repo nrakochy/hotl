@@ -24,6 +24,8 @@ Facts an agent needs before acting:
 - [Configuration](https://nrakochy.github.io/hotl/configuration/): every subcommand, config key, env var, and exit code
 - [Permissions & sandbox](https://nrakochy.github.io/hotl/permissions-and-sandbox/): what the gate and sandbox protect and what they deliberately do not
 - [Troubleshooting](https://nrakochy.github.io/hotl/troubleshooting/): error message → cause → fix table
+- [Wire schemas](https://nrakochy.github.io/hotl/wire-schema/): JSON Schemas for the `-p --json` stream and the ACP-dialect payloads (`hotl schema`)
+- [Feature stages](https://nrakochy.github.io/hotl/features/): every switch with its stage — experimental, beta, stable, deprecated (`hotl features`)
 - [TUI console](https://nrakochy.github.io/hotl/tui/): interactive console keys, opt-in vim input mode (`[behavior] vim_mode`, default off), prompt history and Ctrl-R search
 - [Sessions, resume & forking](https://nrakochy.github.io/hotl/sessions/): `-r` resume, `--fork-from`/`--keep-turns` forking a session's history into a new one, and phase pipelines
 - [Shell integration](https://nrakochy.github.io/hotl/shell/): zsh `: ` prefix, `@[path]` file capture, OSC-133 marks

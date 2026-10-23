@@ -21,6 +21,10 @@ mod images;
 #[allow(dead_code)]
 mod acp;
 
+#[path = "../src/features.rs"]
+#[allow(dead_code)]
+mod features;
+
 #[path = "../src/schema_cli.rs"]
 #[allow(dead_code)]
 mod schema_cli;
@@ -254,5 +258,29 @@ fn every_acp_payload_validates_against_the_published_schema() {
     acp_valid(
         "ModelAck",
         &json!({"ok": true, "model": "m", "applied": false, "warnings": []}),
+    );
+}
+
+/// The features page's generated block is `features::markdown()`; regenerate
+/// under `UPDATE_WIRE_SCHEMA=1` like the schemas.
+#[test]
+fn the_features_page_matches_the_table() {
+    let page = schema_dir().join("../../src/content/docs/features.md");
+    let text = std::fs::read_to_string(&page).unwrap();
+    let (begin, end) = ("<!-- features:begin -->\n", "<!-- features:end -->");
+    let i = text.find(begin).expect("begin marker") + begin.len();
+    let j = text.find(end).expect("end marker");
+    let want = features::markdown();
+    if text[i..j] == want {
+        return;
+    }
+    if std::env::var("UPDATE_WIRE_SCHEMA").as_deref() == Ok("1") {
+        std::fs::write(&page, format!("{}{}{}", &text[..i], want, &text[j..])).unwrap();
+        return;
+    }
+    panic!(
+        "{} is out of date with crates/hotl/src/features.rs. Regenerate: \
+         UPDATE_WIRE_SCHEMA=1 cargo test -p hotl --test wire_schema",
+        page.display()
     );
 }

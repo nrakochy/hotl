@@ -12,7 +12,7 @@ Reference for the command surface, config files, and environment variables of th
 | `hotl [id-prefix\|--resume]` | The full-screen console: streaming transcript, activity strip, modal asks, vim input. Needs a terminal (no TTY → exit 2, use `-p`). `hotl -r --search <text>` lists only the sessions whose transcript mentions the text, with an excerpt, before you pick. See [tui.md](../tui/). |
 | `hotl -p "PROMPT"` | Headless one-shot: run PROMPT to completion, print the answer, exit. See [Headless](#headless--p----json). |
 | `hotl -p "PROMPT" --json` | Headless with a JSONL event stream on stdout instead of prose. |
-| `hotl -p "PROMPT" --shell-trace FILE` | Headless with the zsh plugin's record of the last shell command appended to the prompt (read once and deleted, masked, marked untrusted). The `: ` prefix writes this for you; see [shell.md](../shell/#what--attaches). |
+| `hotl -p "PROMPT" --shell-trace FILE` | Headless with the zsh plugin's record of the last shell command appended to the prompt (read once and deleted, masked, marked untrusted). The `: ` prefix writes this for you; see [shell.md](../shell/#what-the-colon-prefix-attaches). |
 | `hotl resume [id-prefix]` | Continue an earlier session in the console (bare: pick from a numbered list). The seeded session replays the earlier one's full context from its log and ancestry. With `-p` it is the headless resume (see [Headless](#headless--p----json)). |
 | `hotl --fork-from <n\|id\|name\|@last>` | Start a **new** session seeded with another's history, pinned to that session's state at fork time (the original can keep running). `--keep-turns <n>` / `--keep <items>` fork at a prefix instead of the head; `@last` is the newest session. Works headless too (`hotl -p "…" --fork-from …`). See [sessions.md](../sessions/). |
 | `hotl bg [prompt]` | Background a session as a detached socket server; `hotl attach` to reach it. See [backgrounding.md](../backgrounding/). |
@@ -295,6 +295,8 @@ A refusal is a prompt: it names the offending component and tells the model to r
 `ask_user`'s permission is `None` for a specific reason, not an oversight: it is **not a permission gate**. It's a plain data-gathering round-trip — the human's answer becomes a text tool result, exactly like a `read` — so it never authorizes any mutating action on its own (see [permissions-and-sandbox.md](../permissions-and-sandbox/)). It runs under plan mode for the same reason `read`/`glob`/`grep` do: asking a clarifying question changes nothing on disk. Headless (`-p`) and JSON-mode runs have no one to ask, so the question always resolves — never hangs — to a documented "no human available" answer the model can act on. See [tui.md](../tui/#questions) for the console picker.
 
 ### Environment variables
+
+Each variable's stage (experimental, beta, stable, deprecated) and the release that introduced it are on [Feature stages](../features/).
 
 | Variable | Overrides | Meaning |
 |---|---|---|

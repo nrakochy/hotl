@@ -89,6 +89,8 @@ export default defineConfig({
 					label: 'Reference',
 					items: [
 						{ label: 'Configuration', slug: 'configuration' },
+						{ label: 'Wire schemas', slug: 'wire-schema' },
+						{ label: 'Feature stages', slug: 'features' },
 						{ label: 'Troubleshooting', slug: 'troubleshooting' },
 						{ label: 'Updating', slug: 'updating' },
 						{ label: 'Uninstall', slug: 'uninstall' },
