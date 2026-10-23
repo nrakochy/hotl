@@ -134,13 +134,14 @@ pub fn gc(data_dir: &Path, policy: &RetentionPolicy, dry_run: bool) -> GcReport 
     report
 }
 
-/// The three on-disk artifacts of one session: log, blob dir, and the legacy
-/// shadow repo (undo was removed in 0054; the path is still swept so old
-/// installs drain).
+/// The on-disk artifacts of one session: log, blob dir, the background-job
+/// dir (0064), and the legacy shadow repo (undo was removed in 0054; the path
+/// is still swept so old installs drain).
 fn session_paths(log_path: &Path, shadow_dir: &Path, id: &str) -> Vec<PathBuf> {
     let mut v = vec![log_path.to_path_buf()];
     if let Some(stem) = log_path.file_stem().and_then(|s| s.to_str()) {
         v.push(log_path.with_file_name(format!("{stem}.blobs")));
+        v.push(log_path.with_file_name(format!("{stem}.jobs")));
     }
     v.push(shadow_dir.join(format!("{id}.git")));
     v
@@ -181,11 +182,47 @@ mod tests {
     fn make_session(sessions: &Path, shadow: &Path) -> String {
         let log = SessionLog::create(sessions, "m", None, Masker::empty(), 0).unwrap();
         let id = log.session_id.clone();
-        // Give it a blob and a shadow dir so pruning covers all three.
+        // Give it a blob, a job dir and a shadow dir so pruning covers all four.
         log.write_blob("t1", "big result").unwrap();
+        std::fs::create_dir_all(sessions.join(format!("{id}.jobs/a1b2c3"))).unwrap();
+        std::fs::write(
+            sessions.join(format!("{id}.jobs/a1b2c3/log")),
+            "job output\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(shadow.join(format!("{id}.git"))).unwrap();
         std::fs::write(shadow.join(format!("{id}.git/HEAD")), "ref").unwrap();
         id
+    }
+
+    /// 0064 T6: the `.jobs` dir goes with its session, and its bytes count
+    /// toward what the report says was freed.
+    #[test]
+    fn gc_prunes_the_jobs_dir_with_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let shadow = dir.path().join("shadow");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&shadow).unwrap();
+        let old = make_session(&sessions, &shadow);
+        let new = make_session(&sessions, &shadow);
+        backdate(&sessions, &old, Duration::from_secs(7200));
+        backdate(&sessions, &new, Duration::from_secs(60));
+        let jobs_dir = sessions.join(format!("{old}.jobs"));
+        assert!(jobs_dir.join("a1b2c3/log").exists());
+        let policy = RetentionPolicy {
+            max_sessions: Some(1),
+            max_age: None,
+        };
+        let report = gc(dir.path(), &policy, false);
+        assert_eq!(report.pruned.len(), 1);
+        assert_eq!(report.pruned[0].id, old);
+        assert!(!jobs_dir.exists(), "the job dir is pruned with the session");
+        assert!(sessions.join(format!("{new}.jobs/a1b2c3/log")).exists());
+        assert!(
+            report.pruned[0].bytes >= "job output\n".len() as u64,
+            "the job log's bytes are counted"
+        );
     }
 
     /// Backdate a session's log so age-based policy sees it as `ago` old.
