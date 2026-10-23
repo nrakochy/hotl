@@ -1057,10 +1057,13 @@ dependencies = [
 name = "hotl-mcp"
 version = "0.28.0"
 dependencies = [
+ "bytes",
  "dunce",
  "futures-util",
+ "hotl-platform",
  "hotl-tools",
  "hotl-types",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

@@ -27,6 +27,7 @@
 
 pub mod client;
 pub mod config;
+pub mod http;
 pub mod sanitize;
 pub mod tool;
 pub mod trust;

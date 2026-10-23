@@ -43,7 +43,7 @@ const WRITE_TIMEOUT_SECS: u64 = 2;
 /// real) but finite: an endless line without `\n` used to grow a String until
 /// OOM, and the 50 KiB sanitizer cap applies only after the message is in
 /// memory.
-const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
 /// A dying server writes its diagnostics and exits; stdout EOF and the stderr
 /// drain race. One short, bounded wait so the server's own last words make it
 /// into the error we hand back.
@@ -237,7 +237,7 @@ impl Client {
     /// can never arrive. Enforced by `an_unbounded_line_is_bounded`,
     /// `a_blocked_writer_does_not_hang_forever`, and
     /// `eof_fails_pending_immediately`.
-    fn die(&self, reason: String) {
+    pub(crate) fn die(&self, reason: String) {
         self.dead.store(true, Ordering::Relaxed);
         *self
             .last_error
