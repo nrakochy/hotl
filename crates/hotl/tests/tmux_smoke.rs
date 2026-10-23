@@ -600,9 +600,14 @@ async fn slash_completion_and_help_name_the_right_things() {
     smoke.wait_any_row("the completed command", "/effort", s(5));
     smoke.tmux.send_keys(&["C-a", "C-k"]);
     smoke.tmux.type_text("?");
+    // Wait for the whole box: a capture can land mid-redraw, after `/goal`'s
+    // row and before `/workflows`'.
     let rows = smoke.tmux.wait_for(
         "the help box",
-        |rows| rows.iter().any(|r| r.contains("/goal")),
+        |rows| {
+            let all = rows.join("\n");
+            all.contains("/goal") && all.contains("/workflows") && all.contains("ctrl-g")
+        },
         s(5),
     );
     let all = rows.join("\n");
