@@ -28,3 +28,16 @@ threads-required = 'num-test-threads'
 # saturated core pool the child gets starved and the probe times out.
 filter = 'binary(update_offline)'
 threads-required = 4
+
+[test-groups]
+# tmux smoke (0074): one at a time — private servers do not collide, but the
+# timing assertions want the CPU to themselves.
+tmux = { max-threads = 1 }
+
+[[profile.default.overrides]]
+# The scenarios drive the real binary under a private tmux; a 12 s streamed
+# write plus startup would trip the 30 s warning without the longer timeout.
+filter = 'binary(tmux_smoke)'
+test-group = 'tmux'
+threads-required = 4
+slow-timeout = { period = "60s", terminate-after = 2 }

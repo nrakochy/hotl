@@ -74,11 +74,14 @@
           # and without it `project_id_is_stable_for_remote_and_falls_back_to_cwd`
           # silently takes the cwd fallback in both temp checkouts and fails the
           # one assertion it exists to make.
-          nativeCheckInputs = [ pkgs.ripgrep pkgs.git ];
+          # `tmux` for the 0074 smoke; where a private server cannot start
+          # (the darwin sandbox) the scenarios skip, as the sandbox tests do.
+          nativeCheckInputs = [ pkgs.ripgrep pkgs.git pkgs.tmux ];
 
           # Nothing here demands $HOME, but /homeless-shelter is not writable
           # and a single test reaching for it would be an opaque failure.
-          preCheck = "export HOME=$(mktemp -d)";
+          # TMUX_TMPDIR: tmux wants a writable socket dir; /tmp may not exist.
+          preCheck = "export HOME=$(mktemp -d) TMUX_TMPDIR=$HOME";
 
           # macOS refuses to nest one Seatbelt sandbox inside another, and
           # nix's darwin builder is itself Seatbelt — so `/usr/bin/sandbox-exec`
@@ -256,6 +259,7 @@
             clippy
             rustfmt
             rust-analyzer
+            tmux
           ];
         };
       });
