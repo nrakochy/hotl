@@ -853,6 +853,10 @@ struct Turn {
     /// The last sample's own usage, not the turn's total: what the next
     /// sample would rewrite if the cache went cold.
     last_usage: TokenUsage,
+    /// The schema every sample of this turn is constrained to (0073 D8);
+    /// `compose_request` and `speculative_request` read the same field, so an
+    /// adopted request and the sequential rebuild agree.
+    output_format: Option<Arc<serde_json::Value>>,
     /// In-flight speculative compaction digest: fired once the estimate
     /// crosses [`SPECULATE_TRIGGER`], consumed when the turn ends in
     /// `Compact`, aborted otherwise.
@@ -992,6 +996,7 @@ impl Turn {
             max_tokens_continues: cont.max_tokens_continues,
             cleared: cont.cleared,
             spent: cont.spent,
+            output_format: cont.output_format,
             started_ms: cont.started_ms.unwrap_or(started_ms),
             // A continuation starts a fresh progress count: the value it
             // inherited was already read by `try_compact`, and re-carrying it
@@ -1031,6 +1036,7 @@ impl Turn {
             tools_ran: self.tools_ran,
             denials_consecutive: self.denials_consecutive,
             denials_total: self.denials_total,
+            output_format: self.output_format.clone(),
         }
     }
 
@@ -2558,7 +2564,7 @@ impl Turn {
             },
             turn_context: Some(turn_context),
             cache_key: Some(Arc::clone(&self.shared.session_id)),
-            output_format: None,
+            output_format: self.output_format.clone(),
         }
     }
 

@@ -391,6 +391,9 @@ pub struct TurnContinuation {
     /// a fold does not un-deny anything.
     pub(crate) denials_consecutive: u32,
     pub(crate) denials_total: u32,
+    /// The schema this prompt's samples are constrained to (0073 D8).
+    /// Carried across a fold: a compaction mid-retry keeps the constraint.
+    pub(crate) output_format: Option<Arc<serde_json::Value>>,
 }
 
 /// A compaction digest computed speculatively *during* the turn, overlapping
@@ -1176,6 +1179,10 @@ pub enum SessionCmd {
     PromptTagged {
         text: String,
         synthetic: hotl_types::SyntheticReason,
+        /// The adapted JSON Schema every sample of this turn asks the model
+        /// to fit (0073 D8): `output_config.format` on the Anthropic
+        /// dialect. `None` for every prompt but a `--json-schema` retry.
+        output_format: Option<Arc<serde_json::Value>>,
     },
     /// Continue an interrupted turn (M4/#8): sample against the current
     /// projection with no new user item — used on resume when the last item
@@ -1480,7 +1487,29 @@ impl SessionHandle {
     pub async fn prompt_tagged(&self, text: String, synthetic: hotl_types::SyntheticReason) {
         let _ = self
             .cmd
-            .send(SessionCmd::PromptTagged { text, synthetic })
+            .send(SessionCmd::PromptTagged {
+                text,
+                synthetic,
+                output_format: None,
+            })
+            .await;
+    }
+    /// A tagged prompt whose turn is grammar-constrained to `schema` (0073
+    /// D8): the structured loop's retry. `schema` is the **adapted** schema
+    /// (`hotl_workflow::structured::api_schema`), not the file's.
+    pub async fn prompt_structured(
+        &self,
+        text: String,
+        synthetic: hotl_types::SyntheticReason,
+        schema: Arc<serde_json::Value>,
+    ) {
+        let _ = self
+            .cmd
+            .send(SessionCmd::PromptTagged {
+                text,
+                synthetic,
+                output_format: Some(schema),
+            })
             .await;
     }
     pub async fn steer(&self, text: String) {

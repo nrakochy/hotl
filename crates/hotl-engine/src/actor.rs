@@ -1420,6 +1420,7 @@ pub(crate) async fn run(
                         text,
                         images,
                         synthetic: None,
+                        output_format: None,
                     },
                     &cmd_tx,
                     &events,
@@ -1428,7 +1429,11 @@ pub(crate) async fn run(
                 )
                 .await;
             }
-            SessionCmd::PromptTagged { text, synthetic } => {
+            SessionCmd::PromptTagged {
+                text,
+                synthetic,
+                output_format,
+            } => {
                 running = admit_prompt(
                     &shared,
                     &mut log,
@@ -1440,6 +1445,7 @@ pub(crate) async fn run(
                         text,
                         images: Vec::new(),
                         synthetic: Some(synthetic),
+                        output_format,
                     },
                     &cmd_tx,
                     &events,
@@ -1450,7 +1456,7 @@ pub(crate) async fn run(
             }
             SessionCmd::Continue => {
                 if !running && crate::needs_continuation(head.items()) {
-                    spawn_turn(&shared, &cmd_tx, &events, &current_turn, None);
+                    spawn_turn(&shared, &cmd_tx, &events, &current_turn, None, None);
                     running = true;
                 }
             }
@@ -1513,6 +1519,7 @@ pub(crate) async fn run(
                             text,
                             images: Vec::new(),
                             synthetic: Some(synthetic),
+                            output_format: None,
                         },
                         &cmd_tx,
                         &events,
@@ -2769,6 +2776,7 @@ async fn on_turn_finished(
                                     text: guidance,
                                     images: Vec::new(),
                                     synthetic: Some(SyntheticReason::GoalGuidance),
+                                    output_format: None,
                                 },
                                 ctx.cmd_tx,
                                 ctx.events,
@@ -4008,6 +4016,8 @@ struct QueuedPrompt {
     text: String,
     images: Vec<hotl_types::UserImage>,
     synthetic: Option<SyntheticReason>,
+    /// 0073 D8: the retry turn's schema; a folded prompt inherits the entry's.
+    output_format: Option<Arc<serde_json::Value>>,
 }
 
 /// Start a turn now, or queue the prompt if one is running (one-at-a-time
@@ -4109,6 +4119,7 @@ async fn start_turn(
     // images are not exposed to hooks (v1) — the inline `[Image #N]` markers
     // still tell a hook one was attached.
     let prompt_for_hooks = prompt.text.clone();
+    let output_format = prompt.output_format;
     let item = Item::User {
         text: prompt.text,
         synthetic: prompt.synthetic,
@@ -4157,6 +4168,7 @@ async fn start_turn(
                         events,
                         current_turn,
                         Some(crate::Admission { ticket, predicted }),
+                        output_format.clone(),
                     );
                     return true;
                 }
@@ -4216,7 +4228,7 @@ async fn start_turn(
         },
         else {}
     );
-    spawn_turn(shared, cmd_tx, events, current_turn, None);
+    spawn_turn(shared, cmd_tx, events, current_turn, None, output_format);
     true
 }
 
@@ -4228,6 +4240,7 @@ fn spawn_turn(
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
     admission: Option<crate::Admission>,
+    output_format: Option<Arc<serde_json::Value>>,
 ) {
     let token = CancellationToken::new();
     *current_turn
@@ -4242,7 +4255,10 @@ fn spawn_turn(
         cmd_tx,
         events,
         token,
-        crate::TurnContinuation::default(),
+        crate::TurnContinuation {
+            output_format,
+            ..Default::default()
+        },
         admission,
     );
 }

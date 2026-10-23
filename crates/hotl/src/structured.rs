@@ -63,12 +63,27 @@ where
             Ok(value) => return Ok((value, total)),
             Err(e) if attempts < max_retries => {
                 attempts += 1;
-                handle
-                    .prompt_tagged(
-                        format!("Validation failed: {e}\nReply with only the corrected JSON object, nothing else."),
-                        SyntheticReason::RetryFeedback,
-                    )
-                    .await;
+                let feedback = format!(
+                    "Validation failed: {e}\nReply with only the corrected JSON object, nothing else."
+                );
+                // 0073 D8: the retry turn asks the API for the schema too, when
+                // the grammar can take it; the check above keeps the original.
+                match hotl_workflow::structured::api_schema(schema) {
+                    Some(adapted) => {
+                        handle
+                            .prompt_structured(
+                                feedback,
+                                SyntheticReason::RetryFeedback,
+                                std::sync::Arc::new(adapted),
+                            )
+                            .await
+                    }
+                    None => {
+                        handle
+                            .prompt_tagged(feedback, SyntheticReason::RetryFeedback)
+                            .await
+                    }
+                }
             }
             Err(e) => {
                 return Err(format!(
@@ -206,6 +221,62 @@ mod tests {
             )),
             "the retry must feed back as a tagged RetryFeedback item"
         );
+    }
+
+    /// D8: the first attempt is today's bytes — no `output_format` — and the
+    /// retry carries the **adapted** schema (`additionalProperties: false`
+    /// added, the constraint keywords stripped), not the file's.
+    #[tokio::test]
+    async fn a_validation_miss_retries_with_the_adapted_schema() {
+        let (mut handle, provider, _dir) = invalid_then_valid();
+        let schema = json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {"name": {"type": "string", "minLength": 1}}
+        });
+        run_structured(&mut handle, &schema, "give me a name", 2)
+            .await
+            .unwrap();
+        let reqs = provider.requests();
+        assert_eq!(reqs.len(), 2);
+        assert!(
+            reqs[0].output_format.is_none(),
+            "the first attempt sends no format"
+        );
+        let adapted = hotl_workflow::structured::api_schema(&schema).unwrap();
+        assert_eq!(reqs[1].output_format.as_deref(), Some(&adapted));
+        assert_eq!(adapted["additionalProperties"], false);
+        assert!(adapted["properties"]["name"].get("minLength").is_none());
+        assert_ne!(adapted, schema, "adapted, not the file's schema");
+    }
+
+    /// A schema the grammar cannot take (`$ref`) retries as before: tagged
+    /// feedback, no format.
+    #[tokio::test]
+    async fn a_ref_schema_retries_without_a_format() {
+        let (mut handle, provider, _dir) = invalid_then_valid();
+        let schema = json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {"name": {"$ref": "#/$defs/s"}},
+            "$defs": {"s": {"type": "string"}}
+        });
+        run_structured(&mut handle, &schema, "give me a name", 2)
+            .await
+            .unwrap();
+        let reqs = provider.requests();
+        assert_eq!(reqs.len(), 2);
+        assert!(
+            reqs.iter().all(|r| r.output_format.is_none()),
+            "no format anywhere"
+        );
+        assert!(reqs[1].items.iter().any(|i| matches!(
+            &**i,
+            Item::User {
+                synthetic: Some(SyntheticReason::RetryFeedback),
+                ..
+            }
+        )));
     }
 
     /// The loop itself, driven by a caller-issued prompt: usage is the sum
