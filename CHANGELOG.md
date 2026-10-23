@@ -17,6 +17,10 @@ semver promise of their own.
 
 - Crates publish with `cargo publish --workspace`, and CI skips jobs whose
   inputs have not changed since the last green run.
+- Integration tests build as one test binary per crate instead of one per
+  file (110 test binaries → 42), roughly halving the test compile. A few stay
+  separate on purpose: tests of process-wide, set-once state and the timing
+  gates.
 
 ## [0.29.0] - 2026-10-23
 
