@@ -512,12 +512,37 @@ fn mcp_check(config_dir: &Path) -> Vec<Check> {
         })
         .collect();
     let count = |want| states.iter().filter(|(_, s)| *s == want).count();
+    let remote = servers.iter().filter(|s| s.is_remote()).count();
     checks.push(ok(format!(
-        "mcp: {} server(s) configured ({} trusted, {} screen on first use)",
+        "mcp: {} server(s) configured ({} trusted, {} screen on first use, {remote} over HTTP)",
         servers.len(),
         count(TrustState::Trusted),
         count(TrustState::Untrusted)
     )));
+    // URL servers (0063 T6): a token var that is not set, and a host the
+    // egress policy would refuse. `host_allowed` only — doctor never asks.
+    for s in servers.iter().filter(|s| s.is_remote()) {
+        if let Some(var) = &s.bearer_token_env {
+            let set = EnvSecrets.get(var).is_some_and(|v| !v.trim().is_empty());
+            if !set {
+                checks.push(warn(format!(
+                    "mcp: `{}` reads its token from `${var}`, which is not set — export it \
+                     before a turn reaches the server",
+                    s.name
+                )));
+            }
+        }
+        if let Some(url) = &s.url {
+            if let hotl_tools::net::HostVerdict::Denied(reason) =
+                hotl_tools::net::host_allowed(hotl_mcp::http::url_host(url))
+            {
+                checks.push(warn(format!(
+                    "mcp: `{}` would be refused — {reason}",
+                    s.name
+                )));
+            }
+        }
+    }
     for (name, _) in states.iter().filter(|(_, s)| *s == TrustState::Unhashable) {
         checks.push(warn(format!(
             "mcp: `{name}`'s binary cannot be read, so hotl will ask every time — \
@@ -748,6 +773,24 @@ mod tests {
         assert!(out.contains("0 trusted, 1 screen on first use"), "{out}");
         assert!(
             out.contains("warn mcp: `broken`'s binary cannot be read"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn mcp_check_warns_about_an_unset_bearer_env() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[[mcp]]\nname = \"gh\"\nurl = \"https://api.githubcopilot.com/mcp/\"\n\
+             bearer_token_env = \"HOTL_TEST_UNSET_TOKEN_0063\"\n",
+        )
+        .unwrap();
+        let out = lines(&mcp_check(dir.path()));
+        assert!(out.contains("1 server(s) configured"), "{out}");
+        assert!(out.contains("1 over HTTP"), "{out}");
+        assert!(
+            out.contains("warn mcp: `gh` reads its token from `$HOTL_TEST_UNSET_TOKEN_0063`"),
             "{out}"
         );
     }

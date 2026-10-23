@@ -251,7 +251,7 @@ fn help_text() -> &'static str {
          hotl export <s>      print a session's transcript as Markdown (--html for a page); s = id, name, @last\n  \
          hotl stats           sessions, turns, tool calls, tokens and cost by model and by day (--days N, --json)\n  \
          hotl plugins         list Agent Plugins (skills + MCP); add/update/remove packages\n  \
-         hotl mcp             list MCP servers and trust state; show/add/untrust/test\n  \
+         hotl mcp             list MCP servers and trust state; show/add/add --url/untrust/test\n  \
          hotl skills          list skills; add/update/remove marketplaces (skill sources)\n  \
          hotl workflows       list saved workflows; show <name> [--mermaid]; check <file>\n  \
          hotl update          install the latest release (--check to only look)\n  \
