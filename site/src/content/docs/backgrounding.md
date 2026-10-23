@@ -7,14 +7,15 @@ Run a `hotl` agent detached from your terminal, then reconnect to it later — w
 
 ## Background jobs are not background sessions
 
-Two different things share the word:
+Three different things share the word:
 
 | | What it is | Verb |
 |---|---|---|
 | **Background job** | One shell command the *agent* started with `bash {background: true}` — a test suite, a build, a dev server — that keeps running while the session goes on. The agent is told when it ends; you see `⚙ N` on the strip and list them with `/jobs`. Jobs die with their session unless started with `detach: true`. See [configuration.md](../configuration/#built-in-tools) and [tui.md](../tui/). | `bash` tool, `/jobs` |
+| **Background sub-agent** | A child session the *agent* started with `spawn {background: true}` and kept working beside. Its typed result comes back as a notification; its row stays in the agent band until it finishes; `/agents` lists them. Children die with their session. See [agents.md](../agents/#background-sub-agents-wait-send-resume). | `spawn`/`wait`/`send`/`resume`, `/agents` |
 | **Background session** | The whole *hotl process* detached from your terminal, driven over a socket from any shell you attach from. This page. | `hotl bg`, `hotl attach` |
 
-A background session can of course run background jobs; they end with it like any other session's.
+A background session can of course run background jobs and sub-agents; they end with it like any other session's.
 
 ## The model
 

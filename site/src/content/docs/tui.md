@@ -173,7 +173,11 @@ stream is shown and never touch the band.
 
 A spawn you are viewing or pointing at stays listed after it settles (with
 its `✓`) until you move off it or back out; a spawn settling *above* the
-highlight never shifts it onto another agent.
+highlight never shifts it onto another agent. A spawn started with
+`background: true` settles the moment its child starts, but its row stays in
+the band — wanderer walking, drill-in streaming — across idle, until the
+child finishes; then a notice says `sub-agent <id> finished · completed · …`
+and the row leaves. `/agents` lists them, `/agents stop <id>` interrupts one.
 
 `Esc` walks back one rung per press: an open agent stream returns to main
 (highlight kept), an engaged highlight disengages, and only then — with the
@@ -318,6 +322,7 @@ own.
 | `/remember [note]` | Keep one note for every future session in this project. With a note: only while idle and only under `[memory] mode = "read-write"`; the same y/n modal a tool ask uses confirms it, then the line is appended to the project's `MEMORY.md` in the data dir and the notice says `remembered — loads next session`. Bare `/remember` lists the notes, the file, its size against the 16 KiB cap and the dial — any time. See [configuration.md](../configuration/#memory-memory). |
 | `/compact [focus]` | Fold earlier history into the typed summary now, instead of waiting for the 80% rung. With a focus, the summary keeps everything about it in full. Runs when the current turn ends if one is running; the strip reads `folding history…` while it works and the notice says what it cost. See [Folding on purpose](#folding-on-purpose). |
 | `/jobs [stop <id>]` | Background `bash` jobs in this session: id, state, elapsed time and command, one row each; `/jobs stop <id>` kills a job's whole process tree (the `rc` file then reads `killed:SIGKILL`). While jobs run the strip shows `⚙ N`; when one ends a notice says `job <id> ended · exit 0 · 4m12s`. Jobs are not agent-band rows — a job has no stream to drill into; its log is a file (`read` it, or `tail -n 50`). |
+| `/agents [stop <id>]` | This session's sub-agents (`spawn`), running and finished: id, agent type, state, elapsed time and brief, one row each; `/agents stop <id>` interrupts a running one or closes a finished one. A background child's row also lives in the agent band until it finishes. See [agents.md](../agents/#background-sub-agents-wait-send-resume). |
 | `/workflows` | Every run of the `workflow` tool this process has started, with per-phase progress, tokens and elapsed time — live, so safe mid-run. See [workflows.md](../workflows/#watching-it). |
 | `/cost` | Session token totals and, when the provider reports one, cost. |
 | `/btw <question>` | A side question the model answers but will not remember: one extra sample over the same cached prefix the turn uses (cache-read prices for the whole history), the answer as a muted `?` card, nothing in the transcript or the log beyond the spend. Works mid-turn. A tool call the aside wanted is reported, never run. |

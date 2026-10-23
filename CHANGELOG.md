@@ -8,6 +8,28 @@ semver promise of their own.
 
 ### Added
 
+- **Sub-agents can run in the background.** `spawn {…, background: true}`
+  returns at once with the child's id and the model keeps working; the
+  child's typed result arrives as a notification — the same text the
+  blocking call returns — that never interrupts a tool batch and starts a
+  turn when the session is idle. Three tools go with it: `wait` blocks for a
+  result (the first to finish, or one by id, with a timeout), `send` steers a
+  running child, `resume` continues a finished one with its whole context
+  intact. Esc leaves children running; the session's end stops them. Only
+  read-only or worktree-isolated children background: one that could edit
+  the shared tree while you keep working is refused with both ways out
+  named. `[agents] max_children` (8) bounds running plus finished children.
+  The agent band keeps a background child's row until it finishes, `/agents`
+  lists them, `/agents stop <id>` interrupts one; `--json` gains the `agent`
+  row's start frame; `hotl acp` gains `session/children` and
+  `session/children/stop`. Headless `-p` still ends at the turn.
+- **Sub-agent depth is a knob.** `[agents] max_depth` (default 1, at most 3)
+  says how deep children may nest. A child carries `spawn` only below the
+  knob and only when its roster allows it (`tools: all`, or a list naming
+  `spawn`; never `read-only`); `workflow` never nests; every level is forced
+  `dontask`, inherits your rules and never your `bypass`, and runs your hooks
+  under `child:<a>/<b>`. A grandchild's spend reaches your caps. `0` and `4`
+  are refused at startup with the reason.
 - **`bash` can run a command in the background.** `background: true` starts
   it as a job under the same sandbox and the same permission decision as a
   foreground call and returns at once with the job's files — `log`, `rc`,
@@ -163,12 +185,21 @@ semver promise of their own.
 
 ### Fixed
 
+- **A background job that ended behind the turn's last sample was never
+  answered.** Its notification landed in the context, but no turn followed;
+  the model now gets one, like a notification released at turn end.
 - **A shell command that needs longer than one call has an honest shape.**
   0.17.0 recorded the limit that a `cmd &` is reaped with the call; `bash
   {background: true}` is the way to keep it running.
 
 ### Changed
 
+- **Sub-agent spend counts against your caps.** A child's tokens, priced at
+  its model, now charge `max_cost_usd`, and its tool calls count toward
+  `max_tool_calls` — when a blocking `spawn` returns, or when a background
+  child's notification is admitted. Before, every child carried its own copy
+  of the caps and nothing charged the parent. Context fullness is
+  unchanged: a child's tokens never count toward your window.
 - **A skill name collision is warned, not silent.** Two roots offering the
   same name used to drop the loser without a word; now `hotl skills list`,
   `hotl doctor` and the startup warnings name both paths. A frontmatter

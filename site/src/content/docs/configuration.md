@@ -143,6 +143,9 @@ child_idle_secs = 300       # a child that sends nothing for this long is
                             # agent only; omit to inherit the session's
 completion_grace_secs = 20  # after a child reports, how long it gets to exit
                             # before it is reaped — result kept either way
+max_depth = 1               # how deep children may nest (1..=3): a child
+                            # gets `spawn` only below this; `workflow` never
+max_children = 8            # running + finished (parked) children per session
 
 [workflows]                 # the workflow tool's fan-out caps (see workflows.md)
 concurrency = 8             # agents one process runs at once across every workflow
@@ -268,7 +271,10 @@ search over collapsed sources, bodies read on demand, marketplaces, and the
 | `ask_user` | Ask you a structured multiple-choice question (a header, a prompt, and 2–4 labelled options, plus free text) when the model hits a genuine ambiguity instead of guessing. | None — see below |
 | `web_fetch` | Fetch one or more URLs (an array — fetched concurrently in one call) and return their text (HTML stripped). Always registered; needs no configuration. | Ask (always, even under an allowlist) |
 | `web_search` | Search via the `[web.search]` backend you configure and get back titles/URLs/snippets; `web_fetch` a result for the full text. Registered **only** when `[web.search]` is set — absent otherwise, so nothing phones home by default. | Ask |
-| `spawn` | Delegate a self-contained subtask to a fresh, isolated sub-agent (`agent_type`: `general-purpose`, `explore`, `plan`, or your own `agents/*.md` def); `fork: true` seeds it with your own current context instead. See [agents.md](../agents/). | Ask |
+| `spawn` | Delegate a self-contained subtask to a fresh, isolated sub-agent (`agent_type`: `general-purpose`, `explore`, `plan`, or your own `agents/*.md` def); `fork: true` seeds it with your own current context instead. `background: true` returns at once with the child's id (read-only or worktree-isolated children only); the typed result arrives as a notification when it finishes. See [agents.md](../agents/). | Ask (` (background)` appended) |
+| `wait` | Block until a background sub-agent finishes (`child`, or the first to finish) and return its typed result; `timeout_ms` (default 120000) with the child still running. The result then has one reader — no notification follows. | None |
+| `send` | Steer a running background sub-agent: `text` lands in its context before its next sample. | None |
+| `resume` | Continue a finished sub-agent with its context intact (`child`, `text`, optional `background`). Not for isolated, stopped or evicted children. | Ask (`resume sub-agent <id>: …`) |
 
 **All five file tools are workspace-contained, and the boundary is the file descriptor.** A path is inside the working directory if — and only if — a descent from the workspace-root fd reached it *without traversing a symlink*: on Linux one `openat2(RESOLVE_BENEATH)`, everywhere else a component-by-component `openat` with `O_NOFOLLOW`. Because the check is made on the descriptor the tool then uses, there is no name to re-resolve and so no check/open race. A lexical `..`-normalising pass still runs first, but only to pick the error message and the permission — never as the boundary.
 

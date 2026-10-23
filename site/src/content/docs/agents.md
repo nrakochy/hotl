@@ -19,6 +19,11 @@ agents, a pipeline per item, majority votes, repeat-until-quiet — hand the
 through the same child builder, with one ask for the whole run. See
 [workflows.md](../workflows/).
 
+`spawn` takes `agent_type`, `task`, `fork`, `validate_cmd` and `background`.
+By default the call blocks until the child reports; `background: true`
+returns at once and the result arrives later — see
+[Background sub-agents](#background-sub-agents-wait-send-resume).
+
 ## Choosing an `agent_type`
 
 Four built-in agent types ship with hotl:
@@ -126,6 +131,66 @@ cache anyway, so `fork` instead wraps your history into an explicit,
 labeled background block the child receives as context, not as its own
 prior turns.
 
+## Background sub-agents: `wait`, `send`, `resume`
+
+```json
+{"agent_type": "explore", "task": "find every place TokenUsage is summed", "background": true}
+```
+
+With `background: true` the call returns at once with the child's id and the
+parent keeps working:
+
+```
+Started sub-agent a1b2c3 (explore) in the background: find every place TokenUsage is summed
+You will be told when it finishes. `wait {child: "a1b2c3"}` blocks for its result;
+`send {child: "a1b2c3", text}` steers it; `resume` continues it afterwards. Carry on.
+```
+
+When the child finishes, its typed result lands in the parent's context as a
+harness notification — the same `<subagent-result … typed="true">` text the
+blocking call would have returned, with `child="a1b2c3"` and `secs="…"`
+added. It never interrupts a tool batch: if the parent is mid-turn it waits
+for the next sample boundary; if the parent is idle it starts a turn so the
+model can act on it. The notification is cut at 8 KiB (the full text is in
+the child's `RESPONSE.json`, and `wait` returns it uncut). A child that errors
+out, is cancelled or runs out of budget notifies too, as
+`<subagent-result … outcome="error">` with the reason — never an empty
+success.
+
+Three tools go with it:
+
+| Tool | What it does | Asks? |
+|---|---|---|
+| `wait {child?, timeout_ms?}` | Block until that child finishes and return its result. Omit `child` to take whichever finishes first. Times out (default 120 s) with the child still running. A result goes to exactly one reader: if `wait` claims it, no notification follows. | no — it reads a result you already approved producing |
+| `send {child, text}` | Steer a running child: the text lands in its context before its next sample, like a user steer. A finished child says to `resume` instead. | no — the child's own rules still bound what it does |
+| `resume {child, text, background?}` | Continue a finished child with its whole context intact: the same actor, no replay. Returns a typed result like `spawn`. | yes — `resume sub-agent a1b2c3: <text>`, like `spawn` |
+
+Rules worth knowing:
+
+- **Esc leaves background children running.** Cancelling the turn cancels a
+  `wait`, not the child. Children die with the session: `/quit` or `hotl -p`
+  ending stops them all.
+- **Only read-only or isolated children can run in the background.** A child
+  whose tools can edit the working tree, running while you keep working in
+  the same tree, would race you; `spawn … background: true` on such a def is
+  refused with both ways out named — run it in the foreground, or give it a
+  worktree (`isolation: worktree`, `[agents] isolation`).
+- **Not resumable: isolated children** — their worktree is spent at
+  merge-back. Stopped or evicted children are not either; `spawn` again with
+  `fork: true` if you need the context.
+- **`[agents] max_children`** (default 8) bounds running plus finished
+  (parked) children per session. Past it the oldest *finished* child is
+  closed; a ninth concurrent *running* one is a tool error naming the ids.
+- **A child's spend counts against your caps.** Its tokens are priced at its
+  model and charged to `max_cost_usd`; its tool calls count toward
+  `max_tool_calls` — for a blocking call when it returns, for a background
+  child when the notification is admitted. Its tokens do not count toward
+  your context window.
+- **The band shows it.** A background child's row stays in the agent band
+  after its own call settled, until the child's done frame; `/agents` lists
+  running and finished children and `/agents stop <id>` interrupts one. In
+  headless `-p` the run ends at the turn — `wait` before you finish.
+
 ## The return contract
 
 A sub-agent gets its brief twice — inline in its first message, and as a file
@@ -192,7 +257,8 @@ ever narrows:
 | Permission mode | forced, never inherited | always `dontask` — a child has no human on the loop, so `ask` would deadlock and `bypass` would let a sub-agent do without a human what you are standing right there to authorize |
 | Allow / deny rules | inherited verbatim | your `[[allow]]`/`[[deny]]` apply inside children exactly as they do to you |
 | Tool set | the def's `tools:`, intersected with yours | `tools: all` under a read-only parent is read-only; a name you don't have is not one the child gains |
-| `spawn` / `workflow` | never present | depth-1 is structural — naming them in `tools:` does nothing |
+| `spawn` (and `wait`/`send`/`resume`) | only under `[agents] max_depth` | present in a child only when the knob allows another level **and** the def's roster does: `tools: all` → yes, `read-only` → never, a list → only if it names `spawn`. A child's `spawn` still asks, and under its forced `dontask` only your `[[allow]] tool = "spawn"` rule lets it through |
+| `workflow` | never present | a batch runner under a batch runner is fan-out squared with one ask; naming it in `tools:` does nothing at any depth |
 | Worktree isolation | the def's `isolation:`, then `[agents] isolation` | not a call argument; `spawn {isolation: …}` is refused as an unknown key |
 | Hooks | inherited | they run inside children too, under `actor: "child:<id>"` — and, as everywhere, a hook can only deny |
 
@@ -202,10 +268,18 @@ act on, never a prompt nobody is there to answer.
 
 ## Depth, isolation, and trust
 
-- **Depth is capped at one level, structurally.** A child's registry is
-  built fresh and never contains `spawn` — a user agent def cannot re-enable
-  recursion by naming `spawn` in `tools:`. There is no config knob for this
-  today; it's a hard invariant.
+- **Depth is one by default, and a knob.** `[agents] max_depth` (default 1,
+  at most 3) says how deep children may nest: the main session is depth 0,
+  and a child at depth *n* carries `spawn` (with `wait`/`send`/`resume`) only
+  while *n* < `max_depth` and its scope allows it — `tools: all` yes,
+  `read-only` never, a list only by naming `spawn`. `workflow` never nests.
+  Every level is forced `dontask`, inherits your rules and never your
+  `bypass`, and runs your hooks under a nested actor (`child:<a>/<b>`). A
+  grandchild narrows against its parent's scope, not yours; an isolated
+  child's grandchildren work in the child's worktree. A grandchild's spend
+  folds into its parent's, so it reaches your caps. `max_depth = 0` is
+  refused (to turn sub-agents off, deny the tool); `4` is refused naming the
+  cap.
 - **A sub-agent's result is untrusted content to the parent.** Everything a
   child returns — including a `fork`'s eventual result — is wrapped the same
   way a `recall`/`web_fetch` result is: data that can inform the parent's
