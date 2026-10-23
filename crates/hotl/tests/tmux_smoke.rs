@@ -340,7 +340,7 @@ async fn the_strip_reads_preparing_while_a_long_tool_input_streams_and_never_qui
     }
     // The card names big.txt while the input still streams; the follow-up
     // reply is only sampled after the write's result.
-    smoke.wait_any_row("the reply after the write", "wrote it", s(20));
+    wait_allowing(&smoke, "the reply after the write", "wrote it", s(20));
     let rows = smoke.wait_at_rest(s(20));
     let on_disk = std::fs::read_to_string(smoke.file("big.txt"))
         .unwrap_or_else(|e| panic!("big.txt on disk: {e}\n{}", rows.join("\n")));
