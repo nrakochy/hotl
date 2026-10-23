@@ -68,6 +68,37 @@ pub struct PlanFiles {
     pub repo_mirror: Option<PathBuf>,
 }
 
+/// The memory dial (0069 D4). `ReadOnly` is the default: both memory files
+/// load, nothing writes. Read at session start, never mid-session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemoryMode {
+    #[default]
+    ReadOnly,
+    ReadWrite,
+    Off,
+}
+
+/// Where a session's per-project memory file lives (0069). Injected like
+/// [`PlanFiles`]: tests and children never touch the real data dir.
+#[derive(Debug, Clone)]
+pub struct MemoryFiles {
+    /// The project id (`hotl_store::project::id`).
+    pub project: String,
+    /// `<data>/memory/<project>` — holds `MEMORY.md`.
+    pub dir: PathBuf,
+    pub mode: MemoryMode,
+}
+
+/// What bare `/remember` shows: the dial, the file, its size, the entries.
+#[derive(Debug, Clone)]
+pub struct MemoryReport {
+    pub mode: MemoryMode,
+    pub path: PathBuf,
+    pub bytes: usize,
+    pub cap: usize,
+    pub entries: Vec<hotl_context::memory::MemoryEntry>,
+}
+
 /// Re-exported alongside [`ProjectionHead`]: what a read of it yields, split
 /// into the durable projection and the ephemeral per-sample tail. Out-of-crate
 /// readers (`fork`'s history seed) name it to say which half they take.
@@ -119,6 +150,13 @@ pub struct EngineConfig {
     pub cache_ttl: CacheTtl,
     /// Availability-only fallback models (≤3 total — RELIABILITY.md).
     pub fallback_models: Vec<String>,
+    /// The per-project memory file and dial (0069). `None` = off: a child, a
+    /// test, or a session with nowhere to write. On the config, like
+    /// `skill_paths`, so the test literals stay as they are.
+    pub memory_files: Option<MemoryFiles>,
+    /// How long a `/remember` confirm waits for the owner before it counts as
+    /// a no (`[behavior] ask_expiry_secs`).
+    pub ask_expiry: std::time::Duration,
     /// Skills with `paths:` globs (0068 D3): the turn hints the first time a
     /// tool input path matches one. Rides the config rather than
     /// `SessionDeps` so the hundred test literals stay as they are; children
@@ -223,6 +261,8 @@ impl Default for EngineConfig {
             cache_static: true,
             cache_ttl: CacheTtl::FiveMinutes,
             fallback_models: Vec::new(),
+            memory_files: None,
+            ask_expiry: std::time::Duration::from_secs(3600),
             skill_paths: Arc::from(Vec::new()),
             tool_failure_budget: 5,
             max_tool_calls: 0,
@@ -660,6 +700,14 @@ pub enum EngineEvent {
     GoalChanged {
         condition: Option<String>,
     },
+    /// One confirmed memory write landed (0069). `bytes` is the file's size
+    /// after it.
+    MemoryChanged {
+        note: String,
+        date: String,
+        bytes: usize,
+        path: String,
+    },
     /// The session was titled by the utility model (0071 T4), or the call
     /// came back unusable (`title: None`) and only the spend is reported.
     /// `usage` is the title call's own cost — housekeeping the session pays
@@ -754,6 +802,7 @@ impl std::fmt::Debug for EngineEvent {
             Self::GoalChanged { condition } => {
                 write!(f, "GoalChanged(set={})", condition.is_some())
             }
+            Self::MemoryChanged { bytes, .. } => write!(f, "MemoryChanged(bytes={bytes})"),
             Self::SessionTitled { title, .. } => {
                 write!(f, "SessionTitled(set={})", title.is_some())
             }
@@ -1136,6 +1185,24 @@ pub enum SessionCmd {
     /// goal appends the tombstone (outcome `"cleared"`); clearing when none
     /// is active is a silent no-op — no entry, no event.
     SetGoal(Option<String>),
+    /// `/remember <note>` (0069): the actor starts the owner confirm off the
+    /// actor task and replies when the write landed or was refused. Refused
+    /// outright, without asking, unless the dial is `ReadWrite`.
+    Remember {
+        note: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// The one memory writer (0069). Reached only after a yes: from the
+    /// `Remember` confirm task, or from the `remember` tool whose gate asked.
+    MemoryAppend {
+        note: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Bare `/remember`: reads the file and replies. No append, no publish —
+    /// safe mid-turn like `ContextBreakdown`. `None` = memory is off.
+    MemoryEntries {
+        reply: oneshot::Sender<Option<MemoryReport>>,
+    },
     /// A read-only breakdown of what currently fills the context window
     /// (plan 0028). The ONLY `SessionCmd` that neither appends to the log nor
     /// advances the projection: it reads the actor's own head plus two
@@ -1400,6 +1467,32 @@ impl SessionHandle {
     /// survives resume). `None` clears.
     pub async fn set_goal(&self, condition: Option<String>) {
         let _ = self.cmd.send(SessionCmd::SetGoal(condition)).await;
+    }
+    /// `/remember <note>` (0069): asks the owner through the ordinary
+    /// permission ask and resolves when the line is written (`Ok`) or
+    /// refused (`Err(reason)`: read-only, declined, over the cap, expired).
+    pub async fn remember(&self, note: String) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd
+            .send(SessionCmd::Remember { note, reply: tx })
+            .await
+            .is_err()
+        {
+            return Err("the session is gone".into());
+        }
+        rx.await
+            .unwrap_or_else(|_| Err("the session is gone".into()))
+    }
+    /// Bare `/remember`: the dial, the file and its entries. `None` when
+    /// memory is off or the session is gone. Safe mid-turn.
+    pub async fn memory_report(&self) -> Option<MemoryReport> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd
+            .send(SessionCmd::MemoryEntries { reply: tx })
+            .await
+            .ok()?;
+        rx.await.ok().flatten()
     }
     /// What currently fills the context window, by source (`/context`).
     /// `None` if the actor is gone. Appends nothing and publishes nothing, so
@@ -1691,6 +1784,124 @@ pub fn question_sink(
             .await;
             answer
         })
+    })
+}
+
+/// The `remember` tool's sink (0069): straight to the actor's one writer —
+/// the tool's own gate already asked, so this must not ask again. Weak
+/// sender for the same reason `question_sink` keeps one.
+pub fn memory_sink(cmd_tx: mpsc::WeakSender<SessionCmd>) -> hotl_tools::remember::MemorySink {
+    Arc::new(move |note| {
+        let cmd_tx = cmd_tx.clone();
+        Box::pin(async move {
+            let Some(tx) = cmd_tx.upgrade() else {
+                return Err("the session is gone".to_string());
+            };
+            let (reply, rx) = oneshot::channel();
+            tx.send(SessionCmd::MemoryAppend { note, reply })
+                .await
+                .map_err(|_| "the session is gone".to_string())?;
+            rx.await
+                .unwrap_or_else(|_| Err("the session is gone".to_string()))
+        })
+    })
+}
+
+/// The `/remember` confirm (0069 decision 1), off the actor task — the actor
+/// never blocks on a human. The `question_sink` body with three changes: the
+/// durable pair is `PendingAsk`/`AskResolved` (an unanswered confirm
+/// re-surfaces on resume with no new replay code), the race is against
+/// `expiry` since the slash path has no turn, and a yes becomes a
+/// `MemoryAppend` whose result is the reply.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn memory_confirm(
+    cmd_tx: mpsc::WeakSender<SessionCmd>,
+    events: mpsc::Sender<EngineEvent>,
+    hooks_handle: Option<Arc<dyn hooks::Hooks>>,
+    hook_mask: hooks::EventMask,
+    notifications: hooks::NotificationDrain,
+    expiry: std::time::Duration,
+    note: String,
+    reply: oneshot::Sender<Result<(), String>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let summary =
+            hotl_types::sanitize::safe_summary(&format!("remember → project memory: \"{note}\""));
+        let why = "writes your project memory file (data dir); loads into every future \
+                   session here"
+            .to_string();
+        let id = hotl_types::new_ulid();
+        propose_via(
+            &cmd_tx,
+            vec![EntryPayload::PendingAsk {
+                id: id.clone(),
+                summary: summary.clone(),
+                protected_why: Some(why.clone()),
+            }],
+        )
+        .await;
+        crate::hooks::hook_gate!(
+            hooks_handle,
+            hook_mask,
+            crate::hooks::EventMask::NOTIFICATION,
+            |h| {
+                crate::hooks::notify(
+                    h,
+                    &notifications,
+                    crate::hooks::NotificationKind::Blocked,
+                    summary.clone(),
+                );
+            },
+            else {}
+        );
+        let (ask_tx, ask_rx) = oneshot::channel();
+        let answer = if events
+            .send(EngineEvent::Ask {
+                summary,
+                protected_why: Some(why),
+                reply: ask_tx,
+            })
+            .await
+            .is_err()
+        {
+            AskReply::Deny { message: None }
+        } else {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep(expiry) => AskReply::Deny {
+                    message: Some("the confirm expired".into()),
+                },
+                r = ask_rx => r.unwrap_or(AskReply::Deny { message: None }),
+            }
+        };
+        let allowed = matches!(
+            answer,
+            AskReply::Allow | AskReply::AllowWithSecretReads | AskReply::AllowEdited { .. }
+        );
+        propose_via(&cmd_tx, vec![EntryPayload::AskResolved { id, allowed }]).await;
+        let result = if !allowed {
+            Err(match answer {
+                AskReply::Deny { message: Some(m) } => format!("not saved: {m}"),
+                _ => "not saved".to_string(),
+            })
+        } else {
+            match cmd_tx.upgrade() {
+                None => Err("the session is gone".to_string()),
+                Some(tx) => {
+                    let (w_tx, w_rx) = oneshot::channel();
+                    match tx
+                        .send(SessionCmd::MemoryAppend { note, reply: w_tx })
+                        .await
+                    {
+                        Err(_) => Err("the session is gone".to_string()),
+                        Ok(()) => w_rx
+                            .await
+                            .unwrap_or_else(|_| Err("the session is gone".to_string())),
+                    }
+                }
+            }
+        };
+        let _ = reply.send(result);
     })
 }
 

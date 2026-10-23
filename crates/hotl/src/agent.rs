@@ -3385,6 +3385,11 @@ impl Surface {
                 Some(c) => eprintln!("· goal set: {c}"),
                 None => eprintln!("· goal cleared"),
             },
+            // `-p` never writes memory (0069 decision 6); the arm exists for
+            // the match and for a resumed console session's frame.
+            EngineEvent::MemoryChanged { note, bytes, .. } => {
+                eprintln!("· remembered ({bytes} B): {note}")
+            }
             // `-p` never titles (0071 T4); the arm exists for the match.
             EngineEvent::SessionTitled { title, .. } => {
                 if let Some(t) = title {

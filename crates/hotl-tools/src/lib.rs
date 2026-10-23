@@ -18,6 +18,7 @@ pub(crate) mod minified;
 pub mod net;
 pub mod path;
 pub mod plugins;
+pub mod remember;
 pub mod report_tool;
 pub mod rules;
 pub mod sandbox;
@@ -32,6 +33,7 @@ pub mod winfloor;
 pub use ask::AskUserTool;
 pub use builtins::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 pub use minified::MinifyConfig;
+pub use remember::RememberTool;
 pub use report_tool::ReportResultTool;
 pub use todo::{PresentPlanTool, TodoWriteTool};
 pub use web::{WebFetchTool, WebSearchTool};
@@ -386,7 +388,10 @@ impl Registry {
             tools: self
                 .tools
                 .iter()
-                .filter(|t| t.name() != "spawn" && t.name() != "workflow" && keep(t.as_ref()))
+                // `remember` too (0069): a child's lesson is its typed return.
+                .filter(|t| {
+                    !matches!(t.name(), "spawn" | "workflow" | "remember") && keep(t.as_ref())
+                })
                 .cloned()
                 .collect(),
         }

@@ -374,6 +374,21 @@ fn update_line(update: &Value) -> Option<String> {
                 Some(goal) => format!("· goal set: {goal}"),
                 None => "· goal cleared".to_string(),
             },
+            "memory_changed" => format!("· remembered ({} B): {}", n("bytes"), s("note")),
+            "memory_report" => {
+                let entries = update
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                format!(
+                    "· memory ({}): {entries} note(s), {} of {} B — {}",
+                    s("mode"),
+                    n("bytes"),
+                    n("cap"),
+                    s("path")
+                )
+            }
             "goal_verdict" => {
                 let mut line = format!(
                     "· goal check (turn {}): {} — {}",

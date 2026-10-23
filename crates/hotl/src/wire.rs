@@ -240,6 +240,14 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
         EngineEvent::GoalChanged { condition } => {
             json!({"type": "goal_changed", "goal": condition})
         }
+        EngineEvent::MemoryChanged {
+            note,
+            date,
+            bytes,
+            path,
+        } => json!({
+            "type": "memory_changed", "note": note, "date": date, "bytes": bytes, "path": path
+        }),
         // `title` is omitted, not null, when the call produced nothing usable;
         // the spend still rides so a surface's totals stay true.
         EngineEvent::SessionTitled { title, usage } => {

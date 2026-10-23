@@ -1639,6 +1639,82 @@ pub(crate) async fn run(
                     let _ = events.send(EngineEvent::GoalChanged { condition }).await;
                 }
             }
+            SessionCmd::Remember { note, reply } => {
+                // Refused here, before any ask, unless the dial says write.
+                match shared.config.memory_files.as_ref().map(|f| f.mode) {
+                    Some(crate::MemoryMode::ReadWrite) => {
+                        crate::memory_confirm(
+                            cmd_tx.clone(),
+                            events.clone(),
+                            shared.hooks.clone(),
+                            shared.hook_mask(),
+                            shared.notifications.clone(),
+                            shared.config.ask_expiry,
+                            note,
+                            reply,
+                        );
+                    }
+                    Some(_) | None => {
+                        let _ = reply.send(Err("memory is read-only ([memory] mode)".into()));
+                    }
+                }
+            }
+            SessionCmd::MemoryAppend { note, reply } => {
+                // The one writer. The confirm already happened (slash task or
+                // tool gate); the dial is checked again because the tool path
+                // reaches here directly.
+                let files = match shared.config.memory_files.as_ref() {
+                    Some(f) if f.mode == crate::MemoryMode::ReadWrite => f,
+                    _ => {
+                        let _ = reply.send(Err("memory is read-only ([memory] mode)".into()));
+                        continue;
+                    }
+                };
+                let date = hotl_context::civil_date_utc(shared.clock.now_ms());
+                match hotl_context::memory::append(&files.dir, &files.project, &note, &date) {
+                    Ok(appended) => {
+                        let path = appended.path.display().to_string();
+                        let _ = shared
+                            .append(
+                                &mut log,
+                                &mut pipeline,
+                                &mut head,
+                                EntryPayload::MemoryAppended {
+                                    path: path.clone(),
+                                    note: note.clone(),
+                                    date: date.clone(),
+                                },
+                            )
+                            .await;
+                        let _ = events
+                            .send(EngineEvent::MemoryChanged {
+                                note,
+                                date,
+                                bytes: appended.bytes,
+                                path,
+                            })
+                            .await;
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e.to_string()));
+                    }
+                }
+            }
+            SessionCmd::MemoryEntries { reply } => {
+                // Read and return, like `ContextBreakdown`.
+                let report = shared.config.memory_files.as_ref().map(|f| {
+                    let path = f.dir.join(hotl_context::memory::MEMORY_FILE);
+                    crate::MemoryReport {
+                        mode: f.mode,
+                        bytes: std::fs::metadata(&path).map_or(0, |m| m.len() as usize),
+                        cap: hotl_context::memory::MEMORY_BUDGET_BYTES,
+                        entries: hotl_context::memory::entries(&f.dir),
+                        path,
+                    }
+                });
+                let _ = reply.send(report);
+            }
             SessionCmd::ContextBreakdown { reply } => {
                 // The one arm that reads and returns. No append, no publish,
                 // no `.await` — that is what makes `/context` safe mid-turn.
