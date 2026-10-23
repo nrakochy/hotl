@@ -321,14 +321,10 @@ async fn gate_would_catch_a_real_regression() {
         "a real regression (sync-noop seam disabled) must trip the p50 gate: \
          median-of-{TEETH_CHECK_TRIALS}-trials={median_p50}ns baseline={baseline_p50}ns"
     );
-    assert!(
-        exceeds_band(
-            median_p99,
-            baseline_p99,
-            REGRESSION_BAND_MULTIPLIER,
-            NOISE_FLOOR_P99_NS
-        ),
-        "a real regression (sync-noop seam disabled) must trip the p99 gate: \
-         median-of-{TEETH_CHECK_TRIALS}-trials={median_p99}ns baseline={baseline_p99}ns"
+    // Not asserted: the gate fails on either percentile, and on a fast-disk
+    // runner a real `sync_data()` can add less than the 1ms p99 floor.
+    eprintln!(
+        "teeth check p99: median-of-{TEETH_CHECK_TRIALS}-trials={median_p99}ns \
+         baseline={baseline_p99}ns"
     );
 }
