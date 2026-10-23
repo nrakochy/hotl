@@ -1239,7 +1239,7 @@ async fn scaffold(
     // `agents` cap and the `requests` cap draw from one shared budget, not
     // two independently-built ones.
     let (registry, skills, discovery_warnings, retrieval) =
-        build_registry(&cfg, &config_dir, concurrency.clone());
+        build_registry(&cfg, &config_dir, &cwd, concurrency.clone());
     warnings.extend(discovery_warnings);
     let registry = Arc::new(registry);
     let agents_include_claude = cfg.agents.claude.unwrap_or(true);
@@ -2292,6 +2292,7 @@ fn minify_config(cfg: &crate::config::Config) -> (hotl_tools::MinifyConfig, Opti
 fn build_registry(
     cfg: &crate::config::Config,
     config_dir: &std::path::Path,
+    cwd: &std::path::Path,
     concurrency: hotl_tools::concurrency::SessionConcurrency,
 ) -> (
     Registry,
@@ -2324,26 +2325,31 @@ fn build_registry(
         let trust = hotl_mcp::trust::TrustStore::load(config_dir);
         registry.register(Box::new(hotl_mcp::McpTool::new(servers, trust)));
     }
-    // Claude Code skills (SKILL.md roots) load alongside hotl's own unless
-    // opted out via [skills] claude = false; [skills.marketplaces] roots
-    // are hotl's own and load regardless.
-    let include_claude = cfg.skills.claude.unwrap_or(true);
+    // Every skill root (0068 D1): hotl's own, the project walk from cwd,
+    // plugins, marketplaces, and the user convention dirs — each optional
+    // tier switched by its `[skills]` key.
     let (marketplaces, warnings) = cfg.skills.marketplace_roots(config_dir);
     discovery_warnings.extend(warnings);
     let plugin_skills: Vec<(String, Vec<std::path::PathBuf>)> = plugins
         .iter()
         .map(|p| (p.name.clone(), p.skill_dirs.clone()))
         .collect();
+    let roots = hotl_tools::skills::SkillRoots::new(
+        config_dir,
+        cwd,
+        cfg.skills.project.unwrap_or(true),
+        cfg.skills.agents.unwrap_or(true),
+        cfg.skills.claude.unwrap_or(true),
+        marketplaces,
+        plugin_skills,
+    );
     // One discovery walk: the names for `/`-dispatch and their descriptions
     // come off the same tool that goes into the registry, never a second
     // scan of the roots.
     let mut skills_catalog: Vec<(String, String)> = Vec::new();
-    if let Some(skills) = hotl_tools::skills::SkillTool::new(
-        config_dir,
-        include_claude,
-        &marketplaces,
-        &plugin_skills,
-    ) {
+    let (skills, skill_warnings) = hotl_tools::skills::SkillTool::with_roots(&roots);
+    discovery_warnings.extend(skill_warnings);
+    if let Some(skills) = skills {
         skills_catalog = skills
             .catalog()
             .map(|(n, d)| (n.to_string(), d.to_string()))
@@ -5299,12 +5305,15 @@ mod tests {
         std::fs::create_dir_all(&skills).unwrap();
         std::fs::write(skills.join("deploy.md"), "# Deploy checklist\nsteps\n").unwrap();
 
-        // Pin the Claude roots off: they are real directories on the
-        // developer's machine and would leak into this assertion.
+        // Pin the Claude, `~/.agents` and project roots off: they are real
+        // directories on the developer's machine and would leak into this
+        // assertion.
         let mut cfg = crate::config::Config::default();
         cfg.skills.claude = Some(false);
+        cfg.skills.agents = Some(false);
+        cfg.skills.project = Some(false);
         let (_registry, catalog, _warnings, _retrieval) =
-            build_registry(&cfg, dir.path(), test_concurrency());
+            build_registry(&cfg, dir.path(), dir.path(), test_concurrency());
         assert_eq!(
             catalog,
             vec![("deploy".to_string(), "Deploy checklist".to_string())],
@@ -5314,7 +5323,7 @@ mod tests {
         // No skills configured → no names, and no tool registered.
         let empty = tempfile::tempdir().unwrap();
         let (_registry, catalog, _warnings, _retrieval) =
-            build_registry(&cfg, empty.path(), test_concurrency());
+            build_registry(&cfg, empty.path(), empty.path(), test_concurrency());
         assert!(catalog.is_empty(), "{catalog:?}");
     }
 
@@ -6185,14 +6194,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = crate::config::Config::default();
         cfg.skills.claude = Some(false);
-        let (registry, _, _, _) = build_registry(&cfg, dir.path(), test_concurrency());
+        let (registry, _, _, _) = build_registry(&cfg, dir.path(), dir.path(), test_concurrency());
         assert!(registry.get("web_fetch").is_some());
         assert!(registry.get("web_search").is_none());
 
         let cfg = config_from_toml(
             "[web]\n[web.search]\nurl = \"https://s.example/api\"\napi_key_env = \"SEARCH_KEY\"\n",
         );
-        let (registry, _, _, _) = build_registry(&cfg, dir.path(), test_concurrency());
+        let (registry, _, _, _) = build_registry(&cfg, dir.path(), dir.path(), test_concurrency());
         assert!(registry.get("web_fetch").is_some());
         assert!(registry.get("web_search").is_some());
     }

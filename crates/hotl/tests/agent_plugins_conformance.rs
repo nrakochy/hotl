@@ -286,10 +286,13 @@ fn a_scan_fixed_component_locations() {
     assert_eq!(entry.skill_dirs, vec![root.join("skills/summarize")]);
     assert_eq!(entry.servers[0].name, "mem");
 
-    let none = dir.path().join("none");
     let plugins = vec![("reports-plugin".to_string(), entry.skill_dirs.clone())];
-    let tool = hotl_tools::skills::SkillTool::with_roots(&none, &[], &none, &none, false, &plugins)
-        .expect("the plugin skill is discovered");
+    let tool = hotl_tools::skills::SkillTool::with_roots(&hotl_tools::skills::SkillRoots {
+        plugins,
+        ..Default::default()
+    })
+    .0
+    .expect("the plugin skill is discovered");
     let names: Vec<&str> = tool.names().collect();
     assert!(names.contains(&"summarize"), "{names:?}");
     assert!(names.contains(&"reports-plugin:summarize"), "{names:?}");

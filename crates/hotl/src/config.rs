@@ -67,6 +67,11 @@ pub struct SkillsCfg {
     /// `false` stops reading Claude Code skill roots (`~/.claude/skills`,
     /// the plugin cache). Default: read them when present.
     pub claude: Option<bool>,
+    /// `false` stops the project walk (`.agents/skills` and `.claude/skills`
+    /// from cwd up to the repo root). Default: on (0068).
+    pub project: Option<bool>,
+    /// `false` stops reading `~/.agents/skills`. Default: on (0068).
+    pub agents: Option<bool>,
     /// `[skills.marketplaces]` — extra skill sources: name → local path
     /// (read in place) or git URL (managed checkout; `hotl skills add`).
     #[serde(default)]
