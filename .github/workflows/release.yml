@@ -80,7 +80,13 @@ jobs:
           dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
-          echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+          # Hand-edited (dist allow-dirty = ["ci"]): the changelog text stays out
+          # of the job output. GitHub drops a job output that looks like it holds
+          # a secret ("Skip output 'val'"), and v0.29.0's notes quoting
+          # `Bearer …` did exactly that — every build job then skipped. Nothing
+          # downstream reads the announcement fields from this output; `host`
+          # recomputes them.
+          echo "manifest=$(jq -c 'del(.announcement_changelog, .announcement_github_body)' plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
         uses: actions/upload-artifact@v7
         with:
@@ -217,8 +223,10 @@ jobs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
-    # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    # Only run if we're "publishing", and only if both builds succeeded. Hand-edited:
+    # dist's default also accepts "skipped", which is how v0.29.0 went out as a
+    # release holding nothing but dist-manifest.json.
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.build-global-artifacts.result == 'success' && needs.build-local-artifacts.result == 'success' }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"

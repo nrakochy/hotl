@@ -142,6 +142,9 @@ targets = [
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
+# release.yml carries two hand edits (see the comments there), so dist must not
+# fail its freshness check. Re-apply them after any `dist generate`.
+allow-dirty = ["ci"]
 # gzip, not the xz default: `hotl update` decodes in-process, and pure-Rust xz
 # decoders are far narrower crates than flate2. Read at runtime by `dist plan`,
 # so release.yml needs no regeneration — the same is true of `targets` and
