@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-10-23
+
 ### Fixed
 
 - The TUI's `/<skill> args` prompt names the skill call with its keys in a
