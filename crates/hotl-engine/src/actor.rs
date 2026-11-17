@@ -1569,6 +1569,16 @@ pub(crate) async fn run(
                     )
                     .await;
             }
+            SessionCmd::SetColor(color) => {
+                let _ = shared
+                    .append(
+                        &mut log,
+                        &mut pipeline,
+                        &mut head,
+                        EntryPayload::ColorSet { color },
+                    )
+                    .await;
+            }
             SessionCmd::Aside { question } => {
                 spawn_aside(&shared, &cmd_tx, &events, &head, question);
             }

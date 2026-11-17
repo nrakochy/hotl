@@ -40,6 +40,8 @@ async fn rename_appends_a_durable_entry() {
     });
 
     handle.rename("fix-auth".into()).await;
+    handle.set_color(Some("pink".into())).await;
+    handle.set_color(None).await;
     handle.prompt("go".into()).await;
     loop {
         let ev = tokio::time::timeout(Duration::from_secs(30), handle.events.recv())
@@ -61,4 +63,15 @@ async fn rename_appends_a_durable_entry() {
         })
         .collect();
     assert_eq!(renames, vec!["fix-auth".to_string()]);
+    // `/color` (0080) rides the same actor-owned append path.
+    let colors: Vec<Option<String>> = std::fs::read_to_string(&log_path)
+        .expect("read log")
+        .lines()
+        .filter_map(|l| serde_json::from_str::<hotl_types::Entry>(l).ok())
+        .filter_map(|e| match e.payload {
+            EntryPayload::ColorSet { color } => Some(color),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(colors, vec![Some("pink".to_string()), None]);
 }

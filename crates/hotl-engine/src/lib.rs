@@ -1228,6 +1228,8 @@ pub enum SessionCmd {
     },
     /// Set the session's display name (durable: appended to the log).
     Rename(String),
+    /// Set or reset (`None`) the session's `/color` (durable; 0080).
+    SetColor(Option<String>),
     /// The auto-title task reporting back (0071 T4). `title` is already
     /// normalized; `None` = the model produced nothing usable, and only the
     /// spend is recorded.
@@ -1522,6 +1524,11 @@ impl SessionHandle {
     /// Name the session durably (a `rename` log entry; last one wins).
     pub async fn rename(&self, name: String) {
         let _ = self.cmd.send(SessionCmd::Rename(name)).await;
+    }
+    /// Set or reset the session's accent color (a `color_set` log entry;
+    /// last one wins). The caller validates the name.
+    pub async fn set_color(&self, color: Option<String>) {
+        let _ = self.cmd.send(SessionCmd::SetColor(color)).await;
     }
     /// Ask a side question over the cached prefix (0071 T5). The answer
     /// arrives as `AsideDone`; nothing enters the transcript.

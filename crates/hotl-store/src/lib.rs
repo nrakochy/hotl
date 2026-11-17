@@ -152,6 +152,8 @@ pub enum EntryKind {
     MemoryAppended,
     /// 0065: the session's worktree. Log-only, last one wins.
     WorktreeSet,
+    /// 0080: the session's `/color`. Log-only, last one wins.
+    ColorSet,
     Unknown,
 }
 
@@ -180,6 +182,7 @@ impl From<&EntryPayload> for EntryKind {
             EntryPayload::Cleared { .. } => EntryKind::Cleared,
             EntryPayload::MemoryAppended { .. } => EntryKind::MemoryAppended,
             EntryPayload::WorktreeSet { .. } => EntryKind::WorktreeSet,
+            EntryPayload::ColorSet { .. } => EntryKind::ColorSet,
             EntryPayload::Unknown => EntryKind::Unknown,
         }
     }
@@ -1584,6 +1587,9 @@ pub struct Replayed {
     /// the chain, child wins; 0065). A single `Option` like `goal`: the
     /// `--no-worktree` tombstone folds to plain `None`.
     pub worktree: Option<(String, String)>,
+    /// The session's `/color` (last `ColorSet` in the chain, child wins;
+    /// 0080). The reset tombstone folds to plain `None`.
+    pub color: Option<String>,
     /// Integrity warnings (a broken `parent_id` chain — H-12). Empty is clean.
     /// Replay is defensive regardless (indices clamped, unknowns degraded), so
     /// a warning means "this log was edited/corrupted since it was written",
@@ -1608,6 +1614,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
     let mut decisions = Vec::new();
     let mut goal = None;
     let mut worktree = None;
+    let mut color = None;
     let applied = apply_log(
         path,
         &mut items,
@@ -1622,6 +1629,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
         &mut decisions,
         &mut goal,
         &mut worktree,
+        &mut color,
         None,
     )?;
     Ok(Replayed {
@@ -1637,6 +1645,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
         decisions,
         goal,
         worktree,
+        color,
         warnings,
         tip_entry_id: applied.last_entry_id,
     })
@@ -1755,6 +1764,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
     let mut decisions = Vec::new();
     let mut goal = None;
     let mut worktree = None;
+    let mut color = None;
     let mut tip_entry_id = None;
     for (depth, (path, _)) in lineage.iter().enumerate().rev() {
         // Each ancestor is capped by the pin *its own child* recorded. The
@@ -1776,6 +1786,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
             &mut decisions,
             &mut goal,
             &mut worktree,
+            &mut color,
             stop_after,
         )?;
         if depth == 0 {
@@ -1795,6 +1806,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
         decisions,
         goal,
         worktree,
+        color,
         warnings,
         tip_entry_id,
     })
@@ -1838,6 +1850,7 @@ fn apply_log(
     decisions: &mut Vec<hotl_types::Decision>,
     goal: &mut Option<String>,
     worktree: &mut Option<(String, String)>,
+    color: &mut Option<String>,
     stop_after: Option<&str>,
 ) -> Result<Applied, String> {
     let file = File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -1981,6 +1994,8 @@ fn apply_log(
             EntryPayload::GoalSet { condition, .. } => *goal = condition,
             // Log-only, last one wins (0065); the two-null tombstone clears.
             EntryPayload::WorktreeSet { path, branch } => *worktree = path.zip(branch),
+            // Log-only, last one wins (0080); `None` is the reset.
+            EntryPayload::ColorSet { color: c } => *color = c,
             EntryPayload::Usage { .. } | EntryPayload::Cancelled { .. } => {}
             // `#[serde(other)]` keeps an old binary from crashing on a new
             // entry kind — but a dropped kind that *re-points* the projection
@@ -2689,6 +2704,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(replay(&path).unwrap().goal, None);
+    }
+
+    /// 0080: `/color` rides the log like a name — last one wins, a later
+    /// `None` clears it, never a projection item, absent when never set.
+    #[test]
+    fn color_set_replays_last_one_wins_and_none_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let path = log.path().to_path_buf();
+        assert_eq!(replay(&path).unwrap().color, None);
+        for (seq, c) in [(2, "red"), (3, "pink")] {
+            log.append(
+                &EntryPayload::ColorSet {
+                    color: Some(c.into()),
+                },
+                seq,
+            )
+            .unwrap();
+        }
+        let replayed = replay(&path).unwrap();
+        assert_eq!(replayed.color.as_deref(), Some("pink"));
+        assert!(
+            replayed.items.is_empty(),
+            "color_set is not a projection item"
+        );
+        log.append(&EntryPayload::ColorSet { color: None }, 4)
+            .unwrap();
+        assert_eq!(replay(&path).unwrap().color, None);
     }
 
     /// 0065 T3: the worktree rides the log like a name — last one wins,

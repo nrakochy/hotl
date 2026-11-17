@@ -594,6 +594,12 @@ pub enum EntryPayload {
         path: Option<String>,
         branch: Option<String>,
     },
+    /// The session's accent color (`/color`, `session/set_color`; 0080): one
+    /// of `hotl_theme::SESSION_COLORS`' names. Log-only, last one wins, like
+    /// `Rename`; `None` is the reset to default.
+    ColorSet {
+        color: Option<String>,
+    },
     #[serde(other)]
     Unknown,
 }
