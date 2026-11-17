@@ -1540,7 +1540,7 @@ mod tests {
         );
 
         let probe = Arc::new(Probe {
-            hold_ms: 40,
+            hold_ms: 1_000,
             ..Default::default()
         });
         let mut builder = ScriptedBuilder::new(|_, _| vec![ScriptedProvider::text_reply("ok")]);
