@@ -29,7 +29,7 @@ semver promise of their own.
   | `session/set_model`, `session/set_effort`, `session/set_plan` | `session/set_config_option` with `configId` `model`, `effort` or `plan` |
   | `session/rename`, `set_color`, `set_goal`, `steer`, `fold`, `aside`, `jobs/stop`, `children/stop`, `remember` with a `note` | `_hotl/session/<same name>`, same params and results |
   | `session/context`, `workflows`, `jobs`, `children`, `remember` without a `note` | `_hotl/session/<same name>`, same params. The reply is now the report itself. Before, the reply was `{"ok": true}` and the report came after it as a `session/update`. A script that waited for that update must read the reply instead. |
-  | `session/reload_config` | `_hotl/session/reload_config`, same params. On success the reply now also carries `type`, `skills` and `workflows`, and no separate `config_reloaded` update follows. On failure there is no `config_reload_failed` update; the error's `data` holds it instead. |
+  | `session/reload_config` | `_hotl/session/reload_config`, same params. On success the reply now also carries `type`, `skills` and `workflows`, and no separate `config_reloaded` update follows. On failure there is no `config_reload_failed` update; the error's `data` holds it instead. With a session open and no API key found, it now fails with `-32000` instead of re-opening the session. |
   | `session/request_permission {summary, protectedWhy}` | `session/request_permission {toolCall, options}` |
   | `session/request_egress {host}` | `session/request_permission` with `toolCall.kind: "fetch"` |
   | `session/request_question` | `elicitation/create` (a form) when the client supports forms, else `_hotl/session/request_question` |
@@ -61,6 +61,11 @@ semver promise of their own.
   also gets `hotl-setup`), `session/list`, `session/resume`, `session/close`.
   A keyless `hotl acp` still answers `initialize`, so an editor can show the
   sign-in.
+- One `hotl acp` process hosts one session at a time. Opening another
+  session on the same connection (`session/new`, `session/load` or
+  `session/resume`) ends the first one: its running turn stops and its open
+  prompts are answered `cancelled`. An editor that runs a second thread on the
+  same process (Zed may) ends the first thread this way.
 - `conformance/acp/`: the official ACP Rust SDK drives the built `hotl acp`
   and fails if any message hotl writes does not decode through its types.
   Run it with `cargo build -p hotl -p hotl-testkit --bins --examples` then

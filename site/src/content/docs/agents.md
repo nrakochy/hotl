@@ -524,6 +524,10 @@ runs `hotl setup` for it.
   forms. When it does not, the model is told no one is there to answer.
 - **Sessions** can be listed, loaded, resumed, and closed. Loading one replays
   its history into the editor first.
+- **One session at a time.** One `hotl acp` process hosts one session.
+  Opening another session on it ends the first: its running turn stops and
+  its open prompt ends as `cancelled`. If the editor runs a second thread on
+  the same process (Zed may), the first thread ends this way.
 - **Cancel** ends the turn as `cancelled`, denies any ask still open, and drops
   prompts the editor queued behind it.
 - **A prompt sent while a turn runs** waits and runs next, the same as typing
