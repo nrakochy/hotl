@@ -719,6 +719,15 @@ async fn write_in(
     extras: &[std::path::PathBuf],
     input: &Value,
 ) -> ToolResult {
+    write_in_with(root, extras, input, sandbox::read_deny()).await
+}
+
+async fn write_in_with(
+    root: &std::path::Path,
+    extras: &[std::path::PathBuf],
+    input: &Value,
+    deny: &sandbox::ReadDeny,
+) -> ToolResult {
     let path = str_arg(input, "path")?;
     let content = str_arg(input, "content")?;
     // Tier A: rewriting hotl's own allow-rules or hooks is the write-side
@@ -728,9 +737,9 @@ async fn write_in(
     }
     let target = write_target(root, extras, path);
     let before = match &target {
-        WriteTarget::Workspace(rel) => before_beneath(root, rel),
-        WriteTarget::Extra(eroot, rel) => before_beneath(eroot, rel),
-        WriteTarget::OutsideApproved => before_plain(std::path::Path::new(path)),
+        WriteTarget::Workspace(rel) => before_beneath(root, rel, deny),
+        WriteTarget::Extra(eroot, rel) => before_beneath(eroot, rel, deny),
+        WriteTarget::OutsideApproved => before_plain(std::path::Path::new(path), deny),
     };
     match target {
         WriteTarget::Workspace(rel) => guarded_write_bytes(root, &rel, path, content)?,
@@ -760,7 +769,14 @@ async fn write_in(
     )
 }
 
-fn before_beneath(root: &std::path::Path, rel: &std::path::Path) -> crate::Before {
+fn before_beneath(
+    root: &std::path::Path,
+    rel: &std::path::Path,
+    deny: &sandbox::ReadDeny,
+) -> crate::Before {
+    if read_carved(&root.join(rel), deny) {
+        return crate::Before::Unshown;
+    }
     match fsguard::open_beneath(root, rel) {
         Ok(file) => before_of(file),
         Err(fsguard::GuardError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -770,8 +786,11 @@ fn before_beneath(root: &std::path::Path, rel: &std::path::Path) -> crate::Befor
     }
 }
 
-fn before_plain(path: &std::path::Path) -> crate::Before {
-    match std::fs::metadata(path) {
+fn before_plain(path: &std::path::Path, deny: &sandbox::ReadDeny) -> crate::Before {
+    if read_carved(path, deny) {
+        return crate::Before::Unshown;
+    }
+    match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => crate::Before::Absent,
         Ok(meta) if meta.is_file() => match std::fs::File::open(path) {
             Ok(file) => before_of(file),
@@ -779,6 +798,24 @@ fn before_plain(path: &std::path::Path) -> crate::Before {
         },
         _ => crate::Before::Unshown,
     }
+}
+
+fn read_carved(target: &std::path::Path, deny: &sandbox::ReadDeny) -> bool {
+    let absolute = if target.is_absolute() {
+        lexical_normalize(target)
+    } else {
+        lexical_normalize(
+            &std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(target),
+        )
+    };
+    let candidates = [fsguard::resolve_as_far_as_it_exists(&absolute), absolute];
+    deny.always
+        .iter()
+        .chain(&deny.secrets)
+        .chain(&deny.rules)
+        .any(|dir| candidates.iter().any(|c| c.starts_with(dir)))
 }
 
 fn before_of(file: std::fs::File) -> crate::Before {
@@ -2911,6 +2948,57 @@ mod tests {
         assert_eq!(
             write("bin.dat").await.facts.before,
             Some(crate::Before::Unshown)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_never_shows_what_a_read_may_not() {
+        let (_o, root, home) = fsguard::tests::fixture();
+        std::fs::write(root.join(".env"), "TOKEN=secret\n").unwrap();
+        let creds = home.join(".aws/credentials");
+        std::fs::create_dir_all(creds.parent().unwrap()).unwrap();
+        std::fs::write(&creds, "aws_secret=1\n").unwrap();
+        let deny = sandbox::ReadDeny {
+            rules: vec![root.join(".env")],
+            secrets: vec![home.join(".aws")],
+            ..Default::default()
+        };
+        for (path, file) in [
+            (".env".to_string(), root.join(".env")),
+            (creds.display().to_string(), creds.clone()),
+        ] {
+            let out = done(
+                write_in_with(
+                    &root,
+                    &[],
+                    &json!({"path": path, "content": "new\n"}),
+                    &deny,
+                )
+                .await,
+            );
+            assert!(!out.is_error, "{}", out.content);
+            assert_eq!(out.facts.before, Some(crate::Before::Unshown), "{path}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
+        }
+    }
+
+    #[test]
+    fn a_symlinked_target_is_never_shown() {
+        let (_o, root, home) = fsguard::tests::fixture();
+        let target = home.join("private.txt");
+        std::fs::write(&target, "private\n").unwrap();
+        symlink_or_skip!(&target, root.join("link.txt"));
+        assert_eq!(
+            before_beneath(
+                &root,
+                std::path::Path::new("link.txt"),
+                &sandbox::ReadDeny::default()
+            ),
+            crate::Before::Unshown
+        );
+        assert_eq!(
+            before_plain(&root.join("link.txt"), &sandbox::ReadDeny::default()),
+            crate::Before::Unshown
         );
     }
 
