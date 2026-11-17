@@ -793,22 +793,23 @@ pub(crate) async fn build_acp_with(
         // typing-time trigger (first composer keystroke) has no ACP signal
         // to hang off today — see the task report for that deferral.
         scaffold.provider.arm().detach();
-        let (resumed, requested, is_fork, worktree_arg, no_worktree, base) = match spec {
+        let (resumed, requested, is_fork, worktree_arg, no_worktree, base, replay) = match spec {
             crate::acp::SessionSpec::New {
                 name,
                 worktree,
                 cwd,
-            } => (None, name, false, worktree, false, cwd),
+            } => (None, name, false, worktree, false, cwd, false),
             crate::acp::SessionSpec::Load {
                 session_id: sid,
                 name,
                 no_worktree,
                 cwd,
+                replay,
             } => {
                 let resumed = load_lineage(&sessions_dir(), &sid, KeepSpec::All)?;
                 // An explicit rename-on-resume beats the inherited name.
                 let name = name.or_else(|| resumed.inherited_name.clone());
-                (Some(resumed), name, false, None, no_worktree, cwd)
+                (Some(resumed), name, false, None, no_worktree, cwd, replay)
             }
             // A fork is a resume that (a) may stop at a prefix and (b) never
             // takes the parent's name: two live sessions sharing one name
@@ -826,6 +827,7 @@ pub(crate) async fn build_acp_with(
                 worktree,
                 false,
                 cwd,
+                false,
             ),
         };
         // The worktree (0065): a cheap refusal before any log is minted.
@@ -842,7 +844,10 @@ pub(crate) async fn build_acp_with(
         )?;
         let _ = log.append(
             &hotl_types::EntryPayload::CwdSet {
-                path: base.display().to_string(),
+                path: dunce::canonicalize(&base)
+                    .unwrap_or_else(|_| base.clone())
+                    .display()
+                    .to_string(),
             },
             scaffold.clock.now_ms(),
         );
@@ -1027,12 +1032,26 @@ pub(crate) async fn build_acp_with(
             .as_ref()
             .map(|o| o.lease.path().to_path_buf())
             .or_else(|| (base != scaffold.cwd).then(|| base.clone()));
-        let (initial, mut notices) = session_context(
+        let (plan_files, memory_files) = match &root {
+            Some(r) => files_for_root(
+                scaffold.plan_files.as_ref(),
+                scaffold.plan_repo_dir.as_deref(),
+                scaffold.config.memory_files.as_ref(),
+                r,
+            ),
+            None => (
+                scaffold.plan_files.clone(),
+                scaffold.config.memory_files.clone(),
+            ),
+        };
+        let (initial, mut notices) = session_context_with(
             &scaffold,
             &resumed,
             plan,
             root.as_deref(),
             opened.as_ref().map(|o| o.note.as_str()),
+            plan_files.as_ref(),
+            memory_files.as_ref(),
         );
         if let Some(o) = &opened {
             if resumed.is_some() {
@@ -1071,15 +1090,18 @@ pub(crate) async fn build_acp_with(
         });
         let history = resumed
             .as_ref()
-            .filter(|_| !is_fork)
+            .filter(|_| replay)
             .map(|r| r.items.clone())
             .unwrap_or_default();
+        let plan_artifact = plan_files
+            .as_ref()
+            .map(|f| f.dir.join("current.md").display().to_string());
         let handle = spawn_interactive_session(
             scaffold.registry_rooted(root.as_deref()),
             Some(scaffold.spawn_registration(session_id.clone(), root.as_deref())),
             Some(scaffold.recall_registration(session_id.clone())),
             scaffold.hooks.clone(),
-            scaffold.plan_artifact_path(),
+            plan_artifact,
             |registry| {
                 let mut deps = scaffold.deps_with_model(
                     log,
@@ -1099,6 +1121,8 @@ pub(crate) async fn build_acp_with(
                 if let Some(r) = &root {
                     deps.cwd = r.clone();
                 }
+                deps.plan_files = plan_files;
+                deps.config.memory_files = memory_files;
                 deps
             },
         );
@@ -1327,6 +1351,7 @@ struct Scaffold {
     /// Where every session in this process files its plan artifact (0056 T2)
     /// — one project id per process, computed once at scaffold time.
     plan_files: Option<hotl_engine::PlanFiles>,
+    plan_repo_dir: Option<String>,
     /// Startup warnings, collected rather than printed: `/reload` rebuilds a
     /// scaffold with the alternate screen up, where a stray `eprintln!` would
     /// corrupt the display. Startup callers print these verbatim; the reload
@@ -1483,6 +1508,7 @@ async fn scaffold(
     config.max_jobs = cfg.behavior.max_jobs();
     Ok(Scaffold {
         plan_files,
+        plan_repo_dir: cfg.plan.repo_dir.clone(),
         provider,
         model,
         clock,
@@ -1735,14 +1761,33 @@ fn memory_files_for(
         Ok(m) => (m, None),
         Err(w) => (hotl_engine::MemoryMode::ReadOnly, Some(w)),
     };
+    (memory_files_at(mode, cwd), warning)
+}
+
+fn memory_files_at(
+    mode: hotl_engine::MemoryMode,
+    cwd: &std::path::Path,
+) -> Option<hotl_engine::MemoryFiles> {
     let project = hotl_store::project::id(cwd);
+    Some(hotl_engine::MemoryFiles {
+        dir: data_dir().join("memory").join(&project),
+        project,
+        mode,
+    })
+}
+
+fn files_for_root(
+    plan: Option<&hotl_engine::PlanFiles>,
+    plan_repo_dir: Option<&str>,
+    memory: Option<&hotl_engine::MemoryFiles>,
+    root: &std::path::Path,
+) -> (
+    Option<hotl_engine::PlanFiles>,
+    Option<hotl_engine::MemoryFiles>,
+) {
     (
-        Some(hotl_engine::MemoryFiles {
-            dir: data_dir().join("memory").join(&project),
-            project,
-            mode,
-        }),
-        warning,
+        plan.and_then(|_| plan_files_at(plan_repo_dir, root)),
+        memory.and_then(|m| memory_files_at(m.mode, root)),
     )
 }
 
@@ -1765,9 +1810,13 @@ fn plan_files_for(
     cfg: &crate::config::Config,
     cwd: &std::path::Path,
 ) -> Option<hotl_engine::PlanFiles> {
+    plan_files_at(cfg.plan.repo_dir.as_deref(), cwd)
+}
+
+fn plan_files_at(repo_dir: Option<&str>, cwd: &std::path::Path) -> Option<hotl_engine::PlanFiles> {
     let project = hotl_store::project::id(cwd);
     let dir = data_dir().join("plans").join(&project);
-    let repo_mirror = cfg.plan.repo_dir.as_ref().map(|d| {
+    let repo_mirror = repo_dir.map(|d| {
         let base = std::path::Path::new(d);
         let base = if base.is_absolute() {
             base.to_path_buf()
@@ -3500,6 +3549,26 @@ fn session_context(
     root: Option<&std::path::Path>,
     worktree_note: Option<&str>,
 ) -> (Vec<hotl_types::Item>, Vec<String>) {
+    session_context_with(
+        scaffold,
+        resumed,
+        plan,
+        root,
+        worktree_note,
+        scaffold.plan_files.as_ref(),
+        scaffold.config.memory_files.as_ref(),
+    )
+}
+
+fn session_context_with(
+    scaffold: &Scaffold,
+    resumed: &Option<Resumed>,
+    plan: bool,
+    root: Option<&std::path::Path>,
+    worktree_note: Option<&str>,
+    plan_files: Option<&hotl_engine::PlanFiles>,
+    memory_files: Option<&hotl_engine::MemoryFiles>,
+) -> (Vec<hotl_types::Item>, Vec<String>) {
     match resumed {
         Some(r) => (r.items.clone(), Vec::new()),
         None => fresh_context_capped(
@@ -3508,9 +3577,9 @@ fn session_context(
             &scaffold.model,
             &hotl_context::civil_date_utc(scaffold.clock.now_ms()),
             plan,
-            scaffold.plan_files.as_ref(),
+            plan_files,
             scaffold.config.instructions_max_bytes,
-            scaffold.config.memory_files.as_ref(),
+            memory_files,
             worktree_note,
         ),
     }
@@ -9790,6 +9859,30 @@ mod worktree_session_tests {
     use crate::tui::WorktreeArg;
     use hotl_store::worktree::{list_session_worktrees, SessionWorktree};
     use hotl_store::{Masker, SessionLog};
+
+    #[test]
+    fn plan_and_memory_files_follow_the_session_root() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let plan = plan_files_at(Some("docs"), &cwd);
+        let memory = memory_files_at(hotl_engine::MemoryMode::ReadWrite, &cwd);
+        let id = hotl_store::project::id(root.path());
+        assert_ne!(id, hotl_store::project::id(&cwd));
+        let (p, m) = files_for_root(plan.as_ref(), Some("docs"), memory.as_ref(), root.path());
+        let p = p.unwrap();
+        assert_eq!(p.project, id);
+        assert!(p.dir.ends_with(&id), "{:?}", p.dir);
+        assert_eq!(
+            p.repo_mirror,
+            Some(root.path().join("docs").join("hotl-plan.md"))
+        );
+        let m = m.unwrap();
+        assert_eq!(m.project, id);
+        assert!(m.dir.ends_with(&id), "{:?}", m.dir);
+        assert_eq!(m.mode, hotl_engine::MemoryMode::ReadWrite);
+        let (p, m) = files_for_root(None, None, None, root.path());
+        assert!(p.is_none() && m.is_none(), "a dial that is off stays off");
+    }
 
     fn git(dir: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
         std::process::Command::new("git")

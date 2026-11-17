@@ -2809,9 +2809,9 @@ async fn reload_config_swaps_the_engine_and_broadcasts_the_new_truth() {
         "the ack carries the new model"
     );
     assert_eq!(ack["result"]["contextWindow"], 900_000);
-    assert_ne!(
+    assert_eq!(
         ack["result"]["sessionId"], first_session,
-        "the session was re-opened, so it is a new link in the log chain"
+        "the client keeps the session id it knows across a reload"
     );
 
     // REGRESSION: the resume must name the **store** session id, not this
@@ -4536,4 +4536,242 @@ async fn fork_returns_a_new_session_and_does_not_continue() {
     .await;
     assert_eq!(text["params"]["update"]["text"], "FIRST");
     assert_eq!(text["params"]["sessionId"], sid);
+}
+
+fn store_factory(
+    dir: std::path::PathBuf,
+    loads: Arc<std::sync::Mutex<Vec<String>>>,
+) -> acp::SessionFactory {
+    Box::new(move |spec| {
+        let (history, replay) = match &spec {
+            acp::SessionSpec::Load {
+                session_id, replay, ..
+            } => {
+                loads.lock().unwrap().push(session_id.clone());
+                (
+                    hotl_store::replay_chain(&dir, session_id)
+                        .map_err(|e| e.to_string())?
+                        .items,
+                    *replay,
+                )
+            }
+            acp::SessionSpec::Fork { session_id, .. } => {
+                loads.lock().unwrap().push(format!("fork:{session_id}"));
+                (Vec::new(), false)
+            }
+            acp::SessionSpec::New { .. } => (Vec::new(), false),
+        };
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
+        Ok(acp::SessionOpen {
+            history: if replay { history } else { Vec::new() },
+            memory_mode: None,
+            worktree: None,
+            lease: None,
+            color: None,
+            handle: spawn_session(SessionDeps {
+                concurrency: Default::default(),
+                provider: Arc::new(ScriptedProvider::new(vec![])),
+                registry: Arc::new(Registry::builtin()),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: std::env::temp_dir(),
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
+                initial_goal: None,
+                config: EngineConfig::default(),
+            }),
+            name: None,
+            mode: "ask".into(),
+            plan: false,
+            default_effort: None,
+            effort_schedule: None,
+            goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
+            session_id,
+            warnings: Vec::new(),
+            title: None,
+            model: None,
+        })
+    })
+}
+
+fn logged_turn(
+    dir: &std::path::Path,
+    parent: Option<&str>,
+    fork: bool,
+    said: &str,
+    secs: u64,
+) -> String {
+    let path = {
+        let mut log = SessionLog::create(
+            dir,
+            "m",
+            parent.map(|p| hotl_store::ParentRef {
+                session_id: p.to_string(),
+                tip_entry_id: None,
+            }),
+            Masker::empty(),
+            0,
+        )
+        .unwrap();
+        if fork {
+            log.append(&hotl_types::EntryPayload::BranchMove { keep_items: 0 }, 1)
+                .unwrap();
+        }
+        log.append(
+            &hotl_types::EntryPayload::CwdSet {
+                path: "/work/chain".into(),
+            },
+            1,
+        )
+        .unwrap();
+        log.append(
+            &hotl_types::EntryPayload::Item {
+                item: hotl_types::Item::User {
+                    text: said.into(),
+                    synthetic: None,
+                    images: Vec::new(),
+                },
+            },
+            2,
+        )
+        .unwrap();
+        log.path().to_path_buf()
+    };
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+        .unwrap();
+    path.file_stem().unwrap().to_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn load_of_a_resumed_id_sees_its_newest_continuation() {
+    let dir = tempfile::tempdir().unwrap();
+    let s1 = logged_turn(dir.path(), None, false, "first ask", 1_700_000_000);
+    let c1 = logged_turn(dir.path(), Some(&s1), false, "second ask", 1_700_000_100);
+    let fork = logged_turn(dir.path(), Some(&c1), true, "forked ask", 1_700_000_200);
+    let loads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let info = acp::ServerInfo {
+        sessions_dir: Some(dir.path().to_path_buf()),
+        ..server_info()
+    };
+    let (mut w, mut lines) =
+        connect(store_factory(dir.path().to_path_buf(), loads.clone()), info).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/load",
+               "params":{"sessionId":s1,"cwd":std::env::temp_dir(),"mcpServers":[]}}),
+    )
+    .await;
+    let (before, reply) = frames_through_reply(&mut lines, 2).await;
+    assert!(reply.get("result").is_some(), "{reply}");
+    let said: Vec<&str> = session_updates(&before)
+        .iter()
+        .filter(|u| u["sessionUpdate"] == "user_message_chunk")
+        .map(|u| u["content"]["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(said, ["first ask", "second ask"]);
+    assert_eq!(before[0]["params"]["sessionId"], s1.as_str());
+    assert_eq!(loads.lock().unwrap().clone(), vec![c1.clone()]);
+
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/fork",
+               "params":{"sessionId":s1,"cwd":std::env::temp_dir()}}),
+    )
+    .await;
+    read_until_id(&mut lines, 3).await;
+    assert_eq!(loads.lock().unwrap()[1], format!("fork:{c1}"));
+
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/list","params":{"cwd":"/work/chain"}}),
+    )
+    .await;
+    let listed = read_until_id(&mut lines, 4).await;
+    let ids: Vec<&str> = listed["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["sessionId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [fork.as_str(), c1.as_str()], "one row per chain");
+}
+
+#[tokio::test]
+async fn opening_an_unknown_stored_id_is_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = acp::ServerInfo {
+        sessions_dir: Some(dir.path().to_path_buf()),
+        ..server_info()
+    };
+    let (mut w, mut lines) = connect(scripted_factory(), info).await;
+    let calls = [
+        (
+            "session/load",
+            json!({"sessionId":"01NOPE","cwd":std::env::temp_dir()}),
+        ),
+        (
+            "session/resume",
+            json!({"sessionId":"01NOPE","cwd":std::env::temp_dir()}),
+        ),
+        ("_hotl/session/fork", json!({"sessionId":"../x"})),
+    ];
+    for (i, (method, params)) in calls.into_iter().enumerate() {
+        let id = 10 + i as u64;
+        send(
+            &mut w,
+            json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+        )
+        .await;
+        let r = read_until_id(&mut lines, id).await;
+        assert_eq!(r["error"]["code"], -32002, "{method}: {r}");
+    }
+}
+
+#[tokio::test]
+async fn list_matches_a_cwd_by_its_real_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let real = dunce::canonicalize(work.path()).unwrap();
+    let path = {
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).unwrap();
+        log.append(
+            &hotl_types::EntryPayload::CwdSet {
+                path: real.display().to_string(),
+            },
+            1,
+        )
+        .unwrap();
+        log.session_id.clone()
+    };
+    let info = acp::ServerInfo {
+        sessions_dir: Some(dir.path().to_path_buf()),
+        ..server_info()
+    };
+    let (mut w, mut lines) = connect(scripted_factory(), info).await;
+    let spelled = work.path().join(".");
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/list","params":{"cwd":spelled}}),
+    )
+    .await;
+    let listed = read_until_id(&mut lines, 2).await;
+    assert_eq!(
+        listed["result"]["sessions"][0]["sessionId"],
+        path.as_str(),
+        "{listed}"
+    );
 }

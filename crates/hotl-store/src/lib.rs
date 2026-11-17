@@ -2151,16 +2151,71 @@ pub fn session_worktree(path: &Path) -> Option<(String, String)> {
     found.flatten()
 }
 
-pub fn session_cwd(path: &Path) -> Option<String> {
-    label_in_tail(path, "\"cwd_set\"", cwd_of)
-        .or_else(|| label_by_full_scan(path, "\"cwd_set\"", cwd_of))
+const HEAD_LINES: usize = 32;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogHead {
+    pub parent: Option<String>,
+    pub fork: bool,
+    pub cwd: Option<String>,
+    pub label: Option<String>,
 }
 
-fn cwd_of(entry: Entry) -> Option<String> {
-    match entry.payload {
-        EntryPayload::CwdSet { path } => Some(path),
-        _ => None,
+pub fn log_head(path: &Path) -> Option<LogHead> {
+    let file = File::open(path).ok()?;
+    let mut head = LogHead::default();
+    let mut title = None;
+    for line in BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .take(HEAD_LINES)
+    {
+        let Ok(entry) = serde_json::from_str::<Entry>(&line) else {
+            continue;
+        };
+        match entry.payload {
+            EntryPayload::Header { header } => head.parent = header.parent_session_id,
+            EntryPayload::BranchMove { .. } => head.fork = true,
+            EntryPayload::CwdSet { path } => head.cwd = Some(path),
+            EntryPayload::Rename { name } => head.label = Some(name),
+            EntryPayload::Title { title: t } => title = Some(t),
+            _ => {}
+        }
     }
+    head.label = head.label.or(title);
+    Some(head)
+}
+
+pub fn session_label_from_tail(path: &Path) -> Option<String> {
+    label_in_tail(path, "\"rename\"", rename_of)
+        .or_else(|| label_in_tail(path, "\"title\"", title_of))
+}
+
+pub fn newest_continuation(dir: &Path, session_id: &str) -> String {
+    let mut continuations: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (id, path, _) in list_sessions(dir) {
+        if let Some(LogHead {
+            parent: Some(parent),
+            fork: false,
+            ..
+        }) = log_head(&path)
+        {
+            continuations.entry(parent).or_default().push(id);
+        }
+    }
+    let mut visited = std::collections::HashSet::from([session_id.to_string()]);
+    let mut current = session_id.to_string();
+    for _ in 0..LINEAGE_DEPTH_CAP {
+        let Some(next) = continuations.get(&current).and_then(|c| c.first()) else {
+            break;
+        };
+        if !visited.insert(next.clone()) {
+            break;
+        }
+        current = next.clone();
+    }
+    current
 }
 
 fn rename_of(entry: Entry) -> Option<String> {
@@ -2252,17 +2307,64 @@ mod tests {
     use super::*;
     use hotl_types::{Item, Todo, TodoStatus, ToolResultItem};
 
+    fn seeded(dir: &Path, parent: Option<&str>, fork: bool, cwd: &str, secs: u64) -> String {
+        let path = {
+            let mut log = SessionLog::create(
+                dir,
+                "m",
+                parent.map(|p| ParentRef {
+                    session_id: p.to_string(),
+                    tip_entry_id: None,
+                }),
+                Masker::empty(),
+                1,
+            )
+            .unwrap();
+            if fork {
+                log.append(&EntryPayload::BranchMove { keep_items: 0 }, 2)
+                    .unwrap();
+            }
+            log.append(&EntryPayload::CwdSet { path: cwd.into() }, 3)
+                .unwrap();
+            log.append(&EntryPayload::Rename { name: "n".into() }, 4)
+                .unwrap();
+            log.path().to_path_buf()
+        };
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+        path.file_stem().unwrap().to_str().unwrap().to_string()
+    }
+
     #[test]
-    fn session_cwd_is_the_last_one_logged() {
+    fn log_head_reads_parent_fork_cwd_and_label() {
         let dir = tempfile::tempdir().unwrap();
-        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
-        assert_eq!(session_cwd(log.path()), None);
-        log.append(&EntryPayload::CwdSet { path: "/a".into() }, 2)
-            .unwrap();
-        log.append(&EntryPayload::CwdSet { path: "/b".into() }, 3)
-            .unwrap();
-        assert_eq!(session_cwd(log.path()).as_deref(), Some("/b"));
-        assert!(replay(log.path()).is_ok());
+        let root = seeded(dir.path(), None, false, "/a", 10);
+        let fork = seeded(dir.path(), Some(&root), true, "/b", 20);
+        let head = log_head(&dir.path().join(format!("{fork}.jsonl"))).unwrap();
+        assert_eq!(head.parent.as_deref(), Some(root.as_str()));
+        assert!(head.fork);
+        assert_eq!(head.cwd.as_deref(), Some("/b"));
+        assert_eq!(head.label.as_deref(), Some("n"));
+        let head = log_head(&dir.path().join(format!("{root}.jsonl"))).unwrap();
+        assert_eq!(head.parent, None);
+        assert!(!head.fork);
+    }
+
+    #[test]
+    fn newest_continuation_follows_resumes_but_not_forks() {
+        let dir = tempfile::tempdir().unwrap();
+        let s1 = seeded(dir.path(), None, false, "/a", 10);
+        let c1 = seeded(dir.path(), Some(&s1), false, "/a", 20);
+        let old = seeded(dir.path(), Some(&s1), false, "/a", 15);
+        let c2 = seeded(dir.path(), Some(&c1), false, "/a", 30);
+        seeded(dir.path(), Some(&c2), true, "/a", 40);
+        assert_eq!(newest_continuation(dir.path(), &s1), c2);
+        assert_eq!(newest_continuation(dir.path(), &old), old);
+        assert_eq!(newest_continuation(dir.path(), "missing"), "missing");
     }
 
     #[test]

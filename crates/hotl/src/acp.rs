@@ -222,6 +222,7 @@ pub enum SessionSpec {
         /// chain's worktree.
         no_worktree: bool,
         cwd: std::path::PathBuf,
+        replay: bool,
     },
     /// A **new** session seeded with another's projection — optionally only a
     /// prefix of it — pinned to that session's fork-time tip. Unlike `Load`,
@@ -291,9 +292,8 @@ pub struct SessionOpen {
     /// inherited transcript is a §5.7 lie.
     pub previous_model: Option<String>,
     /// The **store** session id — what `hotl_store::replay_chain` resolves and
-    /// what `SessionSpec::Load` takes, as distinct from the `acp-N` handle
-    /// this connection hands clients. `session/reload_config` resumes through
-    /// this; resuming through the handle id silently fails to replay.
+    /// what `SessionSpec::Load` takes. `session/reload_config` resumes through
+    /// this.
     pub session_id: String,
     /// Per-session startup notices (an instruction file cut at the cap,
     /// 0070 T9). The open reply carries them as `warnings`; the client shows
@@ -497,15 +497,23 @@ pub async fn serve(
 struct SessionState {
     id: String,
     /// The durable id this session's log carries — what a resume (and so
-    /// `session/reload_config`) has to name. Not `id`, which is this
-    /// connection's `acp-N` handle and means nothing to the store.
+    /// `session/reload_config`) has to name.
     store_id: String,
     cwd: std::path::PathBuf,
     handle: SessionHandle,
     drain: tokio::task::JoinHandle<()>,
+    go: Option<oneshot::Sender<()>>,
     /// The worktree lock (0065 T7): unlocked when this state drops — a
     /// replaced session, a closed connection, a clean quit.
     _lease: Option<hotl_store::worktree::Leased>,
+}
+
+impl SessionState {
+    fn release_drain(&mut self) {
+        if let Some(go) = self.go.take() {
+            let _ = go.send(());
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -594,7 +602,7 @@ async fn handle_request(
                 return reply_err(writer, id, codes::AUTH_REQUIRED, NO_KEY_MESSAGE).await;
             }
             let Opening {
-                spec,
+                mut spec,
                 kind,
                 client_id,
                 cwd,
@@ -602,6 +610,36 @@ async fn handle_request(
                 Ok(o) => o,
                 Err(e) => return reply_err(writer, id, codes::INVALID_PARAMS, &e).await,
             };
+            if let Some(dir) = info.sessions_dir.clone() {
+                let target = match &mut spec {
+                    SessionSpec::Load { session_id, .. } | SessionSpec::Fork { session_id, .. } => {
+                        Some(session_id)
+                    }
+                    SessionSpec::New { .. } => None,
+                };
+                if let Some(session_id) = target {
+                    let asked = session_id.clone();
+                    let resolved = tokio::task::spawn_blocking(move || {
+                        stored_session(&dir, &asked)
+                            .then(|| hotl_store::newest_continuation(&dir, &asked))
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    match resolved {
+                        Some(newest) => *session_id = newest,
+                        None => {
+                            return reply_err(
+                                writer,
+                                id,
+                                codes::NOT_FOUND,
+                                &format!("no stored session `{session_id}`"),
+                            )
+                            .await
+                        }
+                    }
+                }
+            }
             let mut open = match factory(spec) {
                 Ok(open) => open,
                 Err(e) => return reply_err(writer, id, codes::INTERNAL, &e).await,
@@ -619,6 +657,7 @@ async fn handle_request(
                 open,
                 sid.clone(),
                 cwd,
+                true,
                 writer,
                 session,
                 pending,
@@ -658,6 +697,9 @@ async fn handle_request(
                 OpenKind::Resume => to_json(&ResumeSessionResponse { modes, meta }),
             };
             reply_ok(writer, id, result).await;
+            if let Some(state) = session.as_mut() {
+                state.release_drain();
+            }
             let commands = info
                 .skills
                 .iter()
@@ -727,7 +769,12 @@ async fn handle_request(
                     }
                 },
             };
-            match list_sessions(info.sessions_dir.as_deref(), &request) {
+            let dir = info.sessions_dir.clone();
+            let listed =
+                tokio::task::spawn_blocking(move || list_sessions(dir.as_deref(), &request))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("session/list failed: {e}")));
+            match listed {
                 Ok(list) => reply_ok(writer, id, to_json(&list)).await,
                 Err(e) => reply_err(writer, id, codes::INVALID_PARAMS, &e).await,
             }
@@ -1369,9 +1416,9 @@ async fn handle_request(
             *info = new_info;
             // No live session: the new factory is in place and the next
             // `session/new` gets the reloaded engine. Nothing to re-open.
-            let Some((store_id, cwd)) = session
+            let Some((client_id, store_id, cwd)) = session
                 .as_ref()
-                .map(|s| (s.store_id.clone(), s.cwd.clone()))
+                .map(|s| (s.id.clone(), s.store_id.clone(), s.cwd.clone()))
             else {
                 return reply_ok(
                     writer,
@@ -1384,9 +1431,6 @@ async fn handle_request(
                 )
                 .await;
             };
-            // The **store** id, not this connection's `acp-N` handle — the
-            // factory replays a log chain, and `acp-1` names no log.
-            //
             // `name: None` so the replay inherits the session's own name, and
             // `SessionSpec::Load` so it inherits its own mode: a logged
             // `/mode` outlives a `[permissions] mode` edit, exactly as across
@@ -1398,16 +1442,18 @@ async fn handle_request(
                 name: None,
                 no_worktree: false,
                 cwd: cwd.clone(),
+                replay: false,
             };
             match factory(spec) {
                 Ok(open) => {
                     let mode = open.mode.clone();
                     let plan = open.plan;
-                    let sid = open.session_id.clone();
+                    let sid = client_id;
                     install_session(
                         open,
                         sid.clone(),
                         cwd,
+                        false,
                         writer,
                         session,
                         pending,
@@ -1853,6 +1899,7 @@ fn parse_load(method: &str, msg: &Value) -> Result<Opening, String> {
             name: meta.name,
             no_worktree: meta.no_worktree,
             cwd: cwd.clone(),
+            replay: kind == OpenKind::Load,
         },
         kind,
         client_id: Some(session_id),
@@ -1891,6 +1938,19 @@ fn parse_fork(method: &str, msg: &Value) -> Result<Opening, String> {
 
 const SESSION_LIST_PAGE: usize = 50;
 
+fn stored_session(dir: &std::path::Path, session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.chars().all(|c| c.is_ascii_alphanumeric())
+        && dir.join(format!("{session_id}.jsonl")).is_file()
+}
+
+fn canonical(path: &std::path::Path) -> String {
+    dunce::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
 fn list_sessions(
     dir: Option<&std::path::Path>,
     request: &ListSessionsRequest,
@@ -1901,21 +1961,34 @@ fn list_sessions(
             .parse::<usize>()
             .map_err(|_| format!("params.cursor {c:?} is not a cursor this server gave out"))?,
     };
-    let want = request.cwd.as_ref().map(|c| c.display().to_string());
-    let mut sessions: Vec<SessionInfo> = dir
+    let want = request.cwd.as_deref().map(canonical);
+    let logs: Vec<_> = dir
         .map(hotl_store::list_sessions)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(session_id, path, modified)| {
-            let cwd = hotl_store::session_cwd(&path)?;
+            let head = hotl_store::log_head(&path)?;
+            Some((session_id, path, modified, head))
+        })
+        .collect();
+    let continued: std::collections::HashSet<&str> = logs
+        .iter()
+        .filter(|(.., head)| !head.fork)
+        .filter_map(|(.., head)| head.parent.as_deref())
+        .collect();
+    let mut sessions: Vec<SessionInfo> = logs
+        .iter()
+        .filter(|(session_id, ..)| !continued.contains(session_id.as_str()))
+        .filter_map(|(session_id, path, modified, head)| {
+            let cwd = head.cwd.clone()?;
             if want.as_ref().is_some_and(|w| *w != cwd) {
                 return None;
             }
             Some(SessionInfo {
-                session_id,
+                session_id: session_id.clone(),
                 cwd: cwd.into(),
-                title: hotl_store::session_name(&path).or_else(|| hotl_store::session_title(&path)),
-                updated_at: Some(crate::acp_map::rfc3339(modified)),
+                title: hotl_store::session_label_from_tail(path).or_else(|| head.label.clone()),
+                updated_at: Some(crate::acp_map::rfc3339(*modified)),
             })
         })
         .skip(start)
@@ -1954,22 +2027,6 @@ fn keep_spec(msg: &Value) -> Result<KeepSpec, String> {
     }
 }
 
-/// Make `open` the connection's session, retiring whatever was there, and
-/// return the new session id.
-///
-/// Replacing a session: interrupt its in-flight turn (its events are about to
-/// stop rendering anywhere — it must not keep running tools invisibly in the
-/// shared cwd), stop its drain task, and drop its parked state — a dropped ask
-/// sender reads as a deny to the old engine, and a stale prompt id must never
-/// be answered with the new session's first TurnDone.
-///
-/// Shared by `session/new`, `session/load` and `session/reload_config` so the
-/// three can never drift on what "retire the old session" means.
-/// Replacing a session: interrupt its in-flight turn (its events are about to
-/// stop rendering anywhere — it must not keep running tools invisibly in the
-/// shared cwd), stop its drain task, and drop its parked state — a dropped ask
-/// sender reads as a deny to the old engine, and a stale prompt id must never
-/// be answered with the new session's first TurnDone.
 fn retire_session(
     session: &mut Option<SessionState>,
     pending: &Pending,
@@ -2000,11 +2057,22 @@ fn retire_session(
         .clear();
 }
 
+/// Make `open` the connection's session, retiring whatever was there.
+///
+/// Replacing a session: interrupt its in-flight turn (its events are about to
+/// stop rendering anywhere — it must not keep running tools invisibly in the
+/// shared cwd), stop its drain task, and drop its parked state — a dropped ask
+/// sender reads as a deny to the old engine, and a stale prompt id must never
+/// be answered with the new session's first TurnDone.
+///
+/// Shared by `session/new`, `session/load` and `session/reload_config` so the
+/// three can never drift on what "retire the old session" means.
 #[allow(clippy::too_many_arguments)]
 fn install_session(
     open: SessionOpen,
     id: String,
     cwd: std::path::PathBuf,
+    hold_drain: bool,
     writer: &Writer,
     session: &mut Option<SessionState>,
     pending: &Pending,
@@ -2036,6 +2104,9 @@ fn install_session(
     );
     state._lease = lease;
     state.cwd = cwd;
+    if !hold_drain {
+        state.release_drain();
+    }
     *session = Some(state);
 }
 
@@ -2058,23 +2129,30 @@ fn start_session(
     *next_id += 1;
     let events = std::mem::replace(&mut handle.events, mpsc::channel(1).1);
     let sid = id.clone();
-    let drain = tokio::spawn(drain_events(
-        events,
-        writer,
-        pending,
-        pending_questions,
-        pending_egress,
-        pending_prompt,
-        sid,
-        req_id_seed,
-        model,
-    ));
+    let (go, held) = oneshot::channel::<()>();
+    let drain = tokio::spawn(async move {
+        if held.await.is_ok() {
+            drain_events(
+                events,
+                writer,
+                pending,
+                pending_questions,
+                pending_egress,
+                pending_prompt,
+                sid,
+                req_id_seed,
+                model,
+            )
+            .await;
+        }
+    });
     SessionState {
         id,
         store_id,
         cwd: std::path::PathBuf::new(),
         handle,
         drain,
+        go: Some(go),
         _lease: None,
     }
 }
@@ -2736,8 +2814,8 @@ pub struct WorktreeInfo {
 
 pub const META_OPEN: &str = "hotl.dev/open";
 
-/// The `session/new` / `session/load` / fork result. Absent keys mean
-/// something different from `null` (probe failed / never set / same model).
+/// Absent keys mean something different from `null` (probe failed / never
+/// set / same model).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionOpenExtras {
