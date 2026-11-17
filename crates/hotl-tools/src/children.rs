@@ -55,7 +55,7 @@ pub enum ChildState {
     Closed,
 }
 
-/// One row of `/agents` and `session/children`.
+/// One row of `/agents` and `_hotl/session/children`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildRecord {
     pub id: String,

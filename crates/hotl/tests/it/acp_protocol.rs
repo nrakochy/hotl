@@ -752,7 +752,7 @@ async fn initialize_advertises_skill_names_and_descriptions() {
     );
 }
 
-/// `session/workflows` (0044): the `session/context` shape — ack on the id,
+/// `_hotl/session/workflows` (0044): the `_hotl/session/context` shape — ack on the id,
 /// `workflows_report` as a broadcast, and an error with no session open.
 #[tokio::test]
 async fn session_workflows_returns_an_ack_and_broadcasts_a_report() {
@@ -775,7 +775,7 @@ async fn session_workflows_returns_an_ack_and_broadcasts_a_report() {
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/workflows"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"_hotl/session/workflows"}),
     )
     .await;
     let err = next(&mut lines).await;
@@ -794,24 +794,18 @@ async fn session_workflows_returns_an_ack_and_broadcasts_a_report() {
     next_matching(&mut lines, |m| m["id"] == json!(3)).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/workflows"}),
+        json!({"jsonrpc":"2.0","id":4,"method":"_hotl/session/workflows"}),
     )
     .await;
-    let ack = next_matching(&mut lines, |m| m["id"] == json!(4)).await;
-    assert_eq!(ack["result"], json!({"ok": true}));
-    let note = next_matching(&mut lines, |m| {
-        m["params"]["update"]["type"] == "workflows_report"
-    })
-    .await;
+    let reply = next_matching(&mut lines, |m| m["id"] == json!(4)).await;
+    assert_eq!(reply["result"]["type"], "workflows_report");
     assert!(
-        note["params"]["update"]["runs"].is_array(),
-        "runs is the list, empty in a fresh process: {note}"
+        reply["result"]["runs"].is_array(),
+        "runs is the list, empty in a fresh process: {reply}"
     );
 }
 
-/// `session/context` (plan 0028): a thin ack on the id, the report itself as
-/// a broadcast. The reply carries no payload on purpose — a correlated one
-/// would need a third id queue in the TUI client's `translate`.
+/// `_hotl/session/context` (plan 0028): the report is the reply.
 #[tokio::test]
 async fn session_context_returns_an_ack_and_broadcasts_a_report() {
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -840,17 +834,12 @@ async fn session_context_returns_an_ack_and_broadcasts_a_report() {
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/context","params":{}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/context","params":{}}),
     )
     .await;
-    let ack = next_matching(&mut lines, |m| m["id"] == 3).await;
-    assert_eq!(ack["result"], json!({"ok": true}));
-
-    let report = next_matching(&mut lines, |m| {
-        m["params"]["update"]["type"] == "context_report"
-    })
-    .await;
-    let update = &report["params"]["update"];
+    let report = next_matching(&mut lines, |m| m["id"] == 3).await;
+    let update = &report["result"];
+    assert_eq!(update["type"], "context_report");
     assert_eq!(update["window"], 200_000);
     let rows = update["rows"].as_array().expect("rows");
     assert_eq!(rows.len(), 12, "every row is emitted, zeros included");
@@ -862,7 +851,7 @@ async fn session_context_returns_an_ack_and_broadcasts_a_report() {
     assert!(system["tokens"].as_u64().expect("u64") > 0);
 }
 
-/// 0071 T5: `session/aside` acks thinly; the engine broadcasts the answer.
+/// 0071 T5: `_hotl/session/aside` acks thinly; the engine broadcasts the answer.
 #[tokio::test]
 async fn session_aside_acks_then_broadcasts_the_answer() {
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -918,7 +907,7 @@ async fn session_aside_acks_then_broadcasts_the_answer() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"session/aside","params":{"question":"x"}}),
+        json!({"jsonrpc":"2.0","id":1,"method":"_hotl/session/aside","params":{"question":"x"}}),
     )
     .await;
     assert!(
@@ -939,7 +928,7 @@ async fn session_aside_acks_then_broadcasts_the_answer() {
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/aside","params":{"question":"  "}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"_hotl/session/aside","params":{"question":"  "}}),
     )
     .await;
     assert!(
@@ -948,7 +937,7 @@ async fn session_aside_acks_then_broadcasts_the_answer() {
     );
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":5,"method":"session/aside","params":{"question":"what does it return?"}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"_hotl/session/aside","params":{"question":"what does it return?"}}),
     )
     .await;
     let ack = next(&mut lines).await;
@@ -965,7 +954,7 @@ async fn session_aside_acks_then_broadcasts_the_answer() {
     assert_eq!(answer["params"]["update"]["usage"]["input_tokens"], 10);
 }
 
-/// 0066: `session/fold` acks whether it ran now; a fresh session has
+/// 0066: `_hotl/session/fold` acks whether it ran now; a fresh session has
 /// nothing to fold, which comes back as a `fold_skipped` update.
 #[tokio::test]
 async fn session_fold_at_idle_acks_now_and_relays_the_outcome() {
@@ -994,7 +983,7 @@ async fn session_fold_at_idle_acks_now_and_relays_the_outcome() {
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/fold","params":{}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/fold","params":{}}),
     )
     .await;
     let ack = next_matching(&mut lines, |m| m["id"] == 3).await;
@@ -1024,7 +1013,7 @@ async fn session_fold_without_a_session_is_an_error() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"session/fold","params":{}}),
+        json!({"jsonrpc":"2.0","id":1,"method":"_hotl/session/fold","params":{}}),
     )
     .await;
     let err = next(&mut lines).await;
@@ -1061,7 +1050,7 @@ async fn session_fold_rejects_a_bad_focus() {
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/fold","params":{"focus":"x".repeat(4001)}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/fold","params":{"focus":"x".repeat(4001)}}),
     )
     .await;
     let err = next_matching(&mut lines, |m| m["id"] == 3).await;
@@ -1071,14 +1060,14 @@ async fn session_fold_rejects_a_bad_focus() {
     );
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/fold","params":{"focus":7}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"_hotl/session/fold","params":{"focus":7}}),
     )
     .await;
     let err = next_matching(&mut lines, |m| m["id"] == 4).await;
     assert!(err["error"].is_object(), "{err}");
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":5,"method":"session/fold","params":{"focus":"   "}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"_hotl/session/fold","params":{"focus":"   "}}),
     )
     .await;
     let ack = next_matching(&mut lines, |m| m["id"] == 5).await;
@@ -1106,7 +1095,7 @@ async fn session_context_without_a_session_is_an_error() {
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/context","params":{}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"_hotl/session/context","params":{}}),
     )
     .await;
     let reply = next_matching(&mut lines, |m| m["id"] == 2).await;
@@ -1148,14 +1137,11 @@ async fn the_context_report_kinds_are_snake_case() {
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/context","params":{}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/context","params":{}}),
     )
     .await;
-    let report = next_matching(&mut lines, |m| {
-        m["params"]["update"]["type"] == "context_report"
-    })
-    .await;
-    for row in report["params"]["update"]["rows"].as_array().expect("rows") {
+    let report = next_matching(&mut lines, |m| m["id"] == 3).await;
+    for row in report["result"]["rows"].as_array().expect("rows") {
         let kind = row["kind"].as_str().expect("kind is a string");
         assert!(
             !kind.is_empty() && kind.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
@@ -1454,7 +1440,7 @@ async fn replacing_a_session_clears_parked_state() {
     assert_eq!(result["result"]["stopReason"], "end_turn");
 }
 
-/// `session/steer` queues mid-turn feedback: acknowledged `{queued:true}`
+/// `_hotl/session/steer` queues mid-turn feedback: acknowledged `{queued:true}`
 /// with a session, an error without one.
 #[tokio::test]
 async fn steer_is_acknowledged_and_reaches_engine() {
@@ -1474,7 +1460,7 @@ async fn steer_is_acknowledged_and_reaches_engine() {
     // Steering with NO session is an error naming the missing session.
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"session/steer","params":{"text":"go left"}}),
+        json!({"jsonrpc":"2.0","id":1,"method":"_hotl/session/steer","params":{"text":"go left"}}),
     )
     .await;
     let err = read_until_id(&mut lines, 1).await;
@@ -1491,7 +1477,7 @@ async fn steer_is_acknowledged_and_reaches_engine() {
     read_until_id(&mut lines, 2).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/steer","params":{"text":"go left"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/steer","params":{"text":"go left"}}),
     )
     .await;
     let ack = read_until_id(&mut lines, 3).await;
@@ -1500,14 +1486,14 @@ async fn steer_is_acknowledged_and_reaches_engine() {
     // Missing params.text is an error too.
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/steer"}),
+        json!({"jsonrpc":"2.0","id":4,"method":"_hotl/session/steer"}),
     )
     .await;
     let err = read_until_id(&mut lines, 4).await;
     assert!(err["error"]["message"].as_str().unwrap().contains("text"));
 }
 
-/// Images ride `session/prompt`/`session/steer` params and are validated at
+/// Images ride `session/prompt`/`_hotl/session/steer` params and are validated at
 /// the wire — a poisoned payload is rejected before anything is committed —
 /// and the open result advertises `images: true` for feature detection.
 #[tokio::test]
@@ -1613,7 +1599,7 @@ async fn prompt_images_are_validated_at_the_wire() {
     // Steer takes the same shape and the same validation.
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/steer","params":{
+        json!({"jsonrpc":"2.0","id":4,"method":"_hotl/session/steer","params":{
             "text":"and this",
             "images":[{"media_type":"image/bmp","data":"aW1n"}]}}),
     )
@@ -1640,7 +1626,7 @@ async fn read_until_id(
     }
 }
 
-/// session/new carries a name back; session/rename acks and re-renames.
+/// session/new carries a name back; _hotl/session/rename acks and re-renames.
 #[tokio::test]
 async fn named_open_and_rename() {
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -1665,7 +1651,7 @@ async fn named_open_and_rename() {
     // rename before a session exists → error.
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/rename","params":{"name":"x"}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"_hotl/session/rename","params":{"name":"x"}}),
     )
     .await;
     assert!(
@@ -1685,7 +1671,7 @@ async fn named_open_and_rename() {
     // invalid rename → error; valid rename → ok.
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/rename","params":{"name":"   "}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"_hotl/session/rename","params":{"name":"   "}}),
     )
     .await;
     assert!(
@@ -1694,10 +1680,16 @@ async fn named_open_and_rename() {
     );
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":5,"method":"session/rename","params":{"name":"better-name"}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"_hotl/session/rename","params":{"name":"better-name"}}),
     )
     .await;
     assert_eq!(next(&mut lines).await["result"]["ok"], true);
+    let info = next_raw(&mut lines).await;
+    assert_eq!(
+        info["params"]["update"]["sessionUpdate"],
+        "session_info_update"
+    );
+    assert_eq!(info["params"]["update"]["title"], "better-name");
 }
 
 #[tokio::test]
@@ -1721,7 +1713,7 @@ async fn set_color_acks_a_known_name_or_null_and_refuses_the_rest() {
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/set_color","params":{"color":"red"}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"_hotl/session/set_color","params":{"color":"red"}}),
     )
     .await;
     assert!(
@@ -1737,7 +1729,7 @@ async fn set_color_acks_a_known_name_or_null_and_refuses_the_rest() {
     for (id, color) in [(4, json!("Pink")), (5, json!(null))] {
         send(
             &mut cwrite,
-            json!({"jsonrpc":"2.0","id":id,"method":"session/set_color","params":{"color":color}}),
+            json!({"jsonrpc":"2.0","id":id,"method":"_hotl/session/set_color","params":{"color":color}}),
         )
         .await;
         let r = read_until_id(&mut lines, id).await;
@@ -1751,7 +1743,7 @@ async fn set_color_acks_a_known_name_or_null_and_refuses_the_rest() {
     ] {
         send(
             &mut cwrite,
-            json!({"jsonrpc":"2.0","id":id,"method":"session/set_color","params":params}),
+            json!({"jsonrpc":"2.0","id":id,"method":"_hotl/session/set_color","params":params}),
         )
         .await;
         let r = read_until_id(&mut lines, id).await;
@@ -2006,7 +1998,7 @@ async fn unanswered_elicitation_resolves_on_cancel() {
     .await;
     send(
         &mut w,
-        json!({"jsonrpc":"2.0","id":9,"method":"session/rename","params":{"name":"x"}}),
+        json!({"jsonrpc":"2.0","id":9,"method":"_hotl/session/rename","params":{"name":"x"}}),
     )
     .await;
     let (after, _) = frames_through_reply(&mut lines, 9).await;
@@ -2774,7 +2766,7 @@ async fn set_config_option_model_switches_and_returns_all_options() {
     assert_eq!(reply["result"]["_meta"]["hotl.dev/model"]["applied"], true);
 }
 
-/// `session/set_goal` acks with the normalized goal; the change reaches every
+/// `_hotl/session/set_goal` acks with the normalized goal; the change reaches every
 /// attached surface as `goal_changed` through the drain's catch-all (the
 /// engine's own `GoalChanged` event — there is no handler-side notify to
 /// drift from it). `null` clears, and a non-string / overlong param errors.
@@ -2812,7 +2804,7 @@ async fn set_goal_acks_relays_the_engine_broadcast_and_rejects_invalid_params() 
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/set_goal",
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/set_goal",
                "params":{"goal":"  all tests pass  "}}),
     )
     .await;
@@ -2836,7 +2828,7 @@ async fn set_goal_acks_relays_the_engine_broadcast_and_rejects_invalid_params() 
     // `null` clears, and the engine's clear is broadcast the same way.
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/set_goal","params":{"goal":null}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"_hotl/session/set_goal","params":{"goal":null}}),
     )
     .await;
     let mut saw_clear = false;
@@ -2857,14 +2849,14 @@ async fn set_goal_acks_relays_the_engine_broadcast_and_rejects_invalid_params() 
     let overlong = "x".repeat(4001);
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":5,"method":"session/set_goal","params":{"goal":overlong}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"_hotl/session/set_goal","params":{"goal":overlong}}),
     )
     .await;
     let m = read_until_id(&mut lines, 5).await;
     assert!(m.get("error").is_some(), "overlong must error: {m}");
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":6,"method":"session/set_goal","params":{"goal":42}}),
+        json!({"jsonrpc":"2.0","id":6,"method":"_hotl/session/set_goal","params":{"goal":42}}),
     )
     .await;
     let m = read_until_id(&mut lines, 6).await;
@@ -3100,7 +3092,7 @@ async fn reload_config_swaps_the_engine_and_broadcasts_the_new_truth() {
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/reload_config"}),
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/reload_config"}),
     )
     .await;
 
@@ -3129,14 +3121,10 @@ async fn reload_config_swaps_the_engine_and_broadcasts_the_new_truth() {
         loaded[0]
     );
 
-    let note = next_matching(&mut lines, |m| {
-        m["params"]["update"]["type"] == "config_reloaded"
-    })
-    .await;
-    let u = &note["params"]["update"];
+    let u = &ack["result"];
+    assert_eq!(u["type"], "config_reloaded");
     assert_eq!(u["model"], "m2");
     assert_eq!(u["mode"], "plan", "the re-opened session's own mode");
-    assert_eq!(u["context_window"], 900_000);
     assert_eq!(
         u["skills"],
         json!([{"name": "run", "description": "launch the app"}]),
@@ -3199,18 +3187,15 @@ async fn a_failed_reload_keeps_the_running_session_answering() {
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/reload_config"}),
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/reload_config"}),
     )
     .await;
-    let note = next_matching(&mut lines, |m| {
-        m["params"]["update"]["type"] == "config_reload_failed"
-    })
-    .await;
-    assert!(note["params"]["update"]["reason"]
+    let err = next_matching(&mut lines, |m| m["id"] == json!(3)).await;
+    assert_eq!(err["error"]["data"]["type"], "config_reload_failed");
+    assert!(err["error"]["data"]["reason"]
         .as_str()
         .unwrap()
         .contains("TOML parse error"));
-    let err = next_matching(&mut lines, |m| m["id"] == json!(3)).await;
     assert!(err["error"]["message"]
         .as_str()
         .unwrap()
@@ -3249,7 +3234,7 @@ async fn reload_config_without_a_hook_is_an_error_not_a_silent_no_op() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"session/reload_config"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"_hotl/session/reload_config"}),
     )
     .await;
     let m = next(&mut lines).await;
@@ -3380,7 +3365,7 @@ async fn remember_asks_via_request_permission_then_acks_and_broadcasts_memory_ch
     assert_eq!(open_of(&opened)["memoryMode"], "read-write");
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/remember",
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/remember",
                "params":{"note":"  tests need\nnextest  "}}),
     )
     .await;
@@ -3449,18 +3434,11 @@ async fn remember_bare_returns_a_memory_report() {
     assert_eq!(open_of(&opened)["memoryMode"], "read-only");
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/remember","params":{}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/remember","params":{}}),
     )
     .await;
-    let mut report = None;
-    for _ in 0..6 {
-        let m = next(&mut lines).await;
-        if m["method"] == "session/update" && m["params"]["update"]["type"] == "memory_report" {
-            report = Some(m["params"]["update"].clone());
-            break;
-        }
-    }
-    let r = report.expect("a memory_report notification");
+    let r = read_until_id(&mut lines, 3).await["result"].clone();
+    assert_eq!(r["type"], "memory_report");
     assert_eq!(r["mode"], "read-only");
     assert_eq!(r["cap"], hotl_context::MEMORY_BUDGET_BYTES);
     assert_eq!(r["bytes"], 45);
@@ -3481,15 +3459,15 @@ async fn remember_rejects_an_empty_or_overlong_note() {
     // Whitespace-only reads as absent → a report, not an error.
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/remember","params":{"note":"   "}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/remember","params":{"note":"   "}}),
     )
     .await;
     let ack = read_until_id(&mut lines, 3).await;
-    assert_eq!(ack["result"]["ok"], true, "{ack}");
+    assert_eq!(ack["result"]["type"], "memory_report", "{ack}");
     let long = "x".repeat(hotl_types::MEMORY_NOTE_MAX_CHARS + 1);
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/remember","params":{"note":long}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"_hotl/session/remember","params":{"note":long}}),
     )
     .await;
     let err = read_until_id(&mut lines, 4).await;
@@ -3509,7 +3487,7 @@ async fn remember_in_read_only_mode_errors_without_a_permission_request() {
     .await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/remember","params":{"note":"x"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/remember","params":{"note":"x"}}),
     )
     .await;
     let mut err = None;
@@ -3642,18 +3620,11 @@ async fn session_jobs_reports_running_and_finished_jobs() {
     assert_eq!(started["detached"], false);
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/jobs","params":{}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"_hotl/session/jobs","params":{}}),
     )
     .await;
-    let mut report = None;
-    for _ in 0..8 {
-        let m = next(&mut lines).await;
-        if m["method"] == "session/update" && m["params"]["update"]["type"] == "jobs_report" {
-            report = Some(m["params"]["update"].clone());
-            break;
-        }
-    }
-    let r = report.expect("a jobs_report");
+    let r = read_until_id(&mut lines, 4).await["result"].clone();
+    assert_eq!(r["type"], "jobs_report");
     let rows = r["jobs"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["id"], job);
@@ -3664,7 +3635,7 @@ async fn session_jobs_reports_running_and_finished_jobs() {
     // Stop it; the report then shows it done with the kill recorded.
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":5,"method":"session/jobs/stop","params":{"job": job}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"_hotl/session/jobs/stop","params":{"job": job}}),
     )
     .await;
     let ack = read_until_id(&mut lines, 5).await;
@@ -3691,14 +3662,14 @@ async fn session_jobs_stop_kills_by_id_and_unknown_ids_say_so() {
     let job = started["job"].as_str().unwrap().to_string();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/jobs/stop","params":{"job":"nope00"}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"_hotl/session/jobs/stop","params":{"job":"nope00"}}),
     )
     .await;
     let ack = read_until_id(&mut lines, 4).await;
     assert_eq!(ack["result"]["stopped"], false, "{ack}");
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":5,"method":"session/jobs/stop","params":{}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"_hotl/session/jobs/stop","params":{}}),
     )
     .await;
     let err = read_until_id(&mut lines, 5).await;
@@ -3711,7 +3682,7 @@ async fn session_jobs_stop_kills_by_id_and_unknown_ids_say_so() {
     );
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":6,"method":"session/jobs/stop","params":{"job": job}}),
+        json!({"jsonrpc":"2.0","id":6,"method":"_hotl/session/jobs/stop","params":{"job": job}}),
     )
     .await;
     let ack = read_until_id(&mut lines, 6).await;
@@ -3725,7 +3696,7 @@ async fn session_jobs_stop_kills_by_id_and_unknown_ids_say_so() {
     }
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":7,"method":"session/jobs/stop","params":{"job": job}}),
+        json!({"jsonrpc":"2.0","id":7,"method":"_hotl/session/jobs/stop","params":{"job": job}}),
     )
     .await;
     let ack = read_until_id(&mut lines, 7).await;
@@ -3733,7 +3704,7 @@ async fn session_jobs_stop_kills_by_id_and_unknown_ids_say_so() {
 }
 
 /// Registers a fake running sub-agent with the session's registry (0072), so
-/// `session/children` has something to report without a real child builder.
+/// `_hotl/session/children` has something to report without a real child builder.
 struct RegisterChild;
 
 impl hotl_tools::Tool for RegisterChild {
@@ -3845,16 +3816,12 @@ async fn children_report(
 ) -> Value {
     send(
         cwrite,
-        json!({"jsonrpc":"2.0","id":id,"method":"session/children","params":{}}),
+        json!({"jsonrpc":"2.0","id":id,"method":"_hotl/session/children","params":{}}),
     )
     .await;
-    for _ in 0..12 {
-        let m = next(lines).await;
-        if m["method"] == "session/update" && m["params"]["update"]["type"] == "children_report" {
-            return m["params"]["update"].clone();
-        }
-    }
-    panic!("no children_report");
+    let r = read_until_id(lines, id).await["result"].clone();
+    assert_eq!(r["type"], "children_report");
+    r
 }
 
 #[tokio::test]
@@ -3882,7 +3849,7 @@ async fn session_children_reports_running_and_closed() {
     let child = row["id"].as_str().unwrap().to_string();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":5,"method":"session/children/stop","params":{"child": child}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"_hotl/session/children/stop","params":{"child": child}}),
     )
     .await;
     let ack = read_until_id(&mut lines, 5).await;
@@ -3902,14 +3869,14 @@ async fn session_children_stop_interrupts_by_id_and_unknown_ids_say_so() {
     read_until_id(&mut lines, 3).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/children/stop","params":{"child":"nope00"}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"_hotl/session/children/stop","params":{"child":"nope00"}}),
     )
     .await;
     let ack = read_until_id(&mut lines, 4).await;
     assert_eq!(ack["result"]["stopped"], false, "{ack}");
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":5,"method":"session/children/stop","params":{}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"_hotl/session/children/stop","params":{}}),
     )
     .await;
     let err = read_until_id(&mut lines, 5).await;
@@ -3924,7 +3891,7 @@ async fn session_children_stop_interrupts_by_id_and_unknown_ids_say_so() {
     let child = r["children"][0]["id"].as_str().unwrap().to_string();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":7,"method":"session/children/stop","params":{"child": child}}),
+        json!({"jsonrpc":"2.0","id":7,"method":"_hotl/session/children/stop","params":{"child": child}}),
     )
     .await;
     assert_eq!(
@@ -3934,7 +3901,7 @@ async fn session_children_stop_interrupts_by_id_and_unknown_ids_say_so() {
     // Twice is false: closed is not live.
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":8,"method":"session/children/stop","params":{"child": child}}),
+        json!({"jsonrpc":"2.0","id":8,"method":"_hotl/session/children/stop","params":{"child": child}}),
     )
     .await;
     assert_eq!(
@@ -4021,8 +3988,12 @@ async fn initialize_meta_only_for_opted_in_clients() {
     assert!(init["contextWindow"].is_u64());
     assert!(init["streamIdleSecs"].is_u64());
     assert_eq!(init["acpSchema"], acp::ACP_SCHEMA_CHECKED);
+    assert!(init.get("extensions").is_none());
     assert_eq!(
-        init["extensions"].as_array().unwrap().len(),
+        r["agentCapabilities"]["_meta"]["hotl.dev/methods"]
+            .as_array()
+            .unwrap()
+            .len(),
         acp::EXTENSION_METHODS.len()
     );
     let r = initialize_with(json!({
@@ -4078,20 +4049,17 @@ async fn every_handled_method_is_advertised_as_an_extension() {
             continue;
         }
         let mut rest = t;
-        while let Some(i) = rest.find("\"session/") {
+        while let Some(i) = rest.find("\"_hotl/session/") {
             let tail = &rest[i + 1..];
             let end = tail.find('"').unwrap();
             handled.push(tail[..end].to_string());
             rest = &tail[end..];
         }
     }
-    for m in [
-        "session/request_permission",
-        "_hotl/session/request_question",
-    ] {
-        assert!(src.contains(&format!("\"method\": \"{m}\"")), "{m} is sent");
-        handled.push(m.to_string());
-    }
+    assert!(src.contains("\"method\": \"_hotl/session/request_question\""));
+    handled.push("_hotl/session/request_question".to_string());
+    assert!(src.contains("ext(\"session/update\")"));
+    handled.push("_hotl/session/update".to_string());
     handled.sort();
     let mut advertised: Vec<String> = acp::EXTENSION_METHODS
         .iter()
@@ -4114,14 +4082,9 @@ async fn every_handled_method_is_advertised_as_an_extension() {
     let mut id = 100;
     for m in acp::EXTENSION_METHODS
         .iter()
-        .filter(|m| !m.contains("session/request_"))
+        .filter(|m| !m.ends_with("/request_question") && !m.ends_with("/update"))
     {
-        // No session yet: most answer "requires an open session" — anything
-        // but "unknown method". `new`/`load` would open one; skip them here.
-        if matches!(
-            *m,
-            "session/new" | "session/load" | "session/prompt" | "session/cancel"
-        ) {
+        if *m == "_hotl/session/fork" {
             continue;
         }
         id += 1;
@@ -4150,6 +4113,79 @@ async fn error_code_for(request: Value) -> i64 {
 }
 
 #[tokio::test]
+async fn reports_come_back_in_the_reply_for_a_client_that_did_not_opt_in() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
+    )
+    .await;
+    next(&mut lines).await;
+    for (id, method, kind) in [
+        (3, "context", "context_report"),
+        (4, "workflows", "workflows_report"),
+        (5, "jobs", "jobs_report"),
+        (6, "children", "children_report"),
+    ] {
+        send(
+            &mut cwrite,
+            json!({"jsonrpc":"2.0","id":id,"method":format!("_hotl/session/{method}"),"params":{}}),
+        )
+        .await;
+        let reply = read_until_id(&mut lines, id).await;
+        assert_eq!(reply["result"]["type"], kind, "{reply}");
+    }
+}
+
+#[test]
+fn every_extension_method_is_underscore_prefixed() {
+    for m in acp::EXTENSION_METHODS {
+        assert!(m.starts_with("_hotl/"), "{m}");
+    }
+}
+
+#[tokio::test]
+async fn old_dialect_names_are_32601() {
+    for name in [
+        "rename",
+        "set_color",
+        "set_goal",
+        "remember",
+        "steer",
+        "fold",
+        "reload_config",
+        "aside",
+        "context",
+        "workflows",
+        "jobs",
+        "jobs/stop",
+        "children",
+        "children/stop",
+    ] {
+        let code =
+            error_code_for(json!({"jsonrpc":"2.0","id":1,"method":format!("session/{name}")}))
+                .await;
+        assert_eq!(code, -32601, "session/{name}");
+    }
+}
+
+#[tokio::test]
 async fn unknown_method_is_32601() {
     let code = error_code_for(json!({"jsonrpc":"2.0","id":1,"method":"session/frobnicate"})).await;
     assert_eq!(code, -32601);
@@ -4165,7 +4201,8 @@ async fn missing_session_id_is_32602() {
 #[tokio::test]
 async fn a_request_with_no_open_session_is_32002() {
     let code =
-        error_code_for(json!({"jsonrpc":"2.0","id":1,"method":"session/fold","params":{}})).await;
+        error_code_for(json!({"jsonrpc":"2.0","id":1,"method":"_hotl/session/fold","params":{}}))
+            .await;
     assert_eq!(code, -32002);
 }
 
@@ -4326,7 +4363,7 @@ async fn reload_with_a_live_session_after_the_key_vanishes_is_auth_required() {
         vec![
             json!({"method":"initialize","params":{"protocolVersion":1}}),
             json!({"method":"session/new","params":new_params()}),
-            json!({"method":"session/reload_config","params":{}}),
+            json!({"method":"_hotl/session/reload_config","params":{}}),
         ],
     )
     .await;
@@ -5523,7 +5560,7 @@ async fn cancel_gets_no_reply_and_the_prompt_answers_cancelled() {
     assert_eq!(reply["result"]["stopReason"], "cancelled", "{reply}");
     send(
         &mut w,
-        json!({"jsonrpc":"2.0","id":51,"method":"session/rename","params":{"name":"x"}}),
+        json!({"jsonrpc":"2.0","id":51,"method":"_hotl/session/rename","params":{"name":"x"}}),
     )
     .await;
     let (after, _) = frames_through_reply(&mut lines, 51).await;
@@ -5574,7 +5611,7 @@ async fn cancel_denies_an_open_permission_request() {
     .await;
     send(
         &mut w,
-        json!({"jsonrpc":"2.0","id":9,"method":"session/rename","params":{"name":"x"}}),
+        json!({"jsonrpc":"2.0","id":9,"method":"_hotl/session/rename","params":{"name":"x"}}),
     )
     .await;
     let (after, _) = frames_through_reply(&mut lines, 9).await;
@@ -6042,7 +6079,7 @@ async fn cancel_also_answers_the_queued_prompts_and_runs_none_of_them() {
     assert!(got.values().all(|r| r == "cancelled"), "{got:?}");
     send(
         &mut w,
-        json!({"jsonrpc":"2.0","id":9,"method":"session/rename","params":{"name":"x"}}),
+        json!({"jsonrpc":"2.0","id":9,"method":"_hotl/session/rename","params":{"name":"x"}}),
     )
     .await;
     read_until_id(&mut lines, 9).await;
@@ -6314,7 +6351,7 @@ async fn a_foreign_session_id_is_32002_and_its_cancel_is_ignored() {
     .await;
     send(
         &mut w,
-        json!({"jsonrpc":"2.0","id":9,"method":"session/rename","params":{"name":"x"}}),
+        json!({"jsonrpc":"2.0","id":9,"method":"_hotl/session/rename","params":{"name":"x"}}),
     )
     .await;
     let (before, _) = frames_through_reply(&mut lines, 9).await;
@@ -6397,7 +6434,7 @@ async fn cancel_during_a_goal_evaluation_answers_at_once() {
     .await;
     send(
         &mut w,
-        json!({"jsonrpc":"2.0","id":9,"method":"session/rename","params":{"name":"x"}}),
+        json!({"jsonrpc":"2.0","id":9,"method":"_hotl/session/rename","params":{"name":"x"}}),
     )
     .await;
     let (mut reply, mut renamed) = (None, None);

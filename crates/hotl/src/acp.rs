@@ -38,36 +38,27 @@ pub const ACP_PROTOCOL_VERSION: u16 = 1;
 
 pub const ACP_SCHEMA_CHECKED: &str = "agent-client-protocol-schema 1.18.0";
 
-/// Every method this dialect speaks beyond `initialize`: what the handler
-/// answers, then the three requests it sends the client. Advertised under
-/// `agentCapabilities._meta.hotl.extensions` (0076 D6).
 pub const EXTENSION_METHODS: &[&str] = &[
-    "session/new",
-    "session/load",
-    "session/resume",
-    "session/list",
-    "session/close",
-    "session/prompt",
-    "session/rename",
-    "session/set_color",
-    "session/set_mode",
-    "session/set_config_option",
-    "session/set_goal",
-    "session/remember",
-    "session/steer",
-    "session/fold",
-    "session/cancel",
-    "session/reload_config",
-    "session/aside",
-    "session/context",
-    "session/workflows",
-    "session/jobs",
-    "session/children",
-    "session/children/stop",
-    "session/jobs/stop",
-    "session/request_permission",
+    "_hotl/session/fork",
+    "_hotl/session/rename",
+    "_hotl/session/set_color",
+    "_hotl/session/set_goal",
+    "_hotl/session/remember",
+    "_hotl/session/steer",
+    "_hotl/session/fold",
+    "_hotl/session/reload_config",
+    "_hotl/session/aside",
+    "_hotl/session/context",
+    "_hotl/session/workflows",
+    "_hotl/session/jobs",
+    "_hotl/session/jobs/stop",
+    "_hotl/session/children",
+    "_hotl/session/children/stop",
+    "_hotl/session/update",
     "_hotl/session/request_question",
 ];
+
+pub const META_METHODS: &str = "hotl.dev/methods";
 
 type Writer = Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
 struct AskSlot {
@@ -320,7 +311,7 @@ pub struct SessionOpen {
     /// inherited transcript is a §5.7 lie.
     pub previous_model: Option<String>,
     /// The **store** session id — what `hotl_store::replay_chain` resolves and
-    /// what `SessionSpec::Load` takes. `session/reload_config` resumes through
+    /// what `SessionSpec::Load` takes. `_hotl/session/reload_config` resumes through
     /// this.
     pub session_id: String,
     /// Per-session startup notices (an instruction file cut at the cap,
@@ -343,7 +334,7 @@ pub type SessionFactory = Box<dyn FnMut(SessionSpec) -> Result<SessionOpen, Stri
 
 /// Rebuilds the factory (and what `initialize` advertises) from a freshly-read
 /// `config.toml`, plus any warnings that read produced. This is the whole of
-/// `session/reload_config`'s engine knowledge: the protocol layer never learns
+/// `_hotl/session/reload_config`'s engine knowledge: the protocol layer never learns
 /// how a scaffold is built, only that one can be rebuilt.
 ///
 /// `Send` because `hotl tui` `tokio::spawn`s `serve`.
@@ -454,7 +445,7 @@ fn workflow_roster(info: &ServerInfo) -> Vec<RosterEntry> {
 /// Drive the protocol over one connection until the client hangs up.
 ///
 /// `reload` grants the connection the ability to rebuild its engine from
-/// `config.toml` mid-flight (`session/reload_config`). `None` is a connection
+/// `config.toml` mid-flight (`_hotl/session/reload_config`). `None` is a connection
 /// without that capability, and the method then answers with an explicit
 /// error — never a silent no-op, which a client would read as a reload that
 /// happened.
@@ -534,7 +525,7 @@ type SharedConfig = Arc<std::sync::Mutex<crate::acp_map::ConfigState>>;
 struct SessionState {
     id: String,
     /// The durable id this session's log carries — what a resume (and so
-    /// `session/reload_config`) has to name.
+    /// `_hotl/session/reload_config`) has to name.
     store_id: String,
     cwd: std::path::PathBuf,
     mcp: Vec<hotl_mcp::config::ServerConfig>,
@@ -935,7 +926,7 @@ async fn handle_request(
             };
             state.handle.prompt_answering(tag, text, images).await;
         }
-        "session/rename" => {
+        "_hotl/session/rename" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(
                     writer,
@@ -954,14 +945,24 @@ async fn handle_request(
                     writer,
                     id,
                     codes::INVALID_PARAMS,
-                    "session/rename requires params.name (1–64 chars after trimming)",
+                    "_hotl/session/rename requires params.name (1–64 chars after trimming)",
                 )
                 .await;
             };
-            state.handle.rename(name).await;
+            state.handle.rename(name.clone()).await;
             reply_ok(writer, id, to_json(&Ack { ok: true })).await;
+            send_update(
+                writer,
+                &state.id,
+                SessionUpdate::SessionInfoUpdate(SessionInfoUpdate {
+                    title: Some(name),
+                    updated_at: None,
+                    meta: None,
+                }),
+            )
+            .await;
         }
-        "session/set_color" => {
+        "_hotl/session/set_color" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(
                     writer,
@@ -990,7 +991,7 @@ async fn handle_request(
                         writer,
                         id,
                         codes::INVALID_PARAMS,
-                        "session/set_color requires params.color (a color name or null)",
+                        "_hotl/session/set_color requires params.color (a color name or null)",
                     )
                     .await
                 }
@@ -1194,7 +1195,7 @@ async fn handle_request(
                 .await;
             }
         }
-        "session/set_goal" => {
+        "_hotl/session/set_goal" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(
                     writer,
@@ -1220,7 +1221,7 @@ async fn handle_request(
                             writer,
                             id,
                             codes::INVALID_PARAMS,
-                            "session/set_goal requires params.goal of 1–4000 chars \
+                            "_hotl/session/set_goal requires params.goal of 1–4000 chars \
                              (or null to clear)",
                         )
                         .await;
@@ -1231,7 +1232,7 @@ async fn handle_request(
                         writer,
                         id,
                         codes::INVALID_PARAMS,
-                        "session/set_goal requires params.goal (a string, or null to clear)",
+                        "_hotl/session/set_goal requires params.goal (a string, or null to clear)",
                     )
                     .await;
                 }
@@ -1246,7 +1247,7 @@ async fn handle_request(
         // error (read-only, declined, over the cap). Without a note: a
         // `memory_report` notification with the dial, the file and its
         // entries. The write itself reaches every surface as `memory_changed`.
-        "session/remember" => {
+        "_hotl/session/remember" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(
                     writer,
@@ -1267,15 +1268,13 @@ async fn handle_request(
                         writer,
                         id,
                         codes::INTERNAL,
-                        "session/remember: memory is off",
+                        "_hotl/session/remember: memory is off",
                     )
                     .await;
                 };
-                reply_ok(writer, id, to_json(&Ack { ok: true })).await;
-                send_report(
-                    client_caps,
+                reply_ok(
                     writer,
-                    &state.id,
+                    id,
                     to_json(&AcpOnlyUpdate::MemoryReport {
                         mode: report.mode.as_str().into(),
                         path: report.path.display().to_string(),
@@ -1300,7 +1299,7 @@ async fn handle_request(
                     id,
                     codes::INVALID_PARAMS,
                     &format!(
-                        "session/remember requires params.note of 1–{} characters on one line",
+                        "_hotl/session/remember requires params.note of 1–{} characters on one line",
                         hotl_types::MEMORY_NOTE_MAX_CHARS
                     ),
                 )
@@ -1318,14 +1317,14 @@ async fn handle_request(
                             &writer,
                             id,
                             codes::INTERNAL,
-                            &format!("session/remember: {why}"),
+                            &format!("_hotl/session/remember: {why}"),
                         )
                         .await
                     }
                 }
             });
         }
-        "session/steer" => {
+        "_hotl/session/steer" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(
                     writer,
@@ -1340,7 +1339,7 @@ async fn handle_request(
                     writer,
                     id,
                     codes::INVALID_PARAMS,
-                    "session/steer requires params.text",
+                    "_hotl/session/steer requires params.text",
                 )
                 .await;
             };
@@ -1352,7 +1351,7 @@ async fn handle_request(
                             writer,
                             id,
                             codes::INTERNAL,
-                            &format!("session/steer: {e}"),
+                            &format!("_hotl/session/steer: {e}"),
                         )
                         .await
                     }
@@ -1362,7 +1361,7 @@ async fn handle_request(
         }
         // `/compact [focus]` (0066): ack with whether it ran now or waits for
         // the turn boundary; the fold's own frames ride `session/update`.
-        "session/fold" => {
+        "_hotl/session/fold" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(
                     writer,
@@ -1381,7 +1380,7 @@ async fn handle_request(
                             writer,
                             id,
                             codes::INVALID_PARAMS,
-                            "session/fold: focus must be 1–4000 chars after trimming",
+                            "_hotl/session/fold: focus must be 1–4000 chars after trimming",
                         )
                         .await
                     }
@@ -1391,7 +1390,7 @@ async fn handle_request(
                         writer,
                         id,
                         codes::INVALID_PARAMS,
-                        "session/fold: focus must be 1–4000 chars after trimming",
+                        "_hotl/session/fold: focus must be 1–4000 chars after trimming",
                     )
                     .await
                 }
@@ -1408,7 +1407,7 @@ async fn handle_request(
                         writer,
                         id,
                         codes::NOT_FOUND,
-                        "session/fold: the session is gone",
+                        "_hotl/session/fold: the session is gone",
                     )
                     .await
                 }
@@ -1478,13 +1477,13 @@ async fn handle_request(
         // system prompt, `[context]`. What cannot is process-wide set-once
         // state — `[sandbox]` extras, `[network]` egress, the thread pools —
         // which the client is told about rather than left to guess at.
-        "session/reload_config" => {
+        "_hotl/session/reload_config" => {
             let Some(hook) = reload.as_mut() else {
                 return reply_err(
                     writer,
                     id,
                     codes::INTERNAL,
-                    "session/reload_config is not supported on this connection",
+                    "_hotl/session/reload_config is not supported on this connection",
                 )
                 .await;
             };
@@ -1493,25 +1492,13 @@ async fn handle_request(
             let (new_factory, new_info, warnings) = match hook().await {
                 Ok(triple) => triple,
                 Err(e) => {
-                    if let Some(state) = session.as_ref() {
-                        let sid = state.id.clone();
-                        send_report(
-                            client_caps,
-                            writer,
-                            &sid,
-                            to_json(&AcpOnlyUpdate::ConfigReloadFailed {
-                                reason: e.to_string(),
-                            }),
-                        )
-                        .await;
-                    }
-                    return reply_err(
-                        writer,
-                        id,
-                        codes::INTERNAL,
-                        &format!("config reload failed: {e}"),
-                    )
-                    .await;
+                    let mut error =
+                        ErrorObject::new(codes::INTERNAL, format!("config reload failed: {e}"));
+                    error.data = Some(to_json(&AcpOnlyUpdate::ConfigReloadFailed {
+                        reason: e.to_string(),
+                    }));
+                    send(writer, &json!({"jsonrpc": "2.0", "id": id, "error": error})).await;
+                    return;
                 }
             };
             if !new_info.key_available && session.is_some() {
@@ -1579,37 +1566,19 @@ async fn handle_request(
                     if let Some(state) = session.as_mut() {
                         state.mcp = mcp;
                     }
-                    let skills = skill_roster(info);
-                    let workflows = workflow_roster(info);
                     reply_ok(
                         writer,
                         id,
                         to_json(&ReloadSessionAck {
+                            kind: "config_reloaded",
                             ok: true,
-                            session_id: sid.clone(),
-                            model: info.model.clone(),
-                            mode: mode.clone(),
-                            plan,
-                            context_window: info.context_window,
-                            warnings: warnings.clone(),
-                        }),
-                    )
-                    .await;
-                    // Broadcast, not just ack — same reasoning as
-                    // `mode_changed`: every attached surface needs the new
-                    // roster, and a client's loop needs no id-plumbing to get
-                    // it. Additive, so `UPDATE_SCHEMA_VERSION` stands.
-                    send_report(
-                        client_caps,
-                        writer,
-                        &sid,
-                        to_json(&AcpOnlyUpdate::ConfigReloaded {
+                            session_id: sid,
                             model: info.model.clone(),
                             mode,
                             plan,
                             context_window: info.context_window,
-                            skills,
-                            workflows,
+                            skills: skill_roster(info),
+                            workflows: workflow_roster(info),
                             warnings,
                         }),
                     )
@@ -1634,13 +1603,13 @@ async fn handle_request(
         // there is no idle guard and no session rebuild.
         // `/btw` (0071 T5): ack, then the engine broadcasts `aside_result`
         // (or `aside_failed`) through the update stream like any event.
-        "session/aside" => {
+        "_hotl/session/aside" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(
                     writer,
                     id,
                     codes::NOT_FOUND,
-                    "session/aside requires an open session",
+                    "_hotl/session/aside requires an open session",
                 )
                 .await;
             };
@@ -1654,35 +1623,28 @@ async fn handle_request(
                     writer,
                     id,
                     codes::INVALID_PARAMS,
-                    "session/aside requires params.question",
+                    "_hotl/session/aside requires params.question",
                 )
                 .await;
             };
             state.handle.aside(question.to_string()).await;
             reply_ok(writer, id, to_json(&Ack { ok: true })).await;
         }
-        "session/context" => {
+        "_hotl/session/context" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(
                     writer,
                     id,
                     codes::NOT_FOUND,
-                    "session/context requires an open session",
+                    "_hotl/session/context requires an open session",
                 )
                 .await;
             };
-            let sid = state.id.clone();
             match state.handle.context_breakdown().await {
                 Some(b) => {
-                    // Thin ack, payload broadcast — the `config_reloaded`
-                    // shape, for the same reason: a client's loop needs no
-                    // id-plumbing to get it. Additive, so
-                    // `UPDATE_SCHEMA_VERSION` stands.
-                    reply_ok(writer, id, to_json(&Ack { ok: true })).await;
-                    send_report(
-                        client_caps,
+                    reply_ok(
                         writer,
-                        &sid,
+                        id,
                         to_json(&AcpOnlyUpdate::ContextReport {
                             window: b.window,
                             rows: b.rows,
@@ -1695,40 +1657,35 @@ async fn handle_request(
                         writer,
                         id,
                         codes::NOT_FOUND,
-                        "session/context: the session is gone",
+                        "_hotl/session/context: the session is gone",
                     )
                     .await
                 }
             }
         }
-        // Every workflow run this process has started (0044), live. The
-        // registry is process-wide, but the broadcast needs a session to ride
-        // on — the same guard and ack-then-broadcast shape as `session/context`.
-        "session/workflows" => {
-            let Some(state) = session.as_ref() else {
+        // Every workflow run this process has started (0044), live.
+        "_hotl/session/workflows" => {
+            if session.is_none() {
                 return reply_err(
                     writer,
                     id,
                     codes::NOT_FOUND,
-                    "session/workflows requires an open session",
+                    "_hotl/session/workflows requires an open session",
                 )
                 .await;
-            };
-            let sid = state.id.clone();
-            reply_ok(writer, id, to_json(&Ack { ok: true })).await;
+            }
             let mut payload = (info.workflows_report)();
             payload["type"] = json!("workflows_report");
-            send_report(client_caps, writer, &sid, payload).await;
+            reply_ok(writer, id, payload).await;
         }
-        // `/jobs` (0064): thin ack, `jobs_report` broadcast — the
-        // `session/workflows` shape. Additive, so `UPDATE_SCHEMA_VERSION` stands.
-        "session/jobs" => {
+        // `/jobs` (0064): the reply is the `jobs_report`.
+        "_hotl/session/jobs" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(
                     writer,
                     id,
                     codes::NOT_FOUND,
-                    "session/jobs requires an open session",
+                    "_hotl/session/jobs requires an open session",
                 )
                 .await;
             };
@@ -1758,24 +1715,21 @@ async fn handle_request(
                     }
                 })
                 .collect();
-            reply_ok(writer, id, to_json(&Ack { ok: true })).await;
-            send_report(
-                client_caps,
+            reply_ok(
                 writer,
-                &state.id,
+                id,
                 to_json(&AcpOnlyUpdate::JobsReport { jobs: rows }),
             )
             .await;
         }
-        // `/agents` (0072): thin ack, `children_report` broadcast — the
-        // `session/jobs` shape. Additive, so `UPDATE_SCHEMA_VERSION` stands.
-        "session/children" => {
+        // `/agents` (0072): the reply is the `children_report`.
+        "_hotl/session/children" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(
                     writer,
                     id,
                     codes::NOT_FOUND,
-                    "session/children requires an open session",
+                    "_hotl/session/children requires an open session",
                 )
                 .await;
             };
@@ -1807,24 +1761,22 @@ async fn handle_request(
                     }
                 })
                 .collect();
-            reply_ok(writer, id, to_json(&Ack { ok: true })).await;
-            send_report(
-                client_caps,
+            reply_ok(
                 writer,
-                &state.id,
+                id,
                 to_json(&AcpOnlyUpdate::ChildrenReport { children: rows }),
             )
             .await;
         }
         // `/agents stop <id>` (0072): interrupts a running child or closes a
         // parked one; the `agent` done frame that follows is the outcome.
-        "session/children/stop" => {
+        "_hotl/session/children/stop" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(
                     writer,
                     id,
                     codes::NOT_FOUND,
-                    "session/children/stop requires an open session",
+                    "_hotl/session/children/stop requires an open session",
                 )
                 .await;
             };
@@ -1838,7 +1790,7 @@ async fn handle_request(
                     writer,
                     id,
                     codes::INVALID_PARAMS,
-                    "session/children/stop requires params.child",
+                    "_hotl/session/children/stop requires params.child",
                 )
                 .await;
             };
@@ -1847,13 +1799,13 @@ async fn handle_request(
         }
         // `/jobs stop <id>` (0064): kills the tree; the `job_done` frame that
         // follows is the outcome.
-        "session/jobs/stop" => {
+        "_hotl/session/jobs/stop" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(
                     writer,
                     id,
                     codes::NOT_FOUND,
-                    "session/jobs/stop requires an open session",
+                    "_hotl/session/jobs/stop requires an open session",
                 )
                 .await;
             };
@@ -1867,7 +1819,7 @@ async fn handle_request(
                     writer,
                     id,
                     codes::INVALID_PARAMS,
-                    "session/jobs/stop requires params.job",
+                    "_hotl/session/jobs/stop requires params.job",
                 )
                 .await;
             };
@@ -2209,7 +2161,7 @@ fn lock_config(config: &SharedConfig) -> std::sync::MutexGuard<'_, crate::acp_ma
 /// sender reads as a deny to the old engine, and a stale prompt id must never
 /// be answered with the new session's first TurnDone.
 ///
-/// Shared by `session/new`, `session/load` and `session/reload_config` so the
+/// Shared by `session/new`, `session/load` and `_hotl/session/reload_config` so the
 /// three can never drift on what "retire the old session" means.
 #[allow(clippy::too_many_arguments)]
 async fn install_session(
@@ -2710,12 +2662,6 @@ pub(crate) fn outcome_tag(outcome: &Outcome) -> Value {
     crate::wire::outcome_frame(outcome)
 }
 
-async fn send_report(caps: &ClientCaps, writer: &Writer, session_id: &str, update: Value) {
-    if caps.ext {
-        notify_ext(writer, session_id, update).await;
-    }
-}
-
 async fn notify_ext(writer: &Writer, session_id: &str, update: Value) {
     send(
         writer,
@@ -3199,7 +3145,6 @@ pub struct HotlInit {
     pub context_window: u64,
     pub stream_idle_secs: u64,
     pub acp_schema: String,
-    pub extensions: Vec<String>,
 }
 
 pub const AUTH_METHOD_KEY: &str = "hotl-key";
@@ -3243,10 +3188,10 @@ pub fn initialize_response(info: &ServerInfo, client_caps: ClientCaps) -> Initia
             context_window: info.context_window,
             stream_idle_secs: info.stream_idle_secs,
             acp_schema: ACP_SCHEMA_CHECKED.into(),
-            extensions: EXTENSION_METHODS.iter().map(|m| m.to_string()).collect(),
         };
         let mut m = serde_json::Map::new();
         m.insert(META_INIT.into(), to_json(&init));
+        m.insert(META_METHODS.into(), json!(EXTENSION_METHODS));
         m
     });
     InitializeResponse {
@@ -3362,7 +3307,7 @@ pub struct StoppedAck {
     pub stopped: bool,
 }
 
-/// `session/reload_config` with no open session.
+/// `_hotl/session/reload_config` with no open session.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ReloadAck {
     pub ok: bool,
@@ -3370,20 +3315,24 @@ pub struct ReloadAck {
     pub warnings: Vec<String>,
 }
 
-/// `session/reload_config` with an open session (it is re-opened).
+/// `_hotl/session/reload_config` with an open session (it is re-opened).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ReloadSessionAck {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
     pub ok: bool,
     pub session_id: String,
     pub model: String,
     pub mode: String,
     pub plan: bool,
     pub context_window: u64,
+    pub skills: Vec<RosterEntry>,
+    pub workflows: Vec<RosterEntry>,
     pub warnings: Vec<String>,
 }
 
-/// `session/steer` and `session/aside`: `false` = there was no turn to queue on.
+/// `_hotl/session/steer` and `_hotl/session/aside`: `false` = there was no turn to queue on.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Queued {
     pub queued: bool,
@@ -3437,15 +3386,6 @@ pub enum AcpOnlyUpdate {
         bytes: usize,
         cap: usize,
         entries: Vec<MemoryEntryRow>,
-    },
-    ConfigReloaded {
-        model: String,
-        mode: String,
-        plan: bool,
-        context_window: u64,
-        skills: Vec<RosterEntry>,
-        workflows: Vec<RosterEntry>,
-        warnings: Vec<String>,
     },
     ConfigReloadFailed {
         reason: String,

@@ -658,7 +658,7 @@ pub async fn acp_main() -> i32 {
     };
     // With the reload hook, same as `hotl tui`: an editor or orchestrator
     // driving hotl over stdio can pick up a `config.toml` edit with
-    // `session/reload_config` instead of restarting the process.
+    // `_hotl/session/reload_config` instead of restarting the process.
     crate::acp::serve(
         tokio::io::stdin(),
         tokio::io::stdout(),
@@ -1171,7 +1171,7 @@ pub(crate) async fn build_acp_with(
             default_effort: scaffold.config.effort.map(|e| e.as_str().to_string()),
             effort_schedule: scaffold.config.effort_schedule.map(|s| s.to_string()),
             // This log's own id — the one a later `session/load` (and so
-            // `session/reload_config`) must name to replay this chain.
+            // `_hotl/session/reload_config`) must name to replay this chain.
             session_id,
             warnings: notices,
             mcp_warnings,
@@ -1200,7 +1200,7 @@ pub(crate) async fn acp_factory(
     }
 }
 
-/// The hook `serve` calls on `session/reload_config`: rebuild the factory from
+/// The hook `serve` calls on `_hotl/session/reload_config`: rebuild the factory from
 /// whatever `config.toml` says *now*. Boxed because the protocol layer must not
 /// know how a scaffold is built — only that one can be rebuilt.
 pub(crate) fn reload_hook() -> crate::acp::Reload {

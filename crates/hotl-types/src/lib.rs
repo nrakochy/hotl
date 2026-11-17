@@ -763,7 +763,7 @@ pub fn bare_model(model: &str) -> &str {
     model.split_once('/').map_or(model, |(_, rest)| rest)
 }
 
-/// Longest focus a human fold may carry (the `session/set_goal` bound; 0066).
+/// Longest focus a human fold may carry (the `_hotl/session/set_goal` bound; 0066).
 pub const FOCUS_MAX: usize = 4000;
 
 /// The one validator for a fold's focus — the TUI, ACP and the engine all

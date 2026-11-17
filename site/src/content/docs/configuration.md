@@ -220,7 +220,7 @@ feel; it's opt-in, the default stays `tokyo-night`.
 
 ### Reloading without restarting
 
-`config.toml` is read at startup. In the console, `/reload` re-reads it and rebuilds the engine against the new file, keeping the session — the transcript, the model's context, the todos, the session name, its permission mode, and plan mode all carry forward. `hotl acp` clients reach the same thing as `session/reload_config`.
+`config.toml` is read at startup. In the console, `/reload` re-reads it and rebuilds the engine against the new file, keeping the session — the transcript, the model's context, the todos, the session name, its permission mode, and plan mode all carry forward. `hotl acp` clients reach the same thing as `_hotl/session/reload_config`.
 
 Most of the file reloads: `[provider]`, `[[allow]]`, `[[mcp]]`, `[[hook]]`, `[formatters]`, `[diagnostics]`, `[skills]`, `[agents]`, `[workflows]`, saved workflow recipes, `[context]`, `[behavior]`, `[settings]`, `system-prompt.md`. A reload that fails to parse or to select a provider changes nothing and says so — the running engine keeps serving.
 
@@ -746,7 +746,7 @@ mode = "read-only"   # read-only (default) | read-write | off
 
 `read-only` loads both files and writes nothing: `/remember <note>` says so,
 and the model has no `remember` tool. `read-write` turns the write path on:
-`/remember <note>` (or `session/remember` under `hotl acp`) asks you with the
+`/remember <note>` (or `_hotl/session/remember` under `hotl acp`) asks you with the
 same y/n a tool ask uses, then appends `- YYYY-MM-DD: <note>` under `## Notes`
 and records a `memory_appended` entry in the session log. The model may
 *propose* a note through the `remember` tool; its permission gate is that

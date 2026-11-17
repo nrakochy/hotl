@@ -677,7 +677,7 @@ pub enum EngineEvent {
     Compacted {
         degraded: bool,
         /// The focus the fold ran with, if any — `/compact <focus>` or
-        /// `session/fold` (0066).
+        /// `_hotl/session/fold` (0066).
         focus: Option<String>,
         /// What the digest cost. Informational here; billed through the next
         /// `TurnDone`'s usage.
@@ -934,7 +934,7 @@ impl std::fmt::Debug for ModelSwitch {
     }
 }
 
-/// How the actor took a human fold request (`/compact`, `session/fold`; 0066).
+/// How the actor took a human fold request (`/compact`, `_hotl/session/fold`; 0066).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FoldAdmission {
     /// Idle: the fold is running now.
@@ -1334,7 +1334,7 @@ pub enum SessionCmd {
     ContextBreakdown {
         reply: oneshot::Sender<hotl_types::ContextBreakdown>,
     },
-    /// A human fold (`/compact`, `session/fold`; 0066). Idle: runs now, the
+    /// A human fold (`/compact`, `_hotl/session/fold`; 0066). Idle: runs now, the
     /// reply says `Started` before the fold. Running: parks until the turn
     /// ends, the reply says `Queued`. `focus` is already normalized.
     Fold {

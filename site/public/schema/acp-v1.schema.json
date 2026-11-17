@@ -56,57 +56,6 @@
         },
         {
           "properties": {
-            "context_window": {
-              "format": "uint64",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "mode": {
-              "type": "string"
-            },
-            "model": {
-              "type": "string"
-            },
-            "plan": {
-              "type": "boolean"
-            },
-            "skills": {
-              "items": {
-                "$ref": "#/$defs/RosterEntry"
-              },
-              "type": "array"
-            },
-            "type": {
-              "const": "config_reloaded",
-              "type": "string"
-            },
-            "warnings": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "workflows": {
-              "items": {
-                "$ref": "#/$defs/RosterEntry"
-              },
-              "type": "array"
-            }
-          },
-          "required": [
-            "type",
-            "model",
-            "mode",
-            "plan",
-            "context_window",
-            "skills",
-            "workflows",
-            "warnings"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
             "reason": {
               "type": "string"
             },
@@ -2769,7 +2718,7 @@
       "description": "What a client answers `_hotl/session/request_question` with. Schema only."
     },
     "Queued": {
-      "description": "`session/steer` and `session/aside`: `false` = there was no turn to queue on.",
+      "description": "`_hotl/session/steer` and `_hotl/session/aside`: `false` = there was no turn to queue on.",
       "properties": {
         "queued": {
           "type": "boolean"
@@ -2781,7 +2730,7 @@
       "type": "object"
     },
     "ReloadAck": {
-      "description": "`session/reload_config` with no open session.",
+      "description": "`_hotl/session/reload_config` with no open session.",
       "properties": {
         "model": {
           "type": "string"
@@ -2804,7 +2753,7 @@
       "type": "object"
     },
     "ReloadSessionAck": {
-      "description": "`session/reload_config` with an open session (it is re-opened).",
+      "description": "`_hotl/session/reload_config` with an open session (it is re-opened).",
       "properties": {
         "contextWindow": {
           "format": "uint64",
@@ -2826,20 +2775,38 @@
         "sessionId": {
           "type": "string"
         },
+        "skills": {
+          "items": {
+            "$ref": "#/$defs/RosterEntry"
+          },
+          "type": "array"
+        },
+        "type": {
+          "type": "string"
+        },
         "warnings": {
           "items": {
             "type": "string"
           },
           "type": "array"
+        },
+        "workflows": {
+          "items": {
+            "$ref": "#/$defs/RosterEntry"
+          },
+          "type": "array"
         }
       },
       "required": [
+        "type",
         "ok",
         "sessionId",
         "model",
         "mode",
         "plan",
         "contextWindow",
+        "skills",
+        "workflows",
         "warnings"
       ],
       "type": "object"

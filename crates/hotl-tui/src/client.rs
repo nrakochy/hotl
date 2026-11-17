@@ -415,6 +415,11 @@ fn decode(msg: &Value) -> Option<ServerMsg> {
             let result = match msg.get("error") {
                 Some(e) => match e.pointer("/data/_meta/hotl.dev~1turn") {
                     Some(turn) => Ok(json!({"_meta": {"hotl.dev/turn": turn}})),
+                    None if e.pointer("/data/type").and_then(Value::as_str)
+                        == Some("config_reload_failed") =>
+                    {
+                        Ok(e.get("data").cloned().unwrap_or(Value::Null))
+                    }
                     None => Err(e
                         .get("message")
                         .and_then(Value::as_str)
@@ -473,9 +478,15 @@ pub fn translate(
             }
             if let Some(pos) = remember_ids.iter().position(|&p| p == id) {
                 remember_ids.remove(pos);
+                if let Some(update) = result.as_ref().ok().and_then(report_update) {
+                    return Some(Msg::Update(update));
+                }
                 return Some(Msg::RememberAck {
                     result: result.map(|_| ()),
                 });
+            }
+            if let Some(update) = result.as_ref().ok().and_then(report_update) {
+                return Some(Msg::Update(update));
             }
             let pos = steer_ids.iter().position(|&p| p == id)?;
             steer_ids.remove(pos);
@@ -484,6 +495,36 @@ pub fn translate(
             result.err().map(|why| Msg::SteerRejected { why })
         }
     }
+}
+
+const REPORT_KINDS: [&str; 6] = [
+    "memory_report",
+    "context_report",
+    "workflows_report",
+    "jobs_report",
+    "children_report",
+    "config_reload_failed",
+];
+
+fn report_update(result: &Value) -> Option<Value> {
+    let kind = result.get("type").and_then(Value::as_str)?;
+    if REPORT_KINDS.contains(&kind) {
+        return Some(result.clone());
+    }
+    if kind != "config_reloaded" {
+        return None;
+    }
+    let field = |k: &str| result.get(k).cloned().unwrap_or(Value::Null);
+    Some(json!({
+        "type": "config_reloaded",
+        "model": field("model"),
+        "mode": field("mode"),
+        "plan": field("plan"),
+        "context_window": field("contextWindow"),
+        "skills": field("skills"),
+        "workflows": field("workflows"),
+        "warnings": field("warnings"),
+    }))
 }
 
 /// A prompt reply as a `Msg`. The outcome's human-readable payload lives under
@@ -555,7 +596,11 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
             prompt_ids.push_back(client.request("session/prompt", params).await?);
         }
         Cmd::SendSteer(p) => {
-            steer_ids.push_back(client.request("session/steer", steer_params(&p)).await?);
+            steer_ids.push_back(
+                client
+                    .request("_hotl/session/steer", steer_params(&p))
+                    .await?,
+            );
         }
         Cmd::Cancel => {
             let params = client.with_session(json!({}));
@@ -565,12 +610,12 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
         // replies and rejected steers.
         Cmd::Rename(name) => {
             client
-                .request("session/rename", json!({"name": name}))
+                .request("_hotl/session/rename", json!({"name": name}))
                 .await?;
         }
         Cmd::SetColor(color) => {
             client
-                .request("session/set_color", json!({"color": color}))
+                .request("_hotl/session/set_color", json!({"color": color}))
                 .await?;
         }
         Cmd::SetMode(mode) => {
@@ -617,19 +662,19 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
                 Some(n) => json!({"note": n}),
                 None => json!({}),
             };
-            remember_ids.push_back(client.request("session/remember", params).await?);
+            remember_ids.push_back(client.request("_hotl/session/remember", params).await?);
         }
         // The ack is noise like set_mode: the engine's `goal_changed`
         // broadcast is what corrects the optimistic update. `None` rides as
         // JSON null, which is the wire's "clear".
         Cmd::SetGoal(goal) => {
             client
-                .request("session/set_goal", json!({"goal": goal}))
+                .request("_hotl/session/set_goal", json!({"goal": goal}))
                 .await?;
         }
         Cmd::Aside(question) => {
             client
-                .request("session/aside", json!({"question": question}))
+                .request("_hotl/session/aside", json!({"question": question}))
                 .await?;
         }
         Cmd::Fold(focus) => {
@@ -637,36 +682,35 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
                 Some(f) => json!({"focus": f}),
                 None => json!({}),
             };
-            client.request("session/fold", params).await?;
+            client.request("_hotl/session/fold", params).await?;
         }
-        // The ack is noise like rename/set_mode: the engine broadcasts
-        // `config_reloaded` (or `config_reload_failed`), and that is what the
-        // client acts on — no id-plumbing in the runtime's loop.
+        // The reply carries the report; `translate` turns it into an update.
         Cmd::ReloadConfig => {
-            client.request("session/reload_config", Value::Null).await?;
+            client
+                .request("_hotl/session/reload_config", Value::Null)
+                .await?;
         }
-        // The id is discarded: the report comes back as a `context_report`
-        // broadcast, so there is nothing to correlate it against.
+        // The reply carries the report; `translate` turns it into an update.
         Cmd::RequestContext => {
-            client.request("session/context", json!({})).await?;
+            client.request("_hotl/session/context", json!({})).await?;
         }
         Cmd::RequestWorkflows => {
-            client.request("session/workflows", json!({})).await?;
+            client.request("_hotl/session/workflows", json!({})).await?;
         }
         Cmd::RequestJobs => {
-            client.request("session/jobs", json!({})).await?;
+            client.request("_hotl/session/jobs", json!({})).await?;
         }
         Cmd::StopJob(job) => {
             client
-                .request("session/jobs/stop", json!({"job": job}))
+                .request("_hotl/session/jobs/stop", json!({"job": job}))
                 .await?;
         }
         Cmd::RequestChildren => {
-            client.request("session/children", json!({})).await?;
+            client.request("_hotl/session/children", json!({})).await?;
         }
         Cmd::StopChild(child) => {
             client
-                .request("session/children/stop", json!({"child": child}))
+                .request("_hotl/session/children/stop", json!({"child": child}))
                 .await?;
         }
         Cmd::ReplyPermission {
@@ -701,7 +745,7 @@ fn prompt_params(p: &crate::paste::PromptPayload) -> Value {
     json!({"prompt": blocks})
 }
 
-/// `session/steer` params. `images` carries only entries
+/// `_hotl/session/steer` params. `images` carries only entries
 /// the runtime seam encoded (`data: Some`) and is omitted entirely when
 /// empty, so a text-only frame stays byte-identical to the pre-image
 /// protocol — an older server never sees a key it does not know. Unencoded
@@ -1545,6 +1589,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_report_reply_becomes_the_update_the_view_reads() {
+        let reply = ServerMsg::Response {
+            id: 4,
+            result: Ok(json!({"type": "jobs_report", "jobs": []})),
+        };
+        let Some(Msg::Update(v)) = translate(
+            reply,
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+        ) else {
+            panic!("a report reply is an update");
+        };
+        assert_eq!(v["type"], "jobs_report");
+    }
+
+    #[test]
+    fn a_reload_reply_reads_like_the_old_broadcast() {
+        let v = report_update(&json!({
+            "type": "config_reloaded", "ok": true, "sessionId": "s", "model": "m2",
+            "mode": "plan", "plan": false, "contextWindow": 900000,
+            "skills": [], "workflows": [], "warnings": ["w"]
+        }))
+        .unwrap();
+        assert_eq!(v["context_window"], 900000);
+        assert_eq!(v["warnings"], json!(["w"]));
+    }
+
+    #[test]
+    fn a_failed_reload_error_decodes_to_the_failure_report() {
+        let line = json!({"jsonrpc": "2.0", "id": 3, "error": {"code": -32603,
+            "message": "config reload failed: x",
+            "data": {"type": "config_reload_failed", "reason": "x"}}});
+        let Some(ServerMsg::Response { result: Ok(v), .. }) = decode(&line) else {
+            panic!("the failure report rides the error");
+        };
+        assert_eq!(report_update(&v).unwrap()["reason"], "x");
+    }
+
     #[tokio::test]
     async fn reload_config_is_a_bare_wire_request() {
         let (mut read, write) = tokio::io::duplex(4096);
@@ -1574,7 +1659,7 @@ mod tests {
         read.read_to_string(&mut out).await.unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(out.trim()).unwrap(),
-            json!({"jsonrpc": "2.0", "id": 1, "method": "session/reload_config"})
+            json!({"jsonrpc": "2.0", "id": 1, "method": "_hotl/session/reload_config"})
         );
     }
 

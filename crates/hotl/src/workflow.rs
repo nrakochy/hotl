@@ -34,7 +34,7 @@ pub(crate) const RESULT_BYTES: usize = 64 * 1024;
 
 /// Every run this process has started, oldest first — process-wide because
 /// tools have no context struct and the ACP server reads it for
-/// `session/workflows` (the `hotl_tools::net` precedent).
+/// `_hotl/session/workflows` (the `hotl_tools::net` precedent).
 pub fn runs() -> &'static Mutex<Vec<Arc<Mutex<RunSummary>>>> {
     static RUNS: OnceLock<Mutex<Vec<Arc<Mutex<RunSummary>>>>> = OnceLock::new();
     RUNS.get_or_init(|| Mutex::new(Vec::new()))

@@ -33,8 +33,8 @@ unless the schema says `null` is a value.
 | `session/prompt` result | `PromptResponse`; its `_meta["hotl.dev/turn"]` is `TurnMeta` |
 | `_hotl/session/update` params | `ExtSessionUpdateParams` (its `update` is a stream frame or an ACP-only kind; standard `session/update` params are `SessionNotification`, and an opted-in client finds the same frame in its update's `_meta["hotl.dev/frame"]`) |
 | `session/set_plan`, `set_mode`, `set_effort`, `set_model`, `set_goal` results | `PlanAck`, `ModeAck`, `EffortAck`, `ModelAck`, `GoalAck` |
-| `session/reload_config` result | `ReloadAck` / `ReloadSessionAck` |
-| `session/steer`, `session/fold` results | `Queued` (`session/cancel` is a notification and gets no reply); stops → `StoppedAck`; the rest → `Ack` |
+| `_hotl/session/reload_config` result | `ReloadAck` / `ReloadSessionAck` |
+| `_hotl/session/steer`, `_hotl/session/fold` results | `Queued` (`session/cancel` is a notification and gets no reply); stops → `StoppedAck`; the rest → `Ack` |
 | server → client `session/request_permission` (tool asks and network asks), `request_question` | `RequestPermissionRequest`, `RequestQuestionParams` |
 | what the client answers them with | `RequestPermissionResponse`, `QuestionReply` |
 

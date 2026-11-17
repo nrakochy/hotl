@@ -942,7 +942,7 @@ pub enum Msg {
     ModelAck {
         result: Result<serde_json::Value, String>,
     },
-    /// `session/remember`'s ack (0069): `Ok` is silent (the `memory_changed`
+    /// `_hotl/session/remember`'s ack (0069): `Ok` is silent (the `memory_changed`
     /// frame carries the notice); `Err` is the refusal text.
     RememberAck {
         result: Result<(), String>,
@@ -996,7 +996,7 @@ pub enum Cmd {
     /// runtime seam reads and encodes the files.
     SendPrompt(paste::PromptPayload),
     SendSteer(paste::PromptPayload),
-    /// Send `session/rename` (fire-and-forget; the ack is noise).
+    /// Send `_hotl/session/rename` (fire-and-forget; the ack is noise).
     Rename(String),
     /// Send `session/set_mode` (fire-and-forget; the ack is noise). Payload
     /// is the mode name (`"ask" | "bypass" | "dontask"`) — already validated
@@ -1011,18 +1011,18 @@ pub enum Cmd {
     /// `model_changed` event is the only thing that moves the strip; the ack
     /// comes back as `Msg::ModelAck` (queued, warnings, or the error).
     SetModel(String),
-    /// Send `session/set_goal` (fire-and-forget; the ack is noise — the
+    /// Send `_hotl/session/set_goal` (fire-and-forget; the ack is noise — the
     /// engine's `goal_changed` broadcast is what corrects the optimism).
     /// `None` clears.
     SetGoal(Option<String>),
-    /// Send `session/remember` (0069): `None` asks for the report, `Some`
+    /// Send `_hotl/session/remember` (0069): `None` asks for the report, `Some`
     /// proposes a note. The ack comes back as `Msg::RememberAck`; the confirm
     /// arrives as an ordinary `Msg::PermissionRequest`.
     Remember(Option<String>),
-    /// Send `session/aside` (0071 T5); the answer comes back as
+    /// Send `_hotl/session/aside` (0071 T5); the answer comes back as
     /// `aside_result`.
     Aside(String),
-    /// Send `session/fold` (fire-and-forget; the ack is noise — the engine's
+    /// Send `_hotl/session/fold` (fire-and-forget; the ack is noise — the engine's
     /// `compacting`/`compacted`/`fold_skipped` frames are the outcome). The
     /// payload is the already-normalized focus (0066).
     Fold(Option<String>),
@@ -1053,24 +1053,24 @@ pub enum Cmd {
         selected: Vec<String>,
         free_text: Option<String>,
     },
-    /// Send `session/reload_config` (fire-and-forget; the engine broadcasts
+    /// Send `_hotl/session/reload_config` (fire-and-forget; the engine broadcasts
     /// `config_reloaded`, which is what the client actually acts on).
     ReloadConfig,
-    /// Send `session/context` (fire-and-forget; the ack is noise — the engine
+    /// Send `_hotl/session/context` (fire-and-forget; the ack is noise — the engine
     /// broadcasts `context_report`, which is what the client acts on).
     RequestContext,
-    /// Send `session/workflows` (0044; same fire-and-forget shape — the
+    /// Send `_hotl/session/workflows` (0044; same fire-and-forget shape — the
     /// engine broadcasts `workflows_report`).
     RequestWorkflows,
-    /// Send `session/jobs` (0064); the report comes back as `jobs_report`.
+    /// Send `_hotl/session/jobs` (0064); the report comes back as `jobs_report`.
     RequestJobs,
-    /// Send `session/jobs/stop` for one job id (0064); the `job_done` frame
+    /// Send `_hotl/session/jobs/stop` for one job id (0064); the `job_done` frame
     /// is the outcome.
     StopJob(String),
-    /// Send `session/children` (0072); the report comes back as
+    /// Send `_hotl/session/children` (0072); the report comes back as
     /// `children_report`.
     RequestChildren,
-    /// Send `session/children/stop` for one sub-agent id (0072); its `agent`
+    /// Send `_hotl/session/children/stop` for one sub-agent id (0072); its `agent`
     /// done frame is the outcome.
     StopChild(String),
     /// Re-read the client-side half of `config.toml` — theme, density, vim
