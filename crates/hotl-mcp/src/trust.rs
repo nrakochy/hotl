@@ -255,7 +255,10 @@ impl fmt::Display for Fingerprint {
                 // come from one read (H-07). An env entry is a code-execution
                 // channel, so it is screened exactly like an argument.
                 if !env.is_empty() {
-                    let pairs: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                    let pairs: Vec<String> = env
+                        .iter()
+                        .map(|(k, v)| format!("{k}={}", mask(v)))
+                        .collect();
                     write!(f, "\nenv: {}", pairs.join(" "))?;
                 }
                 if let Some(cwd) = cwd {
@@ -694,10 +697,8 @@ mod tests {
 
         // Shown == recorded: what the key folds in, the screen displays.
         let screen = env_fp.to_string();
-        assert!(
-            screen.contains("NODE_OPTIONS=--require /tmp/evil.js"),
-            "{screen}"
-        );
+        assert!(screen.contains("NODE_OPTIONS=--re…"), "{screen}");
+        assert!(!screen.contains("evil"), "{screen}");
         let screen = cwd_fp.to_string();
         assert!(screen.contains("cwd: "), "{screen}");
         assert!(!base.to_string().contains("env:"), "{base}");

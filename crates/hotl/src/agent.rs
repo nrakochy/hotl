@@ -8643,6 +8643,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_client_mcp_server_reaches_the_session_tool_roster() {
+        use hotl_testkit::fake_anthropic::{text, FakeAnthropic, Script};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let fake = FakeAnthropic::start(Script::queue(vec![text("ok").into()])).await;
+        let secrets = MapSecrets::from([
+            ("ANTHROPIC_API_KEY", "sk-ant-x"),
+            ("HOTL_ANTHROPIC_BASE_URL", fake.base_url()),
+        ]);
+        let (factory, info, _) = build_acp_with(config_from_toml(""), &secrets)
+            .await
+            .expect("acp starts");
+        let dir = tempfile::tempdir().unwrap();
+        let server = dir.path().join("fake-mcp.sh");
+        std::fs::write(
+            &server,
+            "#!/bin/sh\nwhile read line; do\n  id=${line#*\\\"id\\\":}; id=${id%%[,}]*}\n  case \"$line\" in\n    *'\"initialize\"'*) echo \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$id,\\\"result\\\":{}}\";;\n    *'\"tools/list\"'*) echo \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$id,\\\"result\\\":{\\\"tools\\\":[]}}\";;\n  esac\ndone\n",
+        )
+        .unwrap();
+        let (client, serve_end) = tokio::io::duplex(64 * 1024);
+        let (sread, swrite) = tokio::io::split(serve_end);
+        tokio::spawn(crate::acp::serve(sread, swrite, factory, info, None));
+        let (cread, mut cwrite) = tokio::io::split(client);
+        let mut lines = tokio::io::BufReader::new(cread).lines();
+        let calls = [
+            serde_json::json!({"method":"initialize","params":{"protocolVersion":1}}),
+            serde_json::json!({"method":"session/new","params":{
+                "cwd": dir.path(),
+                "mcpServers": [{
+                    "name": "editor-fs",
+                    "command": "/bin/sh",
+                    "args": [server],
+                    "env": [{"name": "TOKEN", "value": "s3cret"}]
+                }]
+            }}),
+            serde_json::json!({"method":"session/prompt","params":{"text":"hi"}}),
+        ];
+        for (i, call) in calls.iter().enumerate() {
+            let mut call = call.clone();
+            call["jsonrpc"] = serde_json::json!("2.0");
+            call["id"] = serde_json::json!(i + 1);
+            cwrite
+                .write_all(format!("{call}\n").as_bytes())
+                .await
+                .unwrap();
+            loop {
+                let line = lines.next_line().await.unwrap().expect("server closed");
+                let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if v["id"] == serde_json::json!(i + 1) {
+                    assert!(v.get("error").is_none(), "{v}");
+                    break;
+                }
+            }
+        }
+        let request = fake.requests().into_iter().next().expect("one sample");
+        let mcp = request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "mcp")
+            .expect("the session carries the mcp tool");
+        let description = mcp["description"].as_str().unwrap();
+        assert!(description.contains("`editor-fs`"), "{description}");
+    }
+
+    #[tokio::test]
     async fn a_placeholder_provider_refuses_before_any_network_io() {
         use futures_util::StreamExt;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

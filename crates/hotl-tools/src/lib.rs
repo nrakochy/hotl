@@ -888,6 +888,22 @@ mod tests {
     }
 
     #[test]
+    fn replace_swaps_a_tool_of_the_same_name_and_adds_one_that_is_missing() {
+        let mut reg = Registry::builtin();
+        let before = reg.defs().len();
+        reg.replace(Box::new(ShadowRead));
+        assert_eq!(reg.defs().len(), before);
+        assert_eq!(reg.defs().iter().filter(|d| d.name == "read").count(), 1);
+        assert!(!reg.get("read").unwrap().read_only());
+        assert!(reg.get("mcp").is_none());
+        reg.replace(Box::new(NamedTool("mcp")));
+        assert_eq!(reg.defs().len(), before + 1);
+        assert!(reg.get("mcp").is_some());
+        reg.replace(Box::new(NamedTool("mcp")));
+        assert_eq!(reg.defs().iter().filter(|d| d.name == "mcp").count(), 1);
+    }
+
+    #[test]
     fn read_only_is_true_only_for_pure_reads() {
         let reg = Registry::builtin();
         assert!(reg.get("read").unwrap().read_only());
