@@ -3928,3 +3928,66 @@ async fn authenticate_rejects_unknown_and_terminal_methods() {
         assert_eq!(reply["error"]["code"], -32602, "{reply}");
     }
 }
+
+fn hook_to(info_after: fn() -> acp::ServerInfo) -> acp::Reload {
+    Box::new(move || {
+        Box::pin(async move { Ok((scripted_factory(), info_after(), Vec::<String>::new())) })
+    })
+}
+
+async fn rpc_with_hook(info: acp::ServerInfo, hook: acp::Reload, calls: Vec<Value>) -> Vec<Value> {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        info,
+        Some(hook),
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    let mut out = Vec::new();
+    for (i, call) in calls.into_iter().enumerate() {
+        let mut call = call;
+        call["jsonrpc"] = json!("2.0");
+        call["id"] = json!(i + 1);
+        send(&mut cwrite, call).await;
+        out.push(read_until_id(&mut lines, i as u64 + 1).await);
+    }
+    out
+}
+
+#[tokio::test]
+async fn reload_with_a_live_session_after_the_key_vanishes_is_auth_required() {
+    let r = rpc_with_hook(
+        server_info(),
+        hook_to(no_key_info),
+        vec![
+            json!({"method":"initialize","params":{"protocolVersion":1}}),
+            json!({"method":"session/new","params":{}}),
+            json!({"method":"session/reload_config","params":{}}),
+        ],
+    )
+    .await;
+    assert!(r[1]["result"]["sessionId"].is_string(), "{}", r[1]);
+    assert_eq!(r[2]["error"]["code"], -32000, "{}", r[2]);
+}
+
+#[tokio::test]
+async fn authenticate_reloads_so_a_fresh_key_is_picked_up() {
+    let r = rpc_with_hook(
+        no_key_info(),
+        hook_to(server_info),
+        vec![
+            json!({"method":"initialize","params":{"protocolVersion":1}}),
+            json!({"method":"session/new","params":{}}),
+            json!({"method":"authenticate","params":{"methodId":"hotl-key"}}),
+            json!({"method":"session/new","params":{}}),
+        ],
+    )
+    .await;
+    assert_eq!(r[1]["error"]["code"], -32000);
+    assert_eq!(r[2]["result"], json!({}), "{}", r[2]);
+    assert!(r[3]["result"]["sessionId"].is_string(), "{}", r[3]);
+}

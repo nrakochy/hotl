@@ -533,6 +533,12 @@ async fn handle_request(
                 .unwrap_or_default();
             match request.method_id.as_deref() {
                 Some(AUTH_METHOD_KEY) => {
+                    if let Some(hook) = reload.as_mut() {
+                        if let Ok((new_factory, new_info, _)) = hook().await {
+                            *factory = new_factory;
+                            *info = new_info;
+                        }
+                    }
                     if key_available(info) {
                         reply_ok(writer, id, json!({})).await;
                     } else {
@@ -1353,6 +1359,9 @@ async fn handle_request(
                     .await;
                 }
             };
+            if !new_info.key_available && session.is_some() {
+                return reply_err(writer, id, codes::AUTH_REQUIRED, NO_KEY_MESSAGE).await;
+            }
             *factory = new_factory;
             *info = new_info;
             // No live session: the new factory is in place and the next

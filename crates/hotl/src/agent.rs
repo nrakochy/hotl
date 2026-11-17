@@ -677,6 +677,29 @@ pub async fn acp_main() -> i32 {
 /// Deliberately silent: `/reload` (`acp::Reload`) calls this with the
 /// alternate screen up, where a stray `eprintln!` would corrupt the display.
 /// The startup wrapper below is what prints.
+pub(crate) async fn build_acp_strict() -> Result<
+    (
+        crate::acp::SessionFactory,
+        crate::acp::ServerInfo,
+        Vec<String>,
+    ),
+    String,
+> {
+    let (factory, info, warnings) = build_acp().await?;
+    if !info.key_available {
+        return Err(missing_key_message());
+    }
+    Ok((factory, info, warnings))
+}
+
+fn missing_key_message() -> String {
+    let cfg = crate::config::Config::load(&config_dir());
+    match select_provider_typed(&cfg, &EnvSecrets) {
+        Err(e) => e.into(),
+        Ok(_) => crate::acp::NO_KEY_MESSAGE.to_string(),
+    }
+}
+
 pub(crate) async fn build_acp() -> Result<
     (
         crate::acp::SessionFactory,
@@ -703,8 +726,10 @@ pub(crate) async fn build_acp_with(
     let (provider, model, key_source, key_available) = match select_provider_typed(&cfg, secrets) {
         Ok((p, m, s)) => (p, m, s, true),
         Err(SelectError::MissingKey(_)) => {
-            let (p, m, s) = select_provider_typed(&cfg, &PlaceholderKeys(secrets))?;
-            (p, m, s, false)
+            let (p, m, _) = select_provider_typed(&cfg, &PlaceholderKeys(secrets))?;
+            let validated: Arc<dyn hotl_provider::key::KeySource> =
+                Arc::new(hotl_provider::key::StaticKey(None));
+            (p, m, validated, false)
         }
         Err(e) => return Err(e.into()),
     };
@@ -4963,7 +4988,37 @@ fn key_source_for(
                 .map(std::time::Duration::from_secs);
             Arc::new(crate::keysource::HelperKey::new(cmd, ttl))
         }
+        None if fallback_key.as_deref() == Some(PLACEHOLDER_KEY) => Arc::new(RefusingKey),
         None => Arc::new(hotl_provider::key::StaticKey(fallback_key)),
+    }
+}
+
+const PLACEHOLDER_KEY: &str = "hotl-no-key-placeholder";
+
+struct RefusingKey;
+
+impl hotl_provider::key::KeySource for RefusingKey {
+    fn get(
+        &self,
+    ) -> futures_util::future::BoxFuture<'_, Result<Option<String>, hotl_provider::key::KeyError>>
+    {
+        Box::pin(async {
+            Err(hotl_provider::key::KeyError(
+                crate::acp::NO_KEY_MESSAGE.into(),
+            ))
+        })
+    }
+    fn refresh(
+        &self,
+    ) -> futures_util::future::BoxFuture<'_, Result<(), hotl_provider::key::KeyError>> {
+        Box::pin(async {
+            Err(hotl_provider::key::KeyError(
+                crate::acp::NO_KEY_MESSAGE.into(),
+            ))
+        })
+    }
+    fn refreshable(&self) -> bool {
+        false
     }
 }
 
@@ -4992,7 +5047,7 @@ impl SecretStore for PlaceholderKeys<'_> {
     fn get(&self, name: &str) -> Option<String> {
         self.0.get(name).or_else(|| {
             matches!(name, "ANTHROPIC_API_KEY" | "OPENAI_API_KEY")
-                .then(|| "hotl-no-key-placeholder".to_string())
+                .then(|| PLACEHOLDER_KEY.to_string())
         })
     }
 }
@@ -8464,6 +8519,42 @@ mod tests {
         let calls = [serde_json::json!({"method":"authenticate","params":{"methodId":"hotl-key"}})];
         let replies = acp_replies(&secrets, &calls).await;
         assert_eq!(replies[0]["result"], serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn a_placeholder_provider_refuses_before_any_network_io() {
+        use futures_util::StreamExt;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let secrets = MapSecrets::from([("HOTL_ANTHROPIC_BASE_URL", base.as_str())]);
+        let cfg = config_from_toml("");
+        assert!(matches!(
+            select_provider_typed(&cfg, &secrets),
+            Err(SelectError::MissingKey(_))
+        ));
+        let (provider, model, _) = select_provider_typed(&cfg, &PlaceholderKeys(&secrets))
+            .ok()
+            .unwrap();
+        let req = hotl_provider::SamplingRequest {
+            model,
+            max_tokens: 16,
+            system: "".into(),
+            items: hotl_provider::arc_items(Vec::new()),
+            ephemeral_tail: Arc::new(Vec::new()),
+            tools: Arc::from(Vec::<hotl_provider::ToolDef>::new()),
+            thinking: false,
+            effort: None,
+            cache: hotl_provider::CachePolicy::Off,
+            turn_context: None,
+            cache_key: None,
+            output_format: None,
+        };
+        let events: Vec<_> = provider.stream(req).collect().await;
+        assert!(events.iter().any(|e| e.is_err()), "{events:?}");
+        let text = format!("{events:?}");
+        assert!(text.contains("hotl setup"), "{text}");
+        assert!(listener.accept().is_err());
     }
 
     #[tokio::test]

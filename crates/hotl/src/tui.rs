@@ -243,7 +243,7 @@ fn seed_state(state: &mut State, model: String, opened: Opened, first_run_hint: 
 /// taken, so nothing here prints: startup warnings ride `Opened::warnings`
 /// into transcript notices and a failure comes back as its message.
 async fn open_session(tui_args: TuiArgs) -> Result<(Client, ServerReader, String, Opened), String> {
-    let (factory, info, startup_warnings) = crate::agent::build_acp().await?;
+    let (factory, info, startup_warnings) = crate::agent::build_acp_strict().await?;
     let model = info.model.clone();
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server_io);
