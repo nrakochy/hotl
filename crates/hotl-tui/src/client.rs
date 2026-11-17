@@ -109,9 +109,19 @@ impl<W: AsyncWrite + Unpin> AcpClient<W> {
         self.session_id = Some(id.into());
     }
 
+    pub fn clear_questions(&mut self) {
+        self.multi_questions.clear();
+    }
+
     fn with_session(&self, mut params: Value) -> Value {
-        if let (Some(id), Some(map)) = (&self.session_id, params.as_object_mut()) {
-            map.insert("sessionId".into(), json!(id));
+        let Some(id) = &self.session_id else {
+            return params;
+        };
+        if params.is_null() {
+            params = json!({});
+        }
+        if let Some(map) = params.as_object_mut() {
+            map.entry("sessionId").or_insert_with(|| json!(id));
         }
         params
     }
@@ -120,6 +130,7 @@ impl<W: AsyncWrite + Unpin> AcpClient<W> {
     pub async fn request(&mut self, method: &str, params: Value) -> io::Result<u64> {
         self.next_id += 1;
         let id = self.next_id;
+        let params = self.with_session(params);
         let mut msg = json!({"jsonrpc": "2.0", "id": id, "method": method});
         if !params.is_null() {
             msg["params"] = params;
@@ -592,8 +603,7 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
 ) -> io::Result<Option<Cmd>> {
     match cmd {
         Cmd::SendPrompt(p) => {
-            let params = client.with_session(prompt_params(&p));
-            prompt_ids.push_back(client.request("session/prompt", params).await?);
+            prompt_ids.push_back(client.request("session/prompt", prompt_params(&p)).await?);
         }
         Cmd::SendSteer(p) => {
             steer_ids.push_back(
@@ -603,6 +613,7 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
             );
         }
         Cmd::Cancel => {
+            client.clear_questions();
             let params = client.with_session(json!({}));
             client.notify("session/cancel", params).await?;
         }
@@ -620,19 +631,14 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
         }
         Cmd::SetMode(mode) => {
             client
-                .request(
-                    "session/set_mode",
-                    client.with_session(json!({"modeId": mode})),
-                )
+                .request("session/set_mode", json!({"modeId": mode}))
                 .await?;
         }
         Cmd::SetPlan(plan) => {
             client
                 .request(
                     "session/set_config_option",
-                    client.with_session(
-                        json!({"configId": "plan", "type": "boolean", "value": plan}),
-                    ),
+                    json!({"configId": "plan", "type": "boolean", "value": plan}),
                 )
                 .await?;
         }
@@ -641,7 +647,7 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
             client
                 .request(
                     "session/set_config_option",
-                    client.with_session(json!({"configId": "effort", "value": wire})),
+                    json!({"configId": "effort", "value": wire}),
                 )
                 .await?;
         }
@@ -651,7 +657,7 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
                 client
                     .request(
                         "session/set_config_option",
-                        client.with_session(json!({"configId": "model", "value": spec})),
+                        json!({"configId": "model", "value": spec}),
                     )
                     .await?,
             );
@@ -1440,6 +1446,51 @@ mod tests {
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         (lines, ids)
+    }
+
+    #[tokio::test]
+    async fn steer_and_ext_requests_name_the_session() {
+        let (lines, _) = written(Cmd::SendSteer(mixed_payload())).await;
+        assert_eq!(lines[0]["method"], "_hotl/session/steer");
+        assert_eq!(lines[0]["params"]["sessionId"], "s1");
+        let (lines, _) = written(Cmd::RequestJobs).await;
+        assert_eq!(lines[0]["params"]["sessionId"], "s1");
+        let (lines, _) = written(Cmd::ReloadConfig).await;
+        assert_eq!(lines[0]["params"], json!({"sessionId": "s1"}));
+    }
+
+    #[tokio::test]
+    async fn cancel_forgets_open_multi_questions() {
+        let (_read, write) = tokio::io::duplex(4096);
+        let mut client = AcpClient::new(write);
+        client.note_server_msg(&ServerMsg::QuestionRequest {
+            req_id: 4,
+            question: Question {
+                header: String::new(),
+                prompt: String::new(),
+                options: vec![],
+                multi: true,
+            },
+        });
+        exec_wire_cmd(
+            Cmd::Cancel,
+            &mut client,
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+        )
+        .await
+        .unwrap();
+        assert!(client.multi_questions.is_empty());
+    }
+
+    #[test]
+    fn agent_message_chunk_decodes_as_text() {
+        let msg = decode(&serde_json::from_str(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"},"_meta":{"hotl.dev/frame":{"type":"text_delta","text":"hi"}}}}}"#).unwrap());
+        assert!(
+            matches!(msg, Some(ServerMsg::Update(v)) if v["type"] == "text_delta" && v["text"] == "hi")
+        );
     }
 
     #[tokio::test]

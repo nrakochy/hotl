@@ -796,13 +796,17 @@ async fn run_loop(
             sm = read_server_msg(reader) => match sm {
                 Some(m) => {
                     client.note_server_msg(&m);
-                    translate(
+                    let msg = translate(
                     m,
                     &mut prompt_ids,
                     &mut steer_ids,
                     &mut model_ids,
                     &mut remember_ids,
-                    )
+                    );
+                    if matches!(msg, Some(Msg::PromptResult { .. })) {
+                        client.clear_questions();
+                    }
+                    msg
                 }
                 None => return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
