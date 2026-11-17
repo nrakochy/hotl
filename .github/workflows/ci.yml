@@ -413,3 +413,5 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Audit dependencies
         run: cargo audit --deny warnings
+      - name: Audit dependencies (ACP conformance crate; chrono is locked by serde_with but never built)
+        run: cargo audit --deny warnings --file conformance/acp/Cargo.lock --ignore RUSTSEC-2026-0543

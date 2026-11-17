@@ -27,7 +27,9 @@ semver promise of their own.
   | `session/cancel` (a request) | `session/cancel` (a notification, no reply) |
   | `session/set_mode {mode}` | `session/set_mode {modeId}` |
   | `session/set_model`, `session/set_effort`, `session/set_plan` | `session/set_config_option` with `configId` `model`, `effort` or `plan` |
-  | `session/rename`, `set_color`, `set_goal`, `remember`, `steer`, `fold`, `reload_config`, `aside`, `context`, `workflows`, `jobs`, `jobs/stop`, `children`, `children/stop` | `_hotl/session/<same name>`, same params and results |
+  | `session/rename`, `set_color`, `set_goal`, `steer`, `fold`, `aside`, `jobs/stop`, `children/stop`, `remember` with a `note` | `_hotl/session/<same name>`, same params and results |
+  | `session/context`, `workflows`, `jobs`, `children`, `remember` without a `note` | `_hotl/session/<same name>`, same params. The reply is now the report itself. Before, the reply was `{"ok": true}` and the report came after it as a `session/update`. A script that waited for that update must read the reply instead. |
+  | `session/reload_config` | `_hotl/session/reload_config`, same params. On success the reply now also carries `type`, `skills` and `workflows`, and no separate `config_reloaded` update follows. On failure there is no `config_reload_failed` update; the error's `data` holds it instead. |
   | `session/request_permission {summary, protectedWhy}` | `session/request_permission {toolCall, options}` |
   | `session/request_egress {host}` | `session/request_permission` with `toolCall.kind: "fetch"` |
   | `session/request_question` | `elicitation/create` (a form) when the client supports forms, else `_hotl/session/request_question` |
@@ -48,9 +50,10 @@ semver promise of their own.
   background process).
 - `session/cancel` drops only the prompts the client queued. Work hotl queued
   itself, such as a retry for structured output, still runs.
-- `hotl schema acp` prints only hotl's extensions. The published schema moved
-  from `acp-v1.schema.json` to `acp-hotl-extensions.schema.json`; standard
-  messages follow the ACP v1 schema.
+- `hotl schema acp` prints only hotl's extensions, published as
+  `acp-hotl-extensions.schema.json`; standard messages follow the ACP v1
+  schema. The old `acp-v1.schema.json` stays published, frozen, and describes
+  only the removed 0.1 dialect.
 
 ### Added
 

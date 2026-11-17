@@ -80,6 +80,10 @@ fn schema_ids_name_the_published_urls() {
         committed("acp-hotl-extensions.schema.json")["$id"],
         "https://nrakochy.github.io/hotl/schema/acp-hotl-extensions.schema.json"
     );
+    assert_eq!(
+        committed("acp-v1.schema.json")["$id"],
+        "https://nrakochy.github.io/hotl/schema/acp-v1.schema.json"
+    );
 }
 
 #[test]

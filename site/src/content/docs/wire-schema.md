@@ -22,6 +22,11 @@ publishes a new file beside the old one (`json-stream-v3.schema.json`). The old
 URL keeps working. Optional fields are left out rather than sent as `null`,
 unless the schema says `null` is a value.
 
+The old [`acp-v1.schema.json`](/hotl/schema/acp-v1.schema.json) is still
+published for that reason. It describes hotl's own ACP-like protocol
+(`protocolVersion: "0.1"`), which this release removed. It is frozen and no
+longer matches anything hotl sends.
+
 ## ACP: standard v1 plus opt-in extras
 
 `hotl acp`, the console, `hotl serve` and `hotl attach` speak standard
