@@ -702,7 +702,7 @@ fn read_skill_dir(base_dir: &Path) -> Option<SkillEntry> {
     let dir_name = base_dir.file_name()?.to_str()?.to_string();
     let mut meta = parse_frontmatter(&text);
     let name = match meta.name.take() {
-        Some(n) => match normalize_marketplace_name(&n) {
+        Some(n) => match frontmatter_skill_name(&n) {
             Some(n) => n,
             None => {
                 meta.warnings.push(format!(
@@ -728,6 +728,17 @@ fn read_skill_dir(base_dir: &Path) -> Option<SkillEntry> {
         user_invocable: meta.user_invocable,
         argument_hint: meta.argument_hint,
         warnings: meta.warnings,
+    })
+}
+
+/// A frontmatter `name:` as a bare skill name. Claude plugins may write the
+/// qualified `<plugin>:<skill>`; the skill half is the name, and discovery
+/// adds its own `<source>:<skill>` alias.
+fn frontmatter_skill_name(raw: &str) -> Option<String> {
+    normalize_marketplace_name(raw).or_else(|| {
+        let (plugin, skill) = raw.split_once(':')?;
+        normalize_marketplace_name(plugin)?;
+        normalize_marketplace_name(skill)
     })
 }
 
@@ -1915,6 +1926,52 @@ mod tests {
         let e = read_skill_dir(&dir.path().join("ok")).unwrap();
         assert_eq!(e.name, "code-review");
         assert!(e.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_plugin_qualified_frontmatter_name_keeps_its_skill_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("nix-sie-skills_sieclient");
+        write_skill(
+            &skill,
+            "name: nix-sie-skills:sieclient\ndescription: d",
+            "body",
+        );
+        let e = read_skill_dir(&skill).unwrap();
+        assert_eq!(e.name, "sieclient");
+        assert!(e.warnings.is_empty(), "{:?}", e.warnings);
+        // Either half failing the grammar is still the directory fallback.
+        for bad in ["a:b:c", "has space:ok", "ok:has space", ":x", "x:"] {
+            write_skill(&skill, &format!("name: {bad}\ndescription: d"), "body");
+            let e = read_skill_dir(&skill).unwrap();
+            assert_eq!(e.name, "nix-sie-skills_sieclient", "{bad}");
+            assert_eq!(e.warnings.len(), 1, "{bad}: {:?}", e.warnings);
+        }
+    }
+
+    #[test]
+    fn a_claude_plugin_skill_named_plugin_colon_skill_loads_under_both_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        write_skill(
+            &cache.join("mkt/nix-sie-skills/0.0.1/skills/nix-sie-skills_ssh-proxy"),
+            "name: nix-sie-skills:ssh-proxy\ndescription: d",
+            "proxy body",
+        );
+        let (tool, warnings) = SkillTool::with_roots(&SkillRoots {
+            plugin_cache: Some(cache),
+            ..Default::default()
+        });
+        let tool = tool.unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        for name in ["ssh-proxy", "nix-sie-skills:ssh-proxy"] {
+            assert!(
+                tool.run_impl(&json!({"name": name}))
+                    .content
+                    .contains("proxy body"),
+                "{name}"
+            );
+        }
     }
 
     /// A tempdir repo: `.git` at the root, cwd two levels down, skills at
