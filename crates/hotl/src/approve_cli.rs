@@ -327,21 +327,4 @@ mod tests {
         }
         .answers(&question));
     }
-
-    #[test]
-    fn an_egress_prompt_built_for_a_plain_client_is_still_an_egress() {
-        let plain = decoded(
-            json!({"jsonrpc": "2.0", "id": 9, "method": "session/request_permission",
-            "params": {"sessionId": "s", "toolCall": {"toolCallId": "egress-9", "kind": "fetch",
-                "title": "Network access to example.com", "rawInput": {"host": "example.com"}}, "options": []}}),
-        );
-        assert_eq!(
-            plain,
-            ServerMsg::EgressRequest {
-                req_id: 9,
-                host: "example.com".into()
-            }
-        );
-        assert!(!Answer::Ask { id: 9, allow: true }.answers(&plain));
-    }
 }

@@ -397,14 +397,7 @@ pub fn decode(msg: &Value) -> Option<ServerMsg> {
         Some("session/request_permission") => {
             let req_id = msg.get("id").and_then(Value::as_u64)?;
             let call = msg.pointer("/params/toolCall")?;
-            let egress = call.pointer("/_meta/hotl.dev~1egress").or_else(|| {
-                let id = call.get("toolCallId").and_then(Value::as_str)?;
-                let fetch = call.get("kind").and_then(Value::as_str) == Some("fetch");
-                (fetch && id.starts_with("egress-"))
-                    .then(|| call.get("rawInput"))
-                    .flatten()
-            });
-            if let Some(egress) = egress {
+            if let Some(egress) = call.pointer("/_meta/hotl.dev~1egress") {
                 return Some(ServerMsg::EgressRequest {
                     req_id,
                     host: egress
@@ -1214,6 +1207,23 @@ mod tests {
             Some(ServerMsg::EgressRequest {
                 req_id: 12,
                 host: "registry.npmjs.org".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_tool_call_named_like_an_egress_is_still_a_tool_prompt() {
+        let msg: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":3,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"egress-1","kind":"fetch","title":"web_fetch https://evil.example","rawInput":{"host":"registry.npmjs.org"}},"options":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decode(&msg),
+            Some(ServerMsg::PermissionRequest {
+                req_id: 3,
+                summary: "web_fetch https://evil.example".into(),
+                protected_why: None,
+                diff: Vec::new(),
             })
         );
     }

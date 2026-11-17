@@ -694,10 +694,6 @@ impl Connection {
         self.session.as_ref().map(|s| s.id.as_str())
     }
 
-    pub(crate) fn adopt_client_caps(&self) {
-        self.caps_adopter()();
-    }
-
     pub(crate) fn caps_adopter(&self) -> impl FnOnce() + Send + 'static {
         let caps = self.client_caps;
         let shared = self
@@ -740,6 +736,7 @@ impl Connection {
             for (id, slot) in asks.iter_mut().filter(|(_, slot)| fresh(&slot.sent)) {
                 if let Some(request) = slot.sent.what.build(*id, &caps) {
                     slot.ext = caps.ext;
+                    slot.sent.client = client;
                     parked.push((*id, request));
                 }
             }
@@ -755,6 +752,7 @@ impl Connection {
                     if let Request::Question { question, .. } = &slot.sent.what {
                         slot.form = form_of(question, &caps);
                     }
+                    slot.sent.client = client;
                     parked.push((*id, request));
                 }
             }
@@ -765,8 +763,9 @@ impl Connection {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             egress.retain(|_, slot| !slot.reply.is_closed());
-            for (id, slot) in egress.iter().filter(|(_, slot)| fresh(&slot.sent)) {
+            for (id, slot) in egress.iter_mut().filter(|(_, slot)| fresh(&slot.sent)) {
                 if let Some(request) = slot.sent.what.build(*id, &caps) {
+                    slot.sent.client = client;
                     parked.push((*id, request));
                 }
             }
@@ -3364,13 +3363,6 @@ mod parked_tests {
         }
     }
 
-    fn egress() -> Request {
-        Request::Egress {
-            session_id: "s".into(),
-            host: "example.com".into(),
-        }
-    }
-
     fn ask(at: std::time::Instant) -> (AskSlot, oneshot::Receiver<AskReply>) {
         let (reply, rx) = oneshot::channel();
         (
@@ -3378,7 +3370,7 @@ mod parked_tests {
                 reply,
                 offered: crate::acp_map::ask_options("bash: ls"),
                 ext: true,
-                sent: sent_at(egress(), at),
+                sent: sent_at(ask_request("bash: ls"), at),
             },
             rx,
         )
@@ -3425,18 +3417,7 @@ mod parked_tests {
             QuestionSlot {
                 reply: q_tx,
                 form: None,
-                sent: sent_at(
-                    Request::Question {
-                        session_id: "s".into(),
-                        question: hotl_types::Question {
-                            header: "h".into(),
-                            prompt: "p".into(),
-                            options: Vec::new(),
-                            multi: false,
-                        },
-                    },
-                    two_hours_ago(),
-                ),
+                sent: sent_at(question_request(&[]), two_hours_ago()),
             },
         );
         assert_eq!(
@@ -3457,6 +3438,45 @@ mod parked_tests {
 }
 
 #[cfg(test)]
+fn ask_request(summary: &str) -> Request {
+    let input = json!({"command": "ls"});
+    let view = crate::acp_map::AskView {
+        call_id: "c1",
+        tool: "bash",
+        input: &input,
+        summary,
+        protected_why: None,
+    };
+    let mut calls = crate::acp_map::ToolCalls::default();
+    let caps = ClientCaps::default();
+    Request::Ask {
+        session_id: "s".into(),
+        ext: Box::new(calls.ask(&view, &ClientCaps { ext: true, ..caps })),
+        plain: Box::new(calls.ask(&view, &caps)),
+        options: crate::acp_map::ask_options(summary),
+    }
+}
+
+#[cfg(test)]
+fn question_request(labels: &[&str]) -> Request {
+    Request::Question {
+        session_id: "s".into(),
+        question: hotl_types::Question {
+            header: "h".into(),
+            prompt: "p".into(),
+            options: labels
+                .iter()
+                .map(|l| hotl_types::QuestionOption {
+                    label: l.to_string(),
+                    description: None,
+                })
+                .collect(),
+            multi: false,
+        },
+    }
+}
+
+#[cfg(test)]
 mod question_reply_tests {
     use super::*;
 
@@ -3470,10 +3490,7 @@ mod question_reply_tests {
                 multi: false,
             }),
             sent: Sent {
-                what: Request::Egress {
-                    session_id: "s".into(),
-                    host: "h".into(),
-                },
+                what: question_request(&["MVP"]),
                 at: std::time::Instant::now(),
                 client: 0,
             },
@@ -3499,10 +3516,7 @@ mod ask_reply_tests {
                 offered: crate::acp_map::ask_options(summary),
                 ext,
                 sent: Sent {
-                    what: Request::Egress {
-                        session_id: "s".into(),
-                        host: "h".into(),
-                    },
+                    what: ask_request(summary),
                     at: std::time::Instant::now(),
                     client: 0,
                 },

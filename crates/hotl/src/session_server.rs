@@ -325,6 +325,7 @@ impl Drop for EndpointGuard {
 /// What one client message asks of the server.
 enum ClientAction {
     Continue,
+    Initialize(Value),
     Detach,
     Shutdown,
 }
@@ -332,7 +333,7 @@ enum ClientAction {
 async fn switch_client(
     connection: &mut Connection,
     slot: &ClientSlot,
-    write: Option<WriteHalf>,
+    write: Option<Option<WriteHalf>>,
     caps: ClientCaps,
 ) {
     connection.set_client_caps(caps);
@@ -342,7 +343,9 @@ async fn switch_client(
     writer
         .next_client(|| {
             adopt();
-            *slot.lock() = write;
+            if let Some(write) = write {
+                *slot.lock() = write;
+            }
         })
         .await;
 }
@@ -390,7 +393,7 @@ async fn accept_loop(
                     continue;
                 };
                 let caps = crate::acp::caps_of_initialize(&init);
-                switch_client(&mut connection, &slot, Some(write), caps).await;
+                switch_client(&mut connection, &slot, Some(Some(write)), caps).await;
                 reader = Some(new_reader);
                 connection.on_message(&init).await;
             }
@@ -403,9 +406,14 @@ async fn accept_loop(
                 };
                 match action {
                     ClientAction::Continue => {}
+                    ClientAction::Initialize(init) => {
+                        let caps = crate::acp::caps_of_initialize(&init);
+                        switch_client(&mut connection, &slot, None, caps).await;
+                        connection.on_message(&init).await;
+                    }
                     ClientAction::Detach => {
                         reader = None;
-                        switch_client(&mut connection, &slot, None, detached_caps()).await;
+                        switch_client(&mut connection, &slot, Some(None), detached_caps()).await;
                     }
                     ClientAction::Shutdown => break,
                 }
@@ -430,10 +438,7 @@ async fn on_line(line: &str, connection: &mut Connection) -> ClientAction {
     let writer = connection.writer().clone();
     let session_id = connection.session_id().unwrap_or_default().to_string();
     match msg.get("method").and_then(Value::as_str) {
-        Some("initialize") => {
-            connection.on_message(&msg).await;
-            connection.adopt_client_caps();
-        }
+        Some("initialize") => return ClientAction::Initialize(msg),
         Some(method @ ("session/new" | "session/load" | "_hotl/session/fork")) => {
             crate::acp::reply_err(
                 &writer,
@@ -1218,6 +1223,34 @@ mod tests {
             .filter(|m| m["method"] == "session/request_permission")
             .count();
         assert_eq!(asks, 1, "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn a_second_resume_resends_nothing_and_a_new_initialize_starts_over() {
+        let (handle, events) = injected();
+        let (id, _task) = start(handle, std::time::Duration::ZERO);
+        let _ask = inject_ask(&events).await;
+        settle().await;
+        let mut client = Client::attach(&id, hotl_caps()).await;
+        assert_eq!(drained(&mut client).await.len(), 1, "the parked ask, once");
+        let resume = json!({"sessionId": "test", "cwd": std::env::temp_dir()});
+        client.request("session/resume", resume.clone()).await;
+        let again = drained(&mut client).await;
+        assert_eq!(again.len(), 1, "only the resume reply: {again:?}");
+
+        let init = client.initialize(Some("tok"), plain_caps()).await;
+        client.reply_to(init).await;
+        client.request("session/resume", resume).await;
+        let fresh = drained(&mut client).await;
+        let asks: Vec<&Value> = fresh
+            .iter()
+            .filter(|m| m["method"] == "session/request_permission")
+            .collect();
+        assert_eq!(asks.len(), 1, "{fresh:?}");
+        assert!(
+            !serde_json::to_string(&asks).unwrap().contains("hotl.dev/"),
+            "rebuilt for the caps of the new initialize"
+        );
     }
 
     #[tokio::test]

@@ -129,13 +129,13 @@ impl ToolCalls {
         }
         if known {
             return SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                tool_call_id: id.to_string(),
+                tool_call_id: wire_id(id),
                 fields,
                 meta,
             });
         }
         SessionUpdate::ToolCall(ToolCall {
-            tool_call_id: id.to_string(),
+            tool_call_id: wire_id(id),
             title: fields.title.unwrap_or_else(|| name.to_string()),
             kind: fields.kind.unwrap_or_else(|| tool_kind(name)),
             status: fields.status.unwrap_or(ToolCallStatus::Pending),
@@ -161,7 +161,7 @@ impl ToolCalls {
             all.drain(..cut);
         }
         Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-            tool_call_id: parent.to_string(),
+            tool_call_id: wire_id(parent),
             fields: ToolCallUpdateFields {
                 content: Some(vec![text_content(all)]),
                 ..ToolCallUpdateFields::default()
@@ -238,7 +238,7 @@ impl ToolCalls {
             self.open.insert(ask.call_id.to_string(), ask.input.clone());
         }
         ToolCallUpdate {
-            tool_call_id: ask.call_id.to_string(),
+            tool_call_id: wire_id(ask.call_id),
             fields: ToolCallUpdateFields {
                 kind: Some(tool_kind(ask.tool)),
                 status: Some(ToolCallStatus::Pending),
@@ -321,6 +321,16 @@ pub fn ask_reply(
             }
         }
         _ => denied,
+    }
+}
+
+pub const RESERVED_CALL_PREFIXES: &[&str] = &["egress-", "loop-", "remember-", "tool-"];
+
+pub fn wire_id(id: &str) -> String {
+    if RESERVED_CALL_PREFIXES.iter().any(|p| id.starts_with(p)) {
+        format!("tool-{id}")
+    } else {
+        id.to_string()
     }
 }
 
@@ -619,7 +629,7 @@ fn standard(
             }
             let meta = ext_meta(META_CHILD, crate::wire::update_frame(event)?)?;
             SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                tool_call_id: parent_id.clone(),
+                tool_call_id: wire_id(parent_id),
                 fields: ToolCallUpdateFields::default(),
                 meta: Some(meta),
             })
@@ -809,7 +819,7 @@ struct OpenTool {
 
 fn tool_call(tool: OpenTool, status: ToolCallStatus, output: Option<&str>) -> SessionUpdate {
     SessionUpdate::ToolCall(ToolCall {
-        tool_call_id: tool.id,
+        tool_call_id: wire_id(&tool.id),
         kind: tool_kind(&tool.name),
         title: tool.name,
         status,
@@ -2357,6 +2367,44 @@ mod tests {
 
     fn reply_meta(v: Value) -> Meta {
         meta_of(META_REPLY, v)
+    }
+
+    #[test]
+    fn a_tool_id_can_never_pose_as_a_hotl_id() {
+        assert_eq!(wire_id("toolu_1"), "toolu_1");
+        assert_eq!(wire_id("egress-1"), "tool-egress-1");
+        assert_eq!(wire_id("loop-3"), "tool-loop-3");
+        assert_eq!(wire_id("tool-egress-1"), "tool-tool-egress-1");
+        let caps = ClientCaps {
+            ext: true,
+            ..ClientCaps::default()
+        };
+        let mut calls = ToolCalls::default();
+        let input = serde_json::json!({"url": "https://example.com"});
+        let ask = calls.ask(
+            &AskView {
+                call_id: "egress-1",
+                tool: "web_fetch",
+                input: &input,
+                summary: "web_fetch https://example.com",
+                protected_why: None,
+            },
+            &caps,
+        );
+        assert_eq!(ask.tool_call_id, "tool-egress-1");
+        assert!(ask.meta.unwrap().get(META_EGRESS).is_none());
+        let start = EngineEvent::ToolStart {
+            id: "egress-1".into(),
+            name: "web_fetch".into(),
+            summary: "web_fetch https://example.com".into(),
+            input: input.clone(),
+        };
+        let update = serde_json::to_value(outgoing(&start, &caps, &mut calls).map(|o| match o {
+            Outgoing::Update(u) => u,
+            Outgoing::Ext(_) => panic!("a standard update"),
+        }))
+        .unwrap();
+        assert_eq!(update["toolCallId"], "tool-egress-1", "{update}");
     }
 
     #[test]
