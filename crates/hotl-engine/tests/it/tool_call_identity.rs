@@ -415,3 +415,36 @@ async fn tool_done_counts_the_result_the_model_receives() {
         );
     }
 }
+
+#[tokio::test]
+async fn an_ask_names_its_tool_call() {
+    let input = json!({"command": "echo asked"});
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::tool_call("t_ask", "bash", input.clone()),
+        ScriptedProvider::text_reply("done"),
+    ]));
+    let mut s = session(provider);
+    s.handle.prompt("go".into()).await;
+
+    let mut asked = None;
+    loop {
+        match next_event(&mut s).await {
+            EngineEvent::Ask {
+                call_id,
+                tool,
+                input,
+                reply,
+                ..
+            } => {
+                asked = Some((call_id, tool, input));
+                let _ = reply.send(AskReply::Deny { message: None });
+            }
+            EngineEvent::TurnDone { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        asked,
+        Some(("t_ask".to_string(), "bash".to_string(), input))
+    );
+}

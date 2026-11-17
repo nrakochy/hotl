@@ -699,6 +699,9 @@ pub enum EngineEvent {
     Ask {
         summary: String,
         protected_why: Option<String>,
+        call_id: String,
+        tool: String,
+        input: serde_json::Value,
         reply: oneshot::Sender<AskReply>,
     },
     /// A structured `ask_user` question (tier-1 gap #4) — NOT a permission
@@ -2189,6 +2192,9 @@ pub(crate) fn memory_confirm(
             .send(EngineEvent::Ask {
                 summary,
                 protected_why: Some(why),
+                call_id: format!("remember-{id}"),
+                tool: "remember".into(),
+                input: serde_json::json!({"note": note}),
                 reply: ask_tx,
             })
             .await

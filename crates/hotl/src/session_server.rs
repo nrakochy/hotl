@@ -607,6 +607,7 @@ async fn drain_events(mut events: tokio::sync::mpsc::Receiver<EngineEvent>, shar
                 summary,
                 protected_why,
                 reply,
+                ..
             } => {
                 let id = shared.next_ask.fetch_add(1, Ordering::Relaxed);
                 let frame = json!({

@@ -4395,6 +4395,9 @@ impl Surface {
             EngineEvent::Ask {
                 summary,
                 protected_why,
+                call_id,
+                tool,
+                input,
                 reply,
             } => {
                 let (dead, _) = tokio::sync::oneshot::channel();
@@ -4402,6 +4405,9 @@ impl Surface {
                 EngineEvent::Ask {
                     summary,
                     protected_why,
+                    call_id,
+                    tool,
+                    input,
                     reply: dead,
                 }
             }

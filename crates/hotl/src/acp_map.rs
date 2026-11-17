@@ -1879,6 +1879,9 @@ mod tests {
             EngineEvent::Ask {
                 summary: "bash: ls".into(),
                 protected_why: None,
+                call_id: "t-ask".into(),
+                tool: "bash".into(),
+                input: serde_json::json!({"command": "ls"}),
                 reply: tokio::sync::oneshot::channel().0,
             },
             EngineEvent::Question {

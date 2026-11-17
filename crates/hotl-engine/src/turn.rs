@@ -292,6 +292,11 @@ impl Approval {
     }
 }
 
+enum AskCall<'a> {
+    Tool(&'a ToolUse, &'a Value),
+    Loop,
+}
+
 /// What [`Turn::execute`] produces: the result, plus whether it counts against
 /// the per-tool failure budget.
 struct Executed {
@@ -1493,6 +1498,7 @@ impl Turn {
         } else {
             let cont = self
                 .ask(
+                    AskCall::Loop,
                     format!("the agent keeps repeating: {pattern} — let it continue?"),
                     None,
                 )
@@ -2347,7 +2353,7 @@ impl Turn {
             // The only path through `Turn::ask`, and therefore the only path
             // on which a human read the summary.
             Verdict::Ask => Approval {
-                reply: self.ask(summary, why).await,
+                reply: self.ask(AskCall::Tool(tu, input), summary, why).await,
                 by_human: true,
             },
         }
@@ -3229,7 +3235,7 @@ impl Turn {
     /// and its resolution *after* (`ask_resolved`) — so a process that dies
     /// mid-ask leaves a dangling record that resume re-surfaces. The log
     /// records are best-effort: a sealed log never blocks the ask itself.
-    async fn ask(&self, summary: String, why: Option<String>) -> AskReply {
+    async fn ask(&self, call: AskCall<'_>, summary: String, why: Option<String>) -> AskReply {
         // Chokepoint (Vuln 8): `summary`/`why` are model-influenced text about
         // to be rendered into the human's y/N prompt. Flatten each to a single
         // control-free line here — once, for every tool — so none can smuggle a
@@ -3272,9 +3278,16 @@ impl Turn {
             else {}
         );
         let (tx, rx) = oneshot::channel();
+        let (call_id, tool, input) = match call {
+            AskCall::Tool(tu, input) => (tu.id.clone(), tu.name.clone(), input.clone()),
+            AskCall::Loop => (format!("loop-{id}"), String::new(), Value::Null),
+        };
         let event = EngineEvent::Ask {
             summary,
             protected_why: why,
+            call_id,
+            tool,
+            input,
             reply: tx,
         };
         let reply = if self.events.send(event).await.is_err() {

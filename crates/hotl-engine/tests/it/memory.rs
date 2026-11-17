@@ -112,12 +112,18 @@ async fn remember_answering(
             summary,
             protected_why,
             reply,
+            call_id,
+            tool,
+            input,
         } = ev
         else {
             panic!("expected the confirm ask, got {ev:?}");
         };
         assert!(summary.contains("remember → project memory:"), "{summary}");
         assert!(protected_why.is_some(), "the why names the file");
+        assert_eq!(tool, "remember");
+        assert!(call_id.starts_with("remember-"), "{call_id}");
+        assert_eq!(input, serde_json::json!({"note": note}));
         let _ = reply.send(answer);
     };
     // Both must progress together: the ask is emitted inside `remember`.

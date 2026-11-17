@@ -2453,6 +2453,7 @@ async fn drain_events(
                 summary,
                 protected_why,
                 reply,
+                ..
             } => {
                 req_id += 1;
                 pending
