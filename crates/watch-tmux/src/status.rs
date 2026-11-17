@@ -129,6 +129,19 @@ pub fn hotl_title_branch(title: &str) -> Option<String> {
     (!branch.is_empty()).then(|| branch.to_string())
 }
 
+/// The session color a hotl title carries (0080): `hotl · name ● red ⎇ b —
+/// working` → `red`. Unvalidated — this crate has no theme; the view draws
+/// only names it knows. `None` for any other title.
+pub fn hotl_title_color(title: &str) -> Option<String> {
+    let t = title.trim();
+    if t != "hotl" && !t.starts_with("hotl ") {
+        return None;
+    }
+    let (_, rest) = t.split_once(" ● ")?;
+    let color = rest.split([' ', '—']).next()?.trim();
+    (!color.is_empty()).then(|| color.to_string())
+}
+
 pub struct HotlDetector;
 impl StatusDetector for HotlDetector {
     fn classify(&self, sig: &Signals) -> Status {
@@ -466,6 +479,45 @@ enter to select · esc to cancel · ↑↓ to navigate";
         );
         assert_eq!(hotl_title_branch("hotl · fix-auth — working"), None);
         assert_eq!(hotl_title_branch("vim ⎇ main"), None);
+    }
+
+    /// 0080: the color sits before the branch; status and branch reads are
+    /// unchanged by it.
+    #[test]
+    fn hotl_title_color_parses_and_leaves_status_and_branch_alone() {
+        for (title, color, branch, status) in [
+            (
+                "hotl · fix ● red ⎇ feat — working",
+                Some("red"),
+                Some("feat"),
+                Status::Working,
+            ),
+            (
+                "hotl ● pink ⎇ hotl/01JC — waiting on you",
+                Some("pink"),
+                Some("hotl/01JC"),
+                Status::Blocked,
+            ),
+            (
+                "hotl · fix ● cyan — working",
+                Some("cyan"),
+                None,
+                Status::Working,
+            ),
+            ("hotl ● blue", Some("blue"), None, Status::Idle),
+            (
+                "hotl · fix ⎇ feat — working",
+                None,
+                Some("feat"),
+                Status::Working,
+            ),
+            ("hotl · fix", None, None, Status::Idle),
+        ] {
+            assert_eq!(hotl_title_color(title).as_deref(), color, "{title}");
+            assert_eq!(hotl_title_branch(title).as_deref(), branch, "{title}");
+            assert_eq!(hotl_title_status(title), Some(status), "{title}");
+        }
+        assert_eq!(hotl_title_color("vim ● red"), None);
     }
 
     #[test]

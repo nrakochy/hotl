@@ -13,6 +13,7 @@ fn obs(pane: &str) -> AgentObservation {
         },
         cwd: format!("/tmp/{pane}"),
         branch: None,
+        color: None,
         status: Status::Idle,
         status_line: None,
         prompt: None,

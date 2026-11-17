@@ -197,3 +197,32 @@ fn watch_reads_the_phase_and_the_branch_of_a_worktree_session() {
         Some("fix-auth")
     );
 }
+
+/// 0080: `/color red` typed into the console reaches watch's observation via
+/// the pane title, beside the branch, without disturbing the phase read.
+#[test]
+fn watch_reads_the_color_a_slash_color_sets() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut state = State::new(false, "m".into());
+    state.session_name = Some("fix-auth".into());
+    state.session_branch = Some("feat".into());
+    let key = |c| Msg::Key(KeyEvent::new(c, KeyModifiers::NONE));
+    for ch in "/color red".chars() {
+        update(&mut state, key(KeyCode::Char(ch)));
+    }
+    let cmds = update(&mut state, key(KeyCode::Enter));
+    let title = pane_title(&cmds);
+    assert_eq!(title, "hotl · fix-auth ● red ⎇ feat");
+    assert_eq!(watch_tmux::hotl_title_color(&title).as_deref(), Some("red"));
+    assert_eq!(
+        watch_tmux::hotl_title_branch(&title).as_deref(),
+        Some("feat")
+    );
+    assert_eq!(seen_by_watch(&state, &cmds), Status::Idle);
+    let cmds = ask(&mut state);
+    assert_eq!(
+        watch_tmux::hotl_title_color(&pane_title(&cmds)).as_deref(),
+        Some("red")
+    );
+    assert_eq!(seen_by_watch(&state, &cmds), Status::Blocked);
+}

@@ -9,6 +9,8 @@ pub enum Row {
     Agent {
         glyph: String,
         name: String,
+        /// The session's `/color` (0080), raw from the title.
+        color: Option<String>,
         subtitle: String,
         status: Status,
         selected: bool,
@@ -62,6 +64,7 @@ pub fn rows(agents: &[AgentObservation], cursor: usize, tick: u32) -> Vec<Row> {
                 Some(b) => format!("{} ⎇ {b}", project_name(&o.cwd)),
                 None => project_name(&o.cwd),
             },
+            color: o.color.clone(),
             subtitle: o
                 .status_line
                 .clone()
@@ -167,6 +170,7 @@ fn row_line(row: &Row, p: &Palette, width: u16) -> Line<'static> {
         Row::Agent {
             glyph,
             name,
+            color,
             subtitle,
             status,
             selected,
@@ -177,17 +181,28 @@ fn row_line(row: &Row, p: &Palette, width: u16) -> Line<'static> {
             } else {
                 Style::default()
             };
-            let head = 1 + 1 + 1 + name.chars().count() + 3;
+            let dot = color.as_deref().and_then(hotl_theme::session_color_rgb);
+            let head = 1 + 1 + 1 + name.chars().count() + 3 + if dot.is_some() { 2 } else { 0 };
             let avail = (width as usize).saturating_sub(head);
             let sub = truncate(subtitle, avail);
             let pad = avail.saturating_sub(sub.chars().count());
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(" ", base),
                 Span::styled(glyph.clone(), base.fg(gcolor).add_modifier(Modifier::BOLD)),
                 Span::styled(" ", base),
-                Span::styled(name.clone(), base.fg(p.ink).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("   {sub}{}", " ".repeat(pad)), base.fg(p.muted)),
-            ])
+            ];
+            if let Some(c) = dot {
+                spans.push(Span::styled("● ", base.fg(c)));
+            }
+            spans.push(Span::styled(
+                name.clone(),
+                base.fg(p.ink).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!("   {sub}{}", " ".repeat(pad)),
+                base.fg(p.muted),
+            ));
+            Line::from(spans)
         }
     }
 }
@@ -206,6 +221,7 @@ mod tests {
             },
             cwd: cwd.into(),
             branch: None,
+            color: None,
             status,
             status_line: None,
             prompt: None,
@@ -233,6 +249,30 @@ mod tests {
         let mut o = obs(group, sub, cwd, status);
         o.status_line = sl.map(|s| s.to_string());
         o
+    }
+
+    /// 0080: a known session color draws a `●` before the name; an unknown
+    /// or missing one draws nothing.
+    #[test]
+    fn a_session_color_draws_a_dot_before_the_name() {
+        let p = Palette::default();
+        let mut o = obs("s", "w", "/tmp/proj", Status::Idle);
+        o.color = Some("pink".into());
+        let rs = rows(&[o.clone()], 0, 0);
+        let line = row_line(&rs[0], &p, 60);
+        let dot = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains('●'))
+            .expect("a dot");
+        assert_eq!(dot.style.fg, hotl_theme::session_color_rgb("pink"));
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.find('●') < text.find("proj"), "{text}");
+        for c in [None, Some("magenta")] {
+            o.color = c.map(String::from);
+            let line = row_line(&rows(&[o.clone()], 0, 0)[0], &p, 60);
+            assert!(!line.spans.iter().any(|s| s.content.contains('●')), "{c:?}");
+        }
     }
 
     #[test]

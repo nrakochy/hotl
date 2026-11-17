@@ -67,6 +67,7 @@ mod tests {
             },
             cwd: cwd.into(),
             branch: None,
+            color: None,
             status: Status::Idle,
             status_line: None,
             prompt: None,
