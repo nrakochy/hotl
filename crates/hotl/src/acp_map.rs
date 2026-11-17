@@ -171,6 +171,8 @@ pub struct ConfigState {
     pub model: String,
     pub plan: bool,
     pub effort: String,
+    pub models: Vec<String>,
+    pub ext: bool,
 }
 
 pub fn effort_wire(open: &SessionOpen) -> String {
@@ -182,6 +184,16 @@ pub fn effort_wire(open: &SessionOpen) -> String {
             .clone()
             .unwrap_or_else(|| "default".into()),
     }
+}
+
+fn model_choices(state: &ConfigState) -> Vec<String> {
+    let mut choices = vec![state.model.clone()];
+    for model in &state.models {
+        if !choices.contains(model) {
+            choices.push(model.clone());
+        }
+    }
+    choices
 }
 
 pub fn config_options(state: &ConfigState) -> Vec<SessionConfigOption> {
@@ -204,7 +216,10 @@ pub fn config_options(state: &ConfigState) -> Vec<SessionConfigOption> {
             category: Some(SessionConfigOptionCategory::Model),
             kind: SessionConfigKind::Select(SessionConfigSelect {
                 current_value: state.model.clone(),
-                options: vec![level(&state.model, &state.model)],
+                options: model_choices(state)
+                    .into_iter()
+                    .map(|m| level(&m, &m))
+                    .collect(),
             }),
         },
         SessionConfigOption {
@@ -446,6 +461,12 @@ mod tests {
             model: "anthropic/m".into(),
             plan: false,
             effort: "default".into(),
+            models: vec![
+                "anthropic/b".into(),
+                "anthropic/m".into(),
+                "anthropic/c".into(),
+            ],
+            ext: false,
         }
     }
 
@@ -484,7 +505,13 @@ mod tests {
         assert_eq!(model["id"], "model");
         assert_eq!(model["category"], "model");
         assert_eq!(model["currentValue"], "anthropic/m");
-        assert_eq!(model["options"][0]["value"], "anthropic/m");
+        let values: Vec<&str> = model["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(values, ["anthropic/m", "anthropic/b", "anthropic/c"]);
     }
 
     #[test]
@@ -502,6 +529,7 @@ mod tests {
         let options = serde_json::to_value(SessionUpdate::ConfigOptionUpdate(
             crate::acp_types::ConfigOptionUpdate {
                 config_options: config_options(&state()),
+                meta: None,
             },
         ))
         .unwrap();

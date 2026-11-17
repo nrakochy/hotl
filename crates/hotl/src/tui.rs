@@ -473,6 +473,7 @@ async fn handshake(
     } = args;
     let worktree = worktree.as_ref().map(|w| w.wire().to_string());
     let cwd = std::env::current_dir().map_err(|e| format!("no working directory: {e}"))?;
+    let resumed = spec.clone();
     let open = match (spec, fork_from) {
         (_, Some(sid)) => {
             let mut params = json!({"sessionId": sid, "name": name, "cwd": cwd});
@@ -514,6 +515,14 @@ async fn handshake(
     }
     .map_err(|e| e.to_string())?;
     let result = wait_response(reader, open).await?;
+    if let Some(id) = result
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .or(resumed)
+    {
+        client.set_session_id(id);
+    }
     let (mode, plan, context_window, stream_idle_secs) = open_settings(&hello, &result);
     let v = open_meta(&result);
     let (context_tokens, todos, effort, previous_model) = open_extras(&v);

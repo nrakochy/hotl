@@ -374,6 +374,7 @@ pub struct ServerInfo {
     pub model_resolver: Option<ModelResolver>,
     pub key_available: bool,
     pub sessions_dir: Option<std::path::PathBuf>,
+    pub fallback_models: Vec<String>,
     /// The session's primary model — prices `turn_done`'s `usage.cost_usd`
     /// (Task 5 cost telemetry). One process serves one model for its whole
     /// lifetime (process-per-session), so this is fixed for every
@@ -668,6 +669,8 @@ async fn handle_request(
                 pending_prompt,
                 next_id,
                 &info.model,
+                &info.fallback_models,
+                client_caps.ext,
             );
             let context_tokens = match session.as_ref() {
                 Some(state) => state
@@ -1093,6 +1096,7 @@ async fn handle_request(
             }
             let session_id = state.id.clone();
             let config_options = crate::acp_map::config_options(&lock_config(&state.config));
+            let model_change = model_meta.is_some();
             let meta = model_meta.filter(|_| client_caps.ext).map(|ack| {
                 let mut m = serde_json::Map::new();
                 m.insert(META_MODEL.into(), to_json(&ack));
@@ -1107,12 +1111,17 @@ async fn handle_request(
                 }),
             )
             .await;
-            send_update(
-                writer,
-                &session_id,
-                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate { config_options }),
-            )
-            .await;
+            if !model_change {
+                send_update(
+                    writer,
+                    &session_id,
+                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate {
+                        config_options,
+                        meta: None,
+                    }),
+                )
+                .await;
+            }
         }
         "session/set_goal" => {
             let Some(state) = session.as_ref() else {
@@ -1434,6 +1443,8 @@ async fn handle_request(
                         pending_prompt,
                         next_id,
                         &info.model,
+                        &info.fallback_models,
+                        client_caps.ext,
                     );
                     let skills = skill_roster(info);
                     let workflows = workflow_roster(info);
@@ -2029,6 +2040,12 @@ fn retire_session(
         .clear();
 }
 
+fn lock_config(config: &SharedConfig) -> std::sync::MutexGuard<'_, crate::acp_map::ConfigState> {
+    config
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Make `open` the connection's session, retiring whatever was there.
 ///
 /// Replacing a session: interrupt its in-flight turn (its events are about to
@@ -2039,13 +2056,6 @@ fn retire_session(
 ///
 /// Shared by `session/new`, `session/load` and `session/reload_config` so the
 /// three can never drift on what "retire the old session" means.
-#[allow(clippy::too_many_arguments)]
-fn lock_config(config: &SharedConfig) -> std::sync::MutexGuard<'_, crate::acp_map::ConfigState> {
-    config
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn install_session(
     open: SessionOpen,
@@ -2060,6 +2070,8 @@ fn install_session(
     pending_prompt: &PendingPrompt,
     next_id: &mut u64,
     model: &str,
+    fallbacks: &[String],
+    ext: bool,
 ) {
     retire_session(
         session,
@@ -2072,6 +2084,10 @@ fn install_session(
         model: open.model.clone().unwrap_or_else(|| model.to_string()),
         plan: open.plan,
         effort: crate::acp_map::effort_wire(&open),
+        models: std::iter::once(model.to_string())
+            .chain(fallbacks.iter().cloned())
+            .collect(),
+        ext,
     }));
     let lease = open.lease;
     let mut state = start_session(
@@ -2228,15 +2244,41 @@ async fn drain_events(
             }
             other => other,
         };
-        if let EngineEvent::ModelChanged { model, .. } = &event {
-            lock_config(&config).model = model.clone();
-            let config_options = crate::acp_map::config_options(&lock_config(&config));
+        if let EngineEvent::ModelChanged {
+            model,
+            previous,
+            context_tokens,
+            context_window,
+        } = &event
+        {
+            let (config_options, ext) = {
+                let mut state = lock_config(&config);
+                state.model = model.clone();
+                (crate::acp_map::config_options(&state), state.ext)
+            };
+            let meta = ext.then(|| {
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    META_MODEL.into(),
+                    json!({
+                        "model": model,
+                        "previous": previous,
+                        "contextTokens": context_tokens,
+                        "contextWindow": context_window,
+                    }),
+                );
+                m
+            });
             send_update(
                 &writer,
                 &session_id,
-                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate { config_options }),
+                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate {
+                    config_options,
+                    meta,
+                }),
             )
             .await;
+            continue;
         }
         match event {
             EngineEvent::Ask {
@@ -2455,6 +2497,8 @@ mod drain_tests {
                 model: "test-model".into(),
                 plan: false,
                 effort: "default".into(),
+                models: Vec::new(),
+                ext: false,
             })),
         )
         .await;

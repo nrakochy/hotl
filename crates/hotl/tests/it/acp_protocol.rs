@@ -44,6 +44,7 @@ fn server_info() -> acp::ServerInfo {
         model_resolver: None,
         key_available: true,
         sessions_dir: None,
+        fallback_models: Vec::new(),
         // Uncatalogued deliberately: matches `scripted_factory`'s session log
         // model ("m"), and keeps `cost_usd` absent for scenarios that don't
         // test pricing.
@@ -2009,6 +2010,7 @@ async fn the_session_reports_its_effective_mode() {
             model_resolver: None,
             key_available: true,
             sessions_dir: None,
+            fallback_models: Vec::new(),
             model: "m".into(),
         },
         None,
@@ -2163,6 +2165,7 @@ fn server_info_with_resolver() -> acp::ServerInfo {
         model_resolver: Some(test_resolver()),
         key_available: true,
         sessions_dir: None,
+        fallback_models: Vec::new(),
         ..server_info()
     }
 }
@@ -2197,28 +2200,77 @@ async fn set_model_acks_applied_and_the_engine_broadcasts_model_changed() {
         json!({"jsonrpc":"2.0","id":3,"method":"session/set_config_option","params":{"configId":"model","value":"anthropic/other"}}),
     )
     .await;
-    // Applied at once: the engine's broadcast and the ack arrive in either
-    // order, so collect both.
     let (mut ack, mut changed) = (None, None);
-    for _ in 0..8 {
-        if ack.is_some() && changed.is_some() {
-            break;
-        }
-        let m = next(&mut lines).await;
+    while ack.is_none() || changed.is_none() {
+        let m = next_raw(&mut lines).await;
         if m["id"] == json!(3) {
             ack = Some(m);
-        } else if m["params"]["update"]["type"] == "model_changed" {
+        } else if m["params"]["update"]["sessionUpdate"] == "config_option_update" {
             changed = Some(m);
         }
     }
-    let ack = ack.expect("the ack");
+    let (ack, changed) = (ack.unwrap(), changed.unwrap());
     let meta = &ack["result"]["_meta"]["hotl.dev/model"];
     assert_eq!(meta["applied"], true, "{ack}");
     assert_eq!(meta["model"], "anthropic/other");
-    let changed = changed.expect("the broadcast");
-    assert_eq!(changed["params"]["update"]["model"], "anthropic/other");
-    assert_eq!(changed["params"]["update"]["context_window"], 200_000);
-    assert!(changed["params"]["update"]["context_tokens"].is_number());
+    let change = &changed["params"]["update"]["_meta"]["hotl.dev/model"];
+    assert_eq!(change["model"], "anthropic/other");
+    assert_eq!(change["contextWindow"], 200_000);
+    assert!(change["contextTokens"].is_number());
+    assert_eq!(
+        changed["params"]["update"]["configOptions"][0]["currentValue"],
+        "anthropic/other"
+    );
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/set_config_option","params":{"configId":"plan","value":true}}),
+    )
+    .await;
+    loop {
+        let m = next_raw(&mut lines).await;
+        assert_ne!(m["params"]["update"]["type"], "model_changed", "{m}");
+        assert_ne!(
+            m["params"]["update"]["sessionUpdate"], "config_option_update",
+            "one update per model change: {m}"
+        );
+        if m["id"] == json!(4) {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_model_option_lists_the_configured_models() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    let info = acp::ServerInfo {
+        fallback_models: vec!["anthropic/x".into(), "m".into()],
+        ..server_info()
+    };
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), info, None));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 1).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 2).await;
+    let model = &opened["result"]["configOptions"][0];
+    assert_eq!(model["currentValue"], "m");
+    let values: Vec<&str> = model["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(values, ["m", "anthropic/x"]);
 }
 
 #[tokio::test]
@@ -2268,11 +2320,11 @@ async fn set_model_during_a_turn_acks_queued_then_broadcasts_at_the_boundary() {
         json!({"jsonrpc":"2.0","id": ask["id"],"result":{"allow": true}}),
     )
     .await;
-    let changed = next_matching(&mut lines, |m| {
-        m["params"]["update"]["type"] == "model_changed"
-    })
-    .await;
-    assert_eq!(changed["params"]["update"]["model"], "anthropic/other");
+    let changed = next_standard(&mut lines, "config_option_update").await;
+    assert_eq!(
+        changed["params"]["update"]["_meta"]["hotl.dev/model"]["model"],
+        "anthropic/other"
+    );
 }
 
 #[tokio::test]
@@ -2848,6 +2900,7 @@ async fn reload_config_swaps_the_engine_and_broadcasts_the_new_truth() {
         model_resolver: None,
         key_available: true,
         sessions_dir: None,
+        fallback_models: Vec::new(),
         model: "m2".into(),
     };
     // What `SessionSpec::Load` the replacement factory is handed, so this test
@@ -4011,6 +4064,7 @@ fn no_key_info() -> acp::ServerInfo {
     acp::ServerInfo {
         key_available: false,
         sessions_dir: None,
+        fallback_models: Vec::new(),
         ..server_info()
     }
 }
@@ -4513,6 +4567,7 @@ async fn list_pages_newest_first() {
     SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).unwrap();
     let info = acp::ServerInfo {
         sessions_dir: Some(dir.path().to_path_buf()),
+        fallback_models: Vec::new(),
         ..server_info()
     };
     let (mut w, mut lines) = connect(scripted_factory(), info).await;
@@ -4750,6 +4805,7 @@ async fn load_of_a_resumed_id_sees_its_newest_continuation() {
     let loads = Arc::new(std::sync::Mutex::new(Vec::new()));
     let info = acp::ServerInfo {
         sessions_dir: Some(dir.path().to_path_buf()),
+        fallback_models: Vec::new(),
         ..server_info()
     };
     let (mut w, mut lines) =
@@ -4800,6 +4856,7 @@ async fn opening_an_unknown_stored_id_is_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let info = acp::ServerInfo {
         sessions_dir: Some(dir.path().to_path_buf()),
+        fallback_models: Vec::new(),
         ..server_info()
     };
     let (mut w, mut lines) = connect(scripted_factory(), info).await;
@@ -4844,6 +4901,7 @@ async fn list_matches_a_cwd_by_its_real_path() {
     };
     let info = acp::ServerInfo {
         sessions_dir: Some(dir.path().to_path_buf()),
+        fallback_models: Vec::new(),
         ..server_info()
     };
     let (mut w, mut lines) = connect(scripted_factory(), info).await;

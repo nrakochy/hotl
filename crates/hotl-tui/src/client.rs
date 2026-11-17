@@ -86,11 +86,27 @@ pub enum ServerMsg {
 pub struct AcpClient<W: AsyncWrite + Unpin> {
     writer: W,
     next_id: u64,
+    session_id: Option<String>,
 }
 
 impl<W: AsyncWrite + Unpin> AcpClient<W> {
     pub fn new(writer: W) -> Self {
-        AcpClient { writer, next_id: 0 }
+        AcpClient {
+            writer,
+            next_id: 0,
+            session_id: None,
+        }
+    }
+
+    pub fn set_session_id(&mut self, id: impl Into<String>) {
+        self.session_id = Some(id.into());
+    }
+
+    fn with_session(&self, mut params: Value) -> Value {
+        if let (Some(id), Some(map)) = (&self.session_id, params.as_object_mut()) {
+            map.insert("sessionId".into(), json!(id));
+        }
+        params
     }
 
     /// Send a request; returns the id used so the caller can match the reply.
@@ -253,6 +269,16 @@ fn standard_update(kind: &str, update: &Value) -> Option<Value> {
             Some(json!({"type": "mode_changed", "mode": mode}))
         }
         "config_option_update" => {
+            if let Some(change) = update.pointer("/_meta/hotl.dev~1model") {
+                let field = |k: &str| change.get(k).cloned().unwrap_or(Value::Null);
+                return Some(json!({
+                    "type": "model_changed",
+                    "model": field("model"),
+                    "previous": field("previous"),
+                    "context_tokens": field("contextTokens"),
+                    "context_window": field("contextWindow"),
+                }));
+            }
             let options = update.get("configOptions").and_then(Value::as_array)?;
             let current = |id: &str| {
                 options
@@ -483,14 +509,19 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
         }
         Cmd::SetMode(mode) => {
             client
-                .request("session/set_mode", json!({"modeId": mode}))
+                .request(
+                    "session/set_mode",
+                    client.with_session(json!({"modeId": mode})),
+                )
                 .await?;
         }
         Cmd::SetPlan(plan) => {
             client
                 .request(
                     "session/set_config_option",
-                    json!({"configId": "plan", "type": "boolean", "value": plan}),
+                    client.with_session(
+                        json!({"configId": "plan", "type": "boolean", "value": plan}),
+                    ),
                 )
                 .await?;
         }
@@ -499,7 +530,7 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
             client
                 .request(
                     "session/set_config_option",
-                    json!({"configId": "effort", "value": wire}),
+                    client.with_session(json!({"configId": "effort", "value": wire})),
                 )
                 .await?;
         }
@@ -509,7 +540,7 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
                 client
                     .request(
                         "session/set_config_option",
-                        json!({"configId": "model", "value": spec}),
+                        client.with_session(json!({"configId": "model", "value": spec})),
                     )
                     .await?,
             );
@@ -840,6 +871,21 @@ mod tests {
             Some(ServerMsg::Update(
                 json!({"type": "config_options", "plan": true, "effort": "max"})
             ))
+        );
+    }
+
+    #[test]
+    fn a_model_change_update_decodes_into_model_changed() {
+        let msg: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"config_option_update","configOptions":[],"_meta":{"hotl.dev/model":{"model":"a/b","previous":"a/c","contextTokens":7,"contextWindow":9}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decode(&msg),
+            Some(ServerMsg::Update(json!({
+                "type": "model_changed", "model": "a/b", "previous": "a/c",
+                "context_tokens": 7, "context_window": 9
+            })))
         );
     }
 

@@ -329,6 +329,7 @@ async fn start_with(factory: acp::SessionFactory) -> (Client, Reader) {
             model_resolver: None,
             key_available: true,
             sessions_dir: None,
+            fallback_models: Vec::new(),
             model: "m".into(),
         },
         None,

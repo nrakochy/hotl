@@ -23,6 +23,7 @@ fn server_info() -> acp::ServerInfo {
         model_resolver: None,
         key_available: true,
         sessions_dir: None,
+        fallback_models: Vec::new(),
         model: "m".into(),
     }
 }

@@ -462,6 +462,13 @@
     },
     "ConfigOptionUpdate": {
       "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
         "configOptions": {
           "items": {
             "$ref": "#/$defs/SessionConfigOption"

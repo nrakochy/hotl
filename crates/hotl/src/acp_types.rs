@@ -503,6 +503,8 @@ pub struct CurrentModeUpdate {
 #[serde(rename_all = "camelCase")]
 pub struct ConfigOptionUpdate {
     pub config_options: Vec<SessionConfigOption>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
