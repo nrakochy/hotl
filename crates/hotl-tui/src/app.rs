@@ -1188,6 +1188,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                     kind,
                     "mode_changed"
                         | "effort_changed"
+                        | "config_options"
                         | "todos_changed"
                         | "goal_changed"
                         | "goal_verdict"
@@ -2059,6 +2060,25 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         // confirms the optimistic update — or carries a change another
         // attached surface made.
         "plan_changed" => state.plan = v.get("plan").and_then(Value::as_bool).unwrap_or(false),
+        "config_options" => {
+            if let Some(plan) = v.get("plan").and_then(Value::as_bool) {
+                state.plan = plan;
+            }
+            match v.get("effort").and_then(Value::as_str) {
+                Some("default") => {
+                    state.effort = None;
+                    state.default_effort = None;
+                }
+                Some(level)
+                    if state.effort.as_deref().or(state.default_effort.as_deref())
+                        != Some(level) =>
+                {
+                    state.effort = Some(level.to_string());
+                }
+                Some(_) => {}
+                None => {}
+            }
+        }
         // Null is meaningful here, not missing: it is "the provider's own
         // default", which is exactly what `/effort default` sets.
         "effort_changed" => {
@@ -8353,6 +8373,30 @@ mod tests {
         // Null is "the provider's own default", not "missing".
         upd(&mut s, json!({"type": "effort_changed", "effort": null}));
         assert_eq!(s.effort, None);
+    }
+
+    #[test]
+    fn config_options_update_plan_and_effort() {
+        let mut s = State::test_default();
+        s.default_effort = Some("xhigh".into());
+        upd(
+            &mut s,
+            json!({"type": "config_options", "plan": true, "effort": "xhigh"}),
+        );
+        assert!(s.plan);
+        assert_eq!(s.effort, None);
+        upd(
+            &mut s,
+            json!({"type": "config_options", "plan": false, "effort": "max"}),
+        );
+        assert!(!s.plan);
+        assert_eq!(s.effort.as_deref(), Some("max"));
+        upd(
+            &mut s,
+            json!({"type": "config_options", "plan": false, "effort": "default"}),
+        );
+        assert_eq!(s.effort, None);
+        assert_eq!(s.default_effort, None);
     }
 
     // --- /goal (plan 0034) ------------------------------------------

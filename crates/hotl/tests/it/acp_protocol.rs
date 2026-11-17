@@ -1863,10 +1863,8 @@ async fn ask_user_round_trip_via_session_request_question() {
     assert_eq!(result["result"]["outcome"]["text"], "all done via acp");
 }
 
-/// `session/set_mode` acks and switches the mode; an invalid mode errors
-/// naming the valid ones. Mirrors `named_open_and_rename`.
 #[tokio::test]
-async fn set_mode_acks_and_rejects_unknown_modes() {
+async fn set_mode_emits_current_mode_update() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
     tokio::spawn(acp::serve(
@@ -1878,50 +1876,115 @@ async fn set_mode_acks_and_rejects_unknown_modes() {
     ));
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
-
     send(
         &mut cwrite,
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
-    next(&mut lines).await;
-
-    // set_mode before a session exists → error.
+    let _ = read_until_id(&mut lines, 1).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/set_mode","params":{"mode":"plan"}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
-    assert!(
-        next(&mut lines).await["error"].is_object(),
-        "no session yet"
-    );
-
+    let opened = read_until_id(&mut lines, 2).await;
+    assert_eq!(opened["result"]["modes"]["currentModeId"], "ask");
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":new_params()}),
+        json!({"jsonrpc":"2.0","id":3,"method":"session/set_mode","params":{"sessionId":"s","modeId":"dontask"}}),
     )
     .await;
-    next(&mut lines).await;
+    let reply = read_until_id(&mut lines, 3).await;
+    assert_eq!(reply["result"], json!({}));
+    let update = next_standard(&mut lines, "current_mode_update").await;
+    assert_eq!(update["params"]["update"]["currentModeId"], "dontask");
+}
 
-    // invalid mode → error naming the valid ones.
+#[tokio::test]
+async fn set_mode_rejects_unknown_modes_and_the_old_mode_param() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/set_mode","params":{"mode":"yolo"}}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
-    let err = next(&mut lines).await;
-    assert!(err["error"].is_object(), "invalid mode rejected");
-    let message = err["error"]["message"].as_str().unwrap_or("");
-    assert!(message.contains("ask"), "names valid modes: {message}");
-
-    // valid mode → ok.
+    let _ = read_until_id(&mut lines, 1).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":5,"method":"session/set_mode","params":{"mode":"plan"}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
-    assert_eq!(next(&mut lines).await["result"]["ok"], true);
+    let _ = read_until_id(&mut lines, 2).await;
+    for (id, params) in [
+        (3, json!({"modeId": "yolo"})),
+        (4, json!({"mode": "ask"})),
+        (5, json!({"modeId": "plan"})),
+    ] {
+        send(
+            &mut cwrite,
+            json!({"jsonrpc":"2.0","id":id,"method":"session/set_mode","params":params}),
+        )
+        .await;
+        let err = read_until_id(&mut lines, id).await;
+        assert_eq!(err["error"]["code"], -32602, "{err}");
+    }
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":6,"method":"session/set_mode","params":{"mode":"ask"}}),
+    )
+    .await;
+    let err = read_until_id(&mut lines, 6).await;
+    assert!(err["error"]["message"].as_str().unwrap().contains("modeId"));
+}
+
+#[tokio::test]
+async fn the_old_set_calls_are_gone() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 1).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 2).await;
+    for (id, method) in [
+        (3, "session/set_model"),
+        (4, "session/set_effort"),
+        (5, "session/set_plan"),
+    ] {
+        send(
+            &mut cwrite,
+            json!({"jsonrpc":"2.0","id":id,"method":method,"params":{}}),
+        )
+        .await;
+        let err = read_until_id(&mut lines, id).await;
+        assert_eq!(err["error"]["code"], -32601, "{method}: {err}");
+    }
 }
 
 /// The permission mode is server-side truth. A client that renders a badge
@@ -1984,35 +2047,17 @@ async fn the_session_reports_its_effective_mode() {
         "session/new must report the resolved session default effort"
     );
 
-    // A mode change is broadcast, not just acked — any attached surface updates.
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/set_mode","params":{"mode":"dontask"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"session/set_mode","params":{"modeId":"dontask"}}),
     )
     .await;
-    let mut saw_notification = false;
-    for _ in 0..8 {
-        let m = next(&mut lines).await;
-        if m["method"] == "session/update" && m["params"]["update"]["type"] == "mode_changed" {
-            assert_eq!(m["params"]["update"]["mode"], "dontask");
-            saw_notification = true;
-            break;
-        }
-        if m["id"] == json!(3) {
-            assert_eq!(
-                m["result"]["mode"], "dontask",
-                "the ack carries the effective mode"
-            );
-        }
-    }
-    assert!(saw_notification, "set_mode must broadcast mode_changed");
+    let m = next_standard(&mut lines, "current_mode_update").await;
+    assert_eq!(m["params"]["update"]["currentModeId"], "dontask");
 }
 
-/// Plan is its own axis on the wire: `session/set_plan` acks and broadcasts
-/// `plan_changed`, and a client still sending the pre-split `set_mode {"mode":
-/// "plan"}` is routed to it rather than told its mode word is invalid.
 #[tokio::test]
-async fn set_plan_is_its_own_axis_and_the_legacy_plan_mode_word_still_works() {
+async fn plan_is_a_boolean_option() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
     tokio::spawn(acp::serve(
@@ -2024,75 +2069,57 @@ async fn set_plan_is_its_own_axis_and_the_legacy_plan_mode_word_still_works() {
     ));
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
-
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"_meta":{"hotl.dev/extensions":1}}}}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
-    let hello = read_until_id(&mut lines, 1).await;
-    assert_eq!(
-        hello["result"]["agentCapabilities"]["_meta"]["hotl.dev/init"]["defaultPlan"],
-        false
-    );
+    let _ = read_until_id(&mut lines, 1).await;
     send(
         &mut cwrite,
         json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let opened = read_until_id(&mut lines, 2).await;
-    assert_eq!(open_of(&opened)["plan"], false, "session/new reports plan");
-
-    // The dedicated method.
+    let options = &opened["result"]["configOptions"];
+    let plan = options
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["id"] == "plan")
+        .unwrap();
+    assert_eq!(plan["type"], "boolean");
+    assert_eq!(plan["currentValue"], false);
+    assert_eq!(open_of(&opened)["plan"], false);
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/set_plan","params":{"plan":true}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"session/set_config_option",
+               "params":{"sessionId":"s","configId":"plan","type":"boolean","value":true}}),
     )
     .await;
-    let mut saw = false;
-    for _ in 0..8 {
-        let m = next(&mut lines).await;
-        if m["method"] == "session/update" && m["params"]["update"]["type"] == "plan_changed" {
-            assert_eq!(m["params"]["update"]["plan"], true);
-            saw = true;
-            break;
-        }
-        if m["id"] == json!(3) {
-            assert_eq!(m["result"]["plan"], true, "the ack carries the plan state");
-        }
-    }
-    assert!(saw, "set_plan must broadcast plan_changed");
-
-    // The legacy spelling lands on the same axis, not on an error.
-    send(
-        &mut cwrite,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/set_mode","params":{"mode":"plan"}}),
-    )
-    .await;
-    let mut saw_legacy = false;
-    for _ in 0..8 {
-        let m = next(&mut lines).await;
-        if m["id"] == json!(4) {
-            assert!(
-                m.get("error").is_none(),
-                "a pre-split client must not get an error: {m}"
-            );
-            assert_eq!(m["result"]["plan"], true);
-        }
-        if m["method"] == "session/update" && m["params"]["update"]["type"] == "plan_changed" {
-            saw_legacy = true;
-            break;
-        }
-    }
-    assert!(
-        saw_legacy,
-        "legacy set_mode(plan) must broadcast plan_changed"
+    let reply = read_until_id(&mut lines, 3).await;
+    let plan = reply["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["id"] == "plan")
+        .unwrap();
+    assert_eq!(plan["currentValue"], true);
+    let update = next_standard(&mut lines, "config_option_update").await;
+    assert_eq!(
+        update["params"]["update"]["configOptions"],
+        reply["result"]["configOptions"]
     );
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/set_config_option",
+               "params":{"sessionId":"s","configId":"plan","value":"yes"}}),
+    )
+    .await;
+    let err = read_until_id(&mut lines, 4).await;
+    assert_eq!(err["error"]["code"], -32602, "{err}");
 }
 
-/// `session/set_effort` acks with the effective level, broadcasts
-/// `effort_changed`, round-trips the cleared case as JSON `null`, and rejects
-/// a rung it does not carry.
 /// 0067: a resolver that never touches a key — `provider/model` becomes a
 /// same-dialect switch; `openai/…` a cross-dialect one with a scripted
 /// provider; `nope/…` the startup error text.
@@ -2167,7 +2194,7 @@ async fn set_model_acks_applied_and_the_engine_broadcasts_model_changed() {
     let _ = read_until_id(&mut lines, 2).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/set_model","params":{"model":"anthropic/other"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"session/set_config_option","params":{"configId":"model","value":"anthropic/other"}}),
     )
     .await;
     // Applied at once: the engine's broadcast and the ack arrive in either
@@ -2185,8 +2212,9 @@ async fn set_model_acks_applied_and_the_engine_broadcasts_model_changed() {
         }
     }
     let ack = ack.expect("the ack");
-    assert_eq!(ack["result"]["applied"], true, "{ack}");
-    assert_eq!(ack["result"]["model"], "anthropic/other");
+    let meta = &ack["result"]["_meta"]["hotl.dev/model"];
+    assert_eq!(meta["applied"], true, "{ack}");
+    assert_eq!(meta["model"], "anthropic/other");
     let changed = changed.expect("the broadcast");
     assert_eq!(changed["params"]["update"]["model"], "anthropic/other");
     assert_eq!(changed["params"]["update"]["context_window"], 200_000);
@@ -2227,11 +2255,14 @@ async fn set_model_during_a_turn_acks_queued_then_broadcasts_at_the_boundary() {
     let ask = next_matching(&mut lines, |m| m["method"] == "session/request_permission").await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/set_model","params":{"model":"anthropic/other"}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"session/set_config_option","params":{"configId":"model","value":"anthropic/other"}}),
     )
     .await;
     let ack = read_until_id(&mut lines, 4).await;
-    assert_eq!(ack["result"]["applied"], false, "parked: {ack}");
+    assert_eq!(
+        ack["result"]["_meta"]["hotl.dev/model"]["applied"], false,
+        "parked: {ack}"
+    );
     send(
         &mut cwrite,
         json!({"jsonrpc":"2.0","id": ask["id"],"result":{"allow": true}}),
@@ -2271,10 +2302,11 @@ async fn set_model_rejects_an_unknown_provider_and_changes_nothing() {
     let _ = read_until_id(&mut lines, 2).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/set_model","params":{"model":"nope/x"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"session/set_config_option","params":{"configId":"model","value":"nope/x"}}),
     )
     .await;
     let err = read_until_id(&mut lines, 3).await;
+    assert_eq!(err["error"]["code"], -32602);
     assert!(
         err["error"]["message"]
             .as_str()
@@ -2284,7 +2316,7 @@ async fn set_model_rejects_an_unknown_provider_and_changes_nothing() {
     );
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/set_model","params":{}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"session/set_config_option","params":{"configId":"model"}}),
     )
     .await;
     let err = read_until_id(&mut lines, 4).await;
@@ -2292,7 +2324,7 @@ async fn set_model_rejects_an_unknown_provider_and_changes_nothing() {
         err["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("params.model"),
+            .contains("params.value"),
         "{err}"
     );
 }
@@ -2324,7 +2356,7 @@ async fn set_model_without_a_resolver_is_an_error_not_a_silent_no_op() {
     let _ = read_until_id(&mut lines, 2).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/set_model","params":{"model":"anthropic/other"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"session/set_config_option","params":{"configId":"model","value":"anthropic/other"}}),
     )
     .await;
     let err = read_until_id(&mut lines, 3).await;
@@ -2332,7 +2364,7 @@ async fn set_model_without_a_resolver_is_an_error_not_a_silent_no_op() {
         err["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("not supported"),
+            .contains("cannot change"),
         "{err}"
     );
 }
@@ -2417,7 +2449,7 @@ async fn a_resumed_session_runs_its_last_model_set() {
 }
 
 #[tokio::test]
-async fn set_effort_acks_broadcasts_and_rejects_unknown_levels() {
+async fn set_config_option_effort_sets_clears_and_rejects_unknown_levels() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
     tokio::spawn(acp::serve(
@@ -2429,7 +2461,79 @@ async fn set_effort_acks_broadcasts_and_rejects_unknown_levels() {
     ));
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 1).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 2).await;
+    let effort = opened["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["id"] == "effort")
+        .unwrap();
+    assert_eq!(effort["category"], "thought_level");
+    assert_eq!(effort["currentValue"], "xhigh");
+    for (id, value) in [(3, "max"), (4, "default")] {
+        send(
+            &mut cwrite,
+            json!({"jsonrpc":"2.0","id":id,"method":"session/set_config_option",
+                   "params":{"sessionId":"s","configId":"effort","value":value}}),
+        )
+        .await;
+        let reply = read_until_id(&mut lines, id).await;
+        let effort = reply["result"]["configOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == "effort")
+            .unwrap();
+        assert_eq!(effort["currentValue"], value, "{reply}");
+    }
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":5,"method":"session/set_config_option",
+               "params":{"sessionId":"s","configId":"effort","value":"ultra"}}),
+    )
+    .await;
+    let m = read_until_id(&mut lines, 5).await;
+    assert_eq!(
+        m["error"]["code"], -32602,
+        "an unknown rung must error: {m}"
+    );
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":6,"method":"session/set_config_option",
+               "params":{"sessionId":"s","configId":"colour","value":"red"}}),
+    )
+    .await;
+    let m = read_until_id(&mut lines, 6).await;
+    assert_eq!(
+        m["error"]["code"], -32602,
+        "an unknown option must error: {m}"
+    );
+}
 
+#[tokio::test]
+async fn set_config_option_model_switches_and_returns_all_options() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info_with_resolver(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
@@ -2442,57 +2546,25 @@ async fn set_effort_acks_broadcasts_and_rejects_unknown_levels() {
     )
     .await;
     let _ = read_until_id(&mut lines, 2).await;
-
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/set_effort","params":{"effort":"xhigh"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"session/set_config_option",
+               "params":{"sessionId":"s","configId":"model","value":"anthropic/other"}}),
     )
     .await;
-    let mut saw = false;
-    for _ in 0..8 {
-        let m = next(&mut lines).await;
-        if m["method"] == "session/update" && m["params"]["update"]["type"] == "effort_changed" {
-            assert_eq!(m["params"]["update"]["effort"], "xhigh");
-            saw = true;
-            break;
-        }
-        if m["id"] == json!(3) {
-            assert_eq!(m["result"]["effort"], "xhigh", "the ack carries the level");
-        }
-    }
-    assert!(saw, "set_effort must broadcast effort_changed");
-
-    // Clearing is its own act, and reaches the wire as an explicit null.
-    send(
-        &mut cwrite,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/set_effort","params":{"effort":"default"}}),
-    )
-    .await;
-    let mut saw_clear = false;
-    for _ in 0..8 {
-        let m = next(&mut lines).await;
-        if m["method"] == "session/update" && m["params"]["update"]["type"] == "effort_changed" {
-            assert_eq!(m["params"]["update"]["effort"], Value::Null);
-            saw_clear = true;
-            break;
-        }
-        if m["id"] == json!(4) {
-            assert_eq!(m["result"]["effort"], Value::Null);
-        }
-    }
-    assert!(
-        saw_clear,
-        "clearing must broadcast effort_changed with null"
+    let reply = read_until_id(&mut lines, 3).await;
+    let ids: Vec<&str> = reply["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["model", "effort", "plan"]);
+    assert_eq!(
+        reply["result"]["configOptions"][0]["currentValue"],
+        "anthropic/other"
     );
-
-    // `ultra` is another harness's orchestration opt-in, not a rung here.
-    send(
-        &mut cwrite,
-        json!({"jsonrpc":"2.0","id":5,"method":"session/set_effort","params":{"effort":"ultra"}}),
-    )
-    .await;
-    let m = read_until_id(&mut lines, 5).await;
-    assert!(m.get("error").is_some(), "an unknown rung must error: {m}");
+    assert_eq!(reply["result"]["_meta"]["hotl.dev/model"]["applied"], true);
 }
 
 /// `session/set_goal` acks with the normalized goal; the change reaches every
@@ -2719,6 +2791,19 @@ async fn next_matching(
         }
     }
     panic!("no matching frame in 12 tries");
+}
+
+async fn next_standard(
+    lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
+    kind: &str,
+) -> Value {
+    for _ in 0..12 {
+        let m = next_raw(lines).await;
+        if m["params"]["update"]["sessionUpdate"] == kind {
+            return m;
+        }
+    }
+    panic!("no {kind} frame in 12 tries");
 }
 
 /// A rebuild that succeeds, handing back a second scripted factory plus the

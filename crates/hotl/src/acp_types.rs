@@ -270,6 +270,8 @@ pub struct NewSessionResponse {
     pub session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modes: Option<SessionModeState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_options: Option<Vec<SessionConfigOption>>,
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub meta: Option<Meta>,
 }
@@ -279,6 +281,8 @@ pub struct NewSessionResponse {
 pub struct LoadSessionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modes: Option<SessionModeState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_options: Option<Vec<SessionConfigOption>>,
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub meta: Option<Meta>,
 }
@@ -288,6 +292,8 @@ pub struct LoadSessionResponse {
 pub struct ResumeSessionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modes: Option<SessionModeState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_options: Option<Vec<SessionConfigOption>>,
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub meta: Option<Meta>,
 }
@@ -345,6 +351,8 @@ pub enum SessionUpdate {
     AvailableCommandsUpdate(AvailableCommandsUpdate),
     UsageUpdate(UsageUpdate),
     SessionInfoUpdate(SessionInfoUpdate),
+    CurrentModeUpdate(CurrentModeUpdate),
+    ConfigOptionUpdate(ConfigOptionUpdate),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
@@ -483,4 +491,91 @@ pub struct SessionInfoUpdate {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentModeUpdate {
+    pub current_mode_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigOptionUpdate {
+    pub config_options: Vec<SessionConfigOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionConfigOption {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<SessionConfigOptionCategory>,
+    #[serde(flatten)]
+    pub kind: SessionConfigKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionConfigOptionCategory {
+    Mode,
+    Model,
+    ModelConfig,
+    ThoughtLevel,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionConfigKind {
+    Select(SessionConfigSelect),
+    Boolean(SessionConfigBoolean),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionConfigSelect {
+    pub current_value: String,
+    pub options: Vec<SessionConfigSelectOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionConfigSelectOption {
+    pub value: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionConfigBoolean {
+    pub current_value: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionModeRequest {
+    #[serde(default)]
+    pub mode_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionConfigOptionRequest {
+    #[serde(default)]
+    pub config_id: Option<String>,
+    #[serde(default)]
+    pub value: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionConfigOptionResponse {
+    pub config_options: Vec<SessionConfigOption>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
 }

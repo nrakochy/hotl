@@ -4,9 +4,10 @@ use serde_json::Value;
 use crate::acp::{SessionOpen, SessionOpenExtras, WorktreeInfo};
 use crate::acp_types::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, Content, ContentBlock,
-    ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionMode,
-    SessionModeState, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus, ToolKind,
-    UnstructuredCommandInput,
+    ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionConfigBoolean,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelect,
+    SessionConfigSelectOption, SessionMode, SessionModeState, SessionUpdate, ToolCall,
+    ToolCallContent, ToolCallStatus, ToolKind, UnstructuredCommandInput,
 };
 
 pub fn tool_kind(name: &str) -> ToolKind {
@@ -163,6 +164,69 @@ pub fn session_modes(current: &str) -> SessionModeState {
             mode("bypass", "Bypass", "Run every tool without asking"),
         ],
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigState {
+    pub model: String,
+    pub plan: bool,
+    pub effort: String,
+}
+
+pub fn effort_wire(open: &SessionOpen) -> String {
+    match &open.effort {
+        Some(Some(level)) => level.clone(),
+        Some(None) => "default".into(),
+        None => open
+            .default_effort
+            .clone()
+            .unwrap_or_else(|| "default".into()),
+    }
+}
+
+pub fn config_options(state: &ConfigState) -> Vec<SessionConfigOption> {
+    let level = |value: &str, name: &str| SessionConfigSelectOption {
+        value: value.into(),
+        name: name.into(),
+        description: None,
+    };
+    let mut efforts = vec![level("default", "Default")];
+    efforts.extend(
+        hotl_provider::ALL_EFFORTS
+            .iter()
+            .map(|e| level(e.as_str(), e.as_str())),
+    );
+    vec![
+        SessionConfigOption {
+            id: "model".into(),
+            name: "Model".into(),
+            description: Some("The model this session runs".into()),
+            category: Some(SessionConfigOptionCategory::Model),
+            kind: SessionConfigKind::Select(SessionConfigSelect {
+                current_value: state.model.clone(),
+                options: vec![level(&state.model, &state.model)],
+            }),
+        },
+        SessionConfigOption {
+            id: "effort".into(),
+            name: "Effort".into(),
+            description: Some("How hard the model thinks".into()),
+            category: Some(SessionConfigOptionCategory::ThoughtLevel),
+            kind: SessionConfigKind::Select(SessionConfigSelect {
+                current_value: state.effort.clone(),
+                options: efforts,
+            }),
+        },
+        SessionConfigOption {
+            id: "plan".into(),
+            name: "Plan mode".into(),
+            description: Some("File edits ask first while plan mode is on".into()),
+            category: None,
+            kind: SessionConfigKind::Boolean(SessionConfigBoolean {
+                current_value: state.plan,
+            }),
+        },
+    ]
 }
 
 pub fn plan_of(todos: &[hotl_types::Todo]) -> Plan {
@@ -375,6 +439,74 @@ mod tests {
                 {"content": "c", "priority": "medium", "status": "pending"}
             ]})
         );
+    }
+
+    fn state() -> ConfigState {
+        ConfigState {
+            model: "anthropic/m".into(),
+            plan: false,
+            effort: "default".into(),
+        }
+    }
+
+    #[test]
+    fn effort_option_lists_the_ladder() {
+        let options = config_options(&state());
+        let effort = serde_json::to_value(&options[1]).unwrap();
+        assert_eq!(effort["id"], "effort");
+        assert_eq!(effort["category"], "thought_level");
+        assert_eq!(effort["type"], "select");
+        assert_eq!(effort["currentValue"], "default");
+        let values: Vec<&str> = effort["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(values, ["default", "low", "medium", "high", "xhigh", "max"]);
+    }
+
+    #[test]
+    fn plan_is_a_boolean_option() {
+        let mut st = state();
+        st.plan = true;
+        let plan = serde_json::to_value(&config_options(&st)[2]).unwrap();
+        assert_eq!(
+            plan,
+            json!({"id": "plan", "name": "Plan mode", "type": "boolean", "currentValue": true,
+                   "description": "File edits ask first while plan mode is on"})
+        );
+    }
+
+    #[test]
+    fn the_model_option_names_the_running_model() {
+        let model = serde_json::to_value(&config_options(&state())[0]).unwrap();
+        assert_eq!(model["id"], "model");
+        assert_eq!(model["category"], "model");
+        assert_eq!(model["currentValue"], "anthropic/m");
+        assert_eq!(model["options"][0]["value"], "anthropic/m");
+    }
+
+    #[test]
+    fn the_two_option_updates_serialize_with_their_tags() {
+        let mode = serde_json::to_value(SessionUpdate::CurrentModeUpdate(
+            crate::acp_types::CurrentModeUpdate {
+                current_mode_id: "ask".into(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            mode,
+            json!({"sessionUpdate": "current_mode_update", "currentModeId": "ask"})
+        );
+        let options = serde_json::to_value(SessionUpdate::ConfigOptionUpdate(
+            crate::acp_types::ConfigOptionUpdate {
+                config_options: config_options(&state()),
+            },
+        ))
+        .unwrap();
+        assert_eq!(options["sessionUpdate"], "config_option_update");
+        assert_eq!(options["configOptions"].as_array().unwrap().len(), 3);
     }
 
     #[test]

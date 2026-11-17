@@ -21,12 +21,13 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::acp_ext::codes;
 use crate::acp_types::{
-    AgentCapabilities, AuthMethod, AuthenticateRequest, CloseSessionRequest, ErrorObject,
-    Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, ResumeSessionRequest,
-    ResumeSessionResponse, SessionCapabilities, SessionInfo, SessionInfoUpdate,
-    SessionNotification, SessionUpdate, UsageUpdate,
+    AgentCapabilities, AuthMethod, AuthenticateRequest, CloseSessionRequest, ConfigOptionUpdate,
+    CurrentModeUpdate, ErrorObject, Implementation, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    McpCapabilities, NewSessionRequest, NewSessionResponse, PromptCapabilities,
+    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionInfo,
+    SessionInfoUpdate, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, UsageUpdate,
 };
 
 /// Stable schema version of `session/update` / prompt-result payloads (an MD
@@ -49,9 +50,7 @@ pub const EXTENSION_METHODS: &[&str] = &[
     "session/rename",
     "session/set_color",
     "session/set_mode",
-    "session/set_plan",
-    "session/set_effort",
-    "session/set_model",
+    "session/set_config_option",
     "session/set_goal",
     "session/remember",
     "session/steer",
@@ -494,6 +493,8 @@ pub async fn serve(
     }
 }
 
+type SharedConfig = Arc<std::sync::Mutex<crate::acp_map::ConfigState>>;
+
 struct SessionState {
     id: String,
     /// The durable id this session's log carries — what a resume (and so
@@ -501,6 +502,7 @@ struct SessionState {
     store_id: String,
     cwd: std::path::PathBuf,
     handle: SessionHandle,
+    config: SharedConfig,
     drain: tokio::task::JoinHandle<()>,
     go: Option<oneshot::Sender<()>>,
     /// The worktree lock (0065 T7): unlocked when this state drops — a
@@ -687,14 +689,26 @@ async fn handle_request(
                 m
             });
             let modes = Some(crate::acp_map::session_modes(&mode));
+            let config_options = session
+                .as_ref()
+                .map(|state| crate::acp_map::config_options(&lock_config(&state.config)));
             let result = match kind {
                 OpenKind::New | OpenKind::Fork => to_json(&NewSessionResponse {
                     session_id: sid.clone(),
                     modes,
+                    config_options,
                     meta,
                 }),
-                OpenKind::Load => to_json(&LoadSessionResponse { modes, meta }),
-                OpenKind::Resume => to_json(&ResumeSessionResponse { modes, meta }),
+                OpenKind::Load => to_json(&LoadSessionResponse {
+                    modes,
+                    config_options,
+                    meta,
+                }),
+                OpenKind::Resume => to_json(&ResumeSessionResponse {
+                    modes,
+                    config_options,
+                    meta,
+                }),
             };
             reply_ok(writer, id, result).await;
             if let Some(state) = session.as_mut() {
@@ -920,67 +934,41 @@ async fn handle_request(
                 )
                 .await;
             };
-            let raw = msg.pointer("/params/mode").and_then(Value::as_str);
-            // `"plan"` was a mode before it became an overlay. A client still
-            // sending it means "turn plan on", and must not be told its mode
-            // word was a typo.
-            if raw.is_some_and(hotl_tools::rules::is_legacy_plan_word) {
-                state.handle.set_plan(true).await;
-                let session_id = state.id.clone();
-                reply_ok(
-                    writer,
-                    id,
-                    to_json(&PlanAck {
-                        ok: true,
-                        plan: true,
-                    }),
-                )
-                .await;
-                return notify(
-                    writer,
-                    &session_id,
-                    to_json(&AcpOnlyUpdate::PlanChanged { plan: true }),
-                )
-                .await;
-            }
-            let Some(mode) = raw.and_then(hotl_tools::rules::PermissionMode::from_str) else {
+            let request: SetSessionModeRequest =
+                serde_json::from_value(msg.get("params").cloned().unwrap_or(Value::Null))
+                    .unwrap_or(SetSessionModeRequest { mode_id: None });
+            let Some(raw) = request.mode_id else {
                 return reply_err(
                     writer,
                     id,
                     codes::INVALID_PARAMS,
-                    "session/set_mode requires params.mode (ask | bypass | dontask)",
+                    "session/set_mode requires params.modeId (ask | dontask | bypass)",
                 )
                 .await;
             };
-            // The *effective* mode, post-coercion: a `security-enforced` build
-            // forces Bypass→Ask inside `Rules::with_mode`, so acking the
-            // requested mode would leave a client's badge reading `bypass` for
-            // a session actually running `ask` — the §5.7 lie in reverse.
+            let Some(mode) = hotl_tools::rules::PermissionMode::from_str(&raw) else {
+                return reply_err(
+                    writer,
+                    id,
+                    codes::INVALID_PARAMS,
+                    &format!("unknown mode `{raw}` — use ask, dontask or bypass"),
+                )
+                .await;
+            };
             let effective = hotl_tools::rules::enforced_mode(mode);
             state.handle.set_mode(mode).await;
             let session_id = state.id.clone();
-            reply_ok(
-                writer,
-                id,
-                to_json(&ModeAck {
-                    ok: true,
-                    mode: effective.as_str().into(),
-                }),
-            )
-            .await;
-            // Broadcast, not just ack: a mode changed by *any* client (or by
-            // resume inheritance) has to reach every attached surface, and
-            // `session/update` needs no id-plumbing in a client's loop.
-            notify(
+            reply_ok(writer, id, json!({})).await;
+            send_update(
                 writer,
                 &session_id,
-                to_json(&AcpOnlyUpdate::ModeChanged {
-                    mode: effective.as_str().into(),
+                SessionUpdate::CurrentModeUpdate(CurrentModeUpdate {
+                    current_mode_id: effective.as_str().into(),
                 }),
             )
             .await;
         }
-        "session/set_plan" => {
+        "session/set_config_option" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(
                     writer,
@@ -990,157 +978,141 @@ async fn handle_request(
                 )
                 .await;
             };
-            let Some(plan) = msg.pointer("/params/plan").and_then(Value::as_bool) else {
+            let request: SetSessionConfigOptionRequest =
+                serde_json::from_value(msg.get("params").cloned().unwrap_or(Value::Null))
+                    .unwrap_or(SetSessionConfigOptionRequest {
+                        config_id: None,
+                        value: None,
+                    });
+            let (Some(config_id), Some(value)) = (request.config_id, request.value) else {
                 return reply_err(
                     writer,
                     id,
                     codes::INVALID_PARAMS,
-                    "session/set_plan requires params.plan (a boolean)",
+                    "session/set_config_option requires params.configId and params.value",
                 )
                 .await;
             };
-            // No `enforced_mode` counterpart: the overlay only ever adds an
-            // ask, so what is requested is always what takes effect.
-            state.handle.set_plan(plan).await;
-            let session_id = state.id.clone();
-            reply_ok(writer, id, to_json(&PlanAck { ok: true, plan })).await;
-            notify(
-                writer,
-                &session_id,
-                to_json(&AcpOnlyUpdate::PlanChanged { plan }),
-            )
-            .await;
-        }
-        "session/set_effort" => {
-            let Some(state) = session.as_ref() else {
-                return reply_err(
-                    writer,
-                    id,
-                    codes::NOT_FOUND,
-                    "no session — call session/new first",
-                )
-                .await;
-            };
-            let Some(raw) = msg.pointer("/params/effort").and_then(Value::as_str) else {
-                return reply_err(
-                    writer,
-                    id,
-                    codes::INVALID_PARAMS,
-                    "session/set_effort requires params.effort \
-                     (low | medium | high | xhigh | max | default)",
-                )
-                .await;
-            };
-            // Four spellings of "back to the provider's own default", because
-            // a client should not have to guess which one this server took.
-            let effort = match raw.trim() {
-                "" | "default" | "unset" | "none" => None,
-                other => match other.parse::<hotl_provider::Effort>() {
-                    Ok(e) => Some(e),
-                    Err(_) => {
+            let mut model_meta = None;
+            match config_id.as_str() {
+                "model" => {
+                    let Some(raw) = value.as_str() else {
                         return reply_err(
                             writer,
                             id,
                             codes::INVALID_PARAMS,
-                            "session/set_effort requires params.effort \
-                             (low | medium | high | xhigh | max | default)",
+                            "the model option takes a string (provider/model, or default)",
                         )
                         .await;
+                    };
+                    let Some(resolver) = info.model_resolver.as_ref() else {
+                        return reply_err(
+                            writer,
+                            id,
+                            codes::INTERNAL,
+                            "the model option cannot change on this connection",
+                        )
+                        .await;
+                    };
+                    let (switch, warnings) = match resolver(raw) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return reply_err(writer, id, codes::INVALID_PARAMS, &e).await;
+                        }
+                    };
+                    let spec = switch.spec.clone();
+                    match state.handle.set_model(switch).await {
+                        Ok(applied) => {
+                            if applied {
+                                lock_config(&state.config).model = spec.clone();
+                            }
+                            model_meta = Some(ModelAck {
+                                ok: true,
+                                model: spec,
+                                applied,
+                                warnings,
+                            });
+                        }
+                        Err(e) => {
+                            return reply_err(writer, id, codes::INVALID_PARAMS, &e.to_string())
+                                .await;
+                        }
                     }
-                },
-            };
-            // No `enforced_mode` counterpart: no build tightens effort.
-            state.handle.set_effort(effort).await;
-            let session_id = state.id.clone();
-            let wire = effort.map(|e| e.as_str());
-            reply_ok(
-                writer,
-                id,
-                to_json(&EffortAck {
-                    ok: true,
-                    effort: wire.map(String::from),
-                }),
-            )
-            .await;
-            // Broadcast for the same reason as `mode_changed`: a change made
-            // by any client must reach every attached surface.
-            notify(
-                writer,
-                &session_id,
-                to_json(&AcpOnlyUpdate::EffortChanged {
-                    effort: wire.map(String::from),
-                }),
-            )
-            .await;
-        }
-        // `/model` (0067). The ack says whether the switch applied now or
-        // waits for the turn boundary; the engine's `model_changed` event —
-        // relayed like every event — is the only thing that moves a surface.
-        "session/set_model" => {
-            let Some(state) = session.as_ref() else {
-                return reply_err(
-                    writer,
-                    id,
-                    codes::NOT_FOUND,
-                    "no session — call session/new first",
-                )
-                .await;
-            };
-            let Some(raw) = msg.pointer("/params/model").and_then(Value::as_str) else {
-                return reply_err(
-                    writer,
-                    id,
-                    codes::INVALID_PARAMS,
-                    "session/set_model requires params.model (provider/model, or default)",
-                )
-                .await;
-            };
-            let Some(resolver) = info.model_resolver.as_ref() else {
-                return reply_err(
-                    writer,
-                    id,
-                    codes::INTERNAL,
-                    "session/set_model is not supported on this connection",
-                )
-                .await;
-            };
-            let (switch, warnings) = match resolver(raw) {
-                Ok(r) => r,
-                Err(e) => {
+                }
+                "effort" => {
+                    let effort = match value.as_str().map(str::trim) {
+                        Some("" | "default" | "unset" | "none") => None,
+                        Some(other) => match other.parse::<hotl_provider::Effort>() {
+                            Ok(e) => Some(e),
+                            Err(_) => {
+                                return reply_err(
+                                    writer,
+                                    id,
+                                    codes::INVALID_PARAMS,
+                                    "the effort option takes low | medium | high | xhigh | max | default",
+                                )
+                                .await;
+                            }
+                        },
+                        None => {
+                            return reply_err(
+                                writer,
+                                id,
+                                codes::INVALID_PARAMS,
+                                "the effort option takes a string",
+                            )
+                            .await;
+                        }
+                    };
+                    state.handle.set_effort(effort).await;
+                    lock_config(&state.config).effort =
+                        effort.map_or_else(|| "default".to_string(), |e| e.as_str().to_string());
+                }
+                "plan" => {
+                    let Some(plan) = value.as_bool() else {
+                        return reply_err(
+                            writer,
+                            id,
+                            codes::INVALID_PARAMS,
+                            "the plan option takes a boolean",
+                        )
+                        .await;
+                    };
+                    state.handle.set_plan(plan).await;
+                    lock_config(&state.config).plan = plan;
+                }
+                other => {
                     return reply_err(
                         writer,
                         id,
-                        codes::INTERNAL,
-                        &format!("session/set_model: {e}"),
+                        codes::INVALID_PARAMS,
+                        &format!("unknown config option `{other}` — use model, effort or plan"),
                     )
-                    .await
-                }
-            };
-            let spec = switch.spec.clone();
-            match state.handle.set_model(switch).await {
-                Ok(applied) => {
-                    reply_ok(
-                        writer,
-                        id,
-                        to_json(&ModelAck {
-                            ok: true,
-                            model: spec,
-                            applied,
-                            warnings,
-                        }),
-                    )
-                    .await
-                }
-                Err(e) => {
-                    reply_err(
-                        writer,
-                        id,
-                        codes::INTERNAL,
-                        &format!("session/set_model: {e}"),
-                    )
-                    .await
+                    .await;
                 }
             }
+            let session_id = state.id.clone();
+            let config_options = crate::acp_map::config_options(&lock_config(&state.config));
+            let meta = model_meta.filter(|_| client_caps.ext).map(|ack| {
+                let mut m = serde_json::Map::new();
+                m.insert(META_MODEL.into(), to_json(&ack));
+                m
+            });
+            reply_ok(
+                writer,
+                id,
+                to_json(&SetSessionConfigOptionResponse {
+                    config_options: config_options.clone(),
+                    meta,
+                }),
+            )
+            .await;
+            send_update(
+                writer,
+                &session_id,
+                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate { config_options }),
+            )
+            .await;
         }
         "session/set_goal" => {
             let Some(state) = session.as_ref() else {
@@ -2068,6 +2040,13 @@ fn retire_session(
 /// Shared by `session/new`, `session/load` and `session/reload_config` so the
 /// three can never drift on what "retire the old session" means.
 #[allow(clippy::too_many_arguments)]
+fn lock_config(config: &SharedConfig) -> std::sync::MutexGuard<'_, crate::acp_map::ConfigState> {
+    config
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn install_session(
     open: SessionOpen,
     id: String,
@@ -2089,9 +2068,15 @@ fn install_session(
         pending_egress,
         pending_prompt,
     );
+    let config = Arc::new(std::sync::Mutex::new(crate::acp_map::ConfigState {
+        model: open.model.clone().unwrap_or_else(|| model.to_string()),
+        plan: open.plan,
+        effort: crate::acp_map::effort_wire(&open),
+    }));
     let lease = open.lease;
     let mut state = start_session(
         open.handle,
+        config,
         id,
         open.session_id,
         writer.clone(),
@@ -2113,6 +2098,7 @@ fn install_session(
 #[allow(clippy::too_many_arguments)]
 fn start_session(
     mut handle: SessionHandle,
+    config: SharedConfig,
     id: String,
     store_id: String,
     writer: Writer,
@@ -2129,6 +2115,7 @@ fn start_session(
     *next_id += 1;
     let events = std::mem::replace(&mut handle.events, mpsc::channel(1).1);
     let sid = id.clone();
+    let drain_config = Arc::clone(&config);
     let (go, held) = oneshot::channel::<()>();
     let drain = tokio::spawn(async move {
         if held.await.is_ok() {
@@ -2142,6 +2129,7 @@ fn start_session(
                 sid,
                 req_id_seed,
                 model,
+                drain_config,
             )
             .await;
         }
@@ -2151,6 +2139,7 @@ fn start_session(
         store_id,
         cwd: std::path::PathBuf::new(),
         handle,
+        config,
         drain,
         go: Some(go),
         _lease: None,
@@ -2176,6 +2165,7 @@ async fn drain_events(
     session_id: String,
     mut req_id: u64,
     model: String,
+    config: SharedConfig,
 ) {
     let mut held: Option<EngineEvent> = None;
     loop {
@@ -2238,6 +2228,16 @@ async fn drain_events(
             }
             other => other,
         };
+        if let EngineEvent::ModelChanged { model, .. } = &event {
+            lock_config(&config).model = model.clone();
+            let config_options = crate::acp_map::config_options(&lock_config(&config));
+            send_update(
+                &writer,
+                &session_id,
+                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate { config_options }),
+            )
+            .await;
+        }
         match event {
             EngineEvent::Ask {
                 summary,
@@ -2451,6 +2451,11 @@ mod drain_tests {
             "acp-test".into(),
             0,
             "test-model".into(),
+            Arc::new(std::sync::Mutex::new(crate::acp_map::ConfigState {
+                model: "test-model".into(),
+                plan: false,
+                effort: "default".into(),
+            })),
         )
         .await;
         drop(writer); // close the duplex so read_to_string sees EOF
@@ -2813,6 +2818,7 @@ pub struct WorktreeInfo {
 }
 
 pub const META_OPEN: &str = "hotl.dev/open";
+pub const META_MODEL: &str = "hotl.dev/model";
 
 /// Absent keys mean something different from `null` (probe failed / never
 /// set / same model).
@@ -2863,25 +2869,6 @@ pub struct PromptResult {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Ack {
     pub ok: bool,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct PlanAck {
-    pub ok: bool,
-    pub plan: bool,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct ModeAck {
-    pub ok: bool,
-    pub mode: String,
-}
-
-/// `effort` is `null` when reset to the provider default.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct EffortAck {
-    pub ok: bool,
-    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -2984,15 +2971,6 @@ pub enum AcpOnlyUpdate {
         outcome: crate::wire::OutcomeFrame,
         #[serde(skip_serializing_if = "Option::is_none")]
         mispredictions: Option<u32>,
-    },
-    ModeChanged {
-        mode: String,
-    },
-    PlanChanged {
-        plan: bool,
-    },
-    EffortChanged {
-        effort: Option<String>,
     },
     MemoryReport {
         mode: String,
@@ -3127,9 +3105,6 @@ pub struct AcpPayloads {
     prompt_result: PromptResult,
     session_update: SessionUpdateParams,
     ack: Ack,
-    plan_ack: PlanAck,
-    mode_ack: ModeAck,
-    effort_ack: EffortAck,
     model_ack: ModelAck,
     goal_ack: GoalAck,
     stopped_ack: StoppedAck,

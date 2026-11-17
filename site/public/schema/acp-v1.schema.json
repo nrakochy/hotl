@@ -42,56 +42,6 @@
         },
         {
           "properties": {
-            "mode": {
-              "type": "string"
-            },
-            "type": {
-              "const": "mode_changed",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "mode"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "plan": {
-              "type": "boolean"
-            },
-            "type": {
-              "const": "plan_changed",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "plan"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "effort": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "type": {
-              "const": "effort_changed",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
             "bytes": {
               "format": "uint",
               "minimum": 0,
@@ -510,6 +460,20 @@
       ],
       "type": "object"
     },
+    "ConfigOptionUpdate": {
+      "properties": {
+        "configOptions": {
+          "items": {
+            "$ref": "#/$defs/SessionConfigOption"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "configOptions"
+      ],
+      "type": "object"
+    },
     "Content": {
       "properties": {
         "content": {
@@ -594,21 +558,14 @@
       ],
       "type": "object"
     },
-    "EffortAck": {
-      "description": "`effort` is `null` when reset to the provider default.",
+    "CurrentModeUpdate": {
       "properties": {
-        "effort": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "ok": {
-          "type": "boolean"
+        "currentModeId": {
+          "type": "string"
         }
       },
       "required": [
-        "ok"
+        "currentModeId"
       ],
       "type": "object"
     },
@@ -1864,6 +1821,15 @@
             "null"
           ]
         },
+        "configOptions": {
+          "items": {
+            "$ref": "#/$defs/SessionConfigOption"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "modes": {
           "anyOf": [
             {
@@ -1907,21 +1873,6 @@
       ],
       "type": "object"
     },
-    "ModeAck": {
-      "properties": {
-        "mode": {
-          "type": "string"
-        },
-        "ok": {
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "ok",
-        "mode"
-      ],
-      "type": "object"
-    },
     "ModelAck": {
       "properties": {
         "applied": {
@@ -1955,6 +1906,15 @@
           "additionalProperties": true,
           "type": [
             "object",
+            "null"
+          ]
+        },
+        "configOptions": {
+          "items": {
+            "$ref": "#/$defs/SessionConfigOption"
+          },
+          "type": [
+            "array",
             "null"
           ]
         },
@@ -2249,21 +2209,6 @@
       ],
       "type": "object"
     },
-    "PlanAck": {
-      "properties": {
-        "ok": {
-          "type": "boolean"
-        },
-        "plan": {
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "ok",
-        "plan"
-      ],
-      "type": "object"
-    },
     "PlanEntry": {
       "properties": {
         "content": {
@@ -2552,6 +2497,15 @@
             "null"
           ]
         },
+        "configOptions": {
+          "items": {
+            "$ref": "#/$defs/SessionConfigOption"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "modes": {
           "anyOf": [
             {
@@ -2624,6 +2578,124 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "SessionConfigBoolean": {
+      "properties": {
+        "currentValue": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "currentValue"
+      ],
+      "type": "object"
+    },
+    "SessionConfigOption": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SessionConfigSelect",
+          "properties": {
+            "type": {
+              "const": "select",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/SessionConfigBoolean",
+          "properties": {
+            "type": {
+              "const": "boolean",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "category": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionConfigOptionCategory"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    },
+    "SessionConfigOptionCategory": {
+      "enum": [
+        "mode",
+        "model",
+        "model_config",
+        "thought_level"
+      ],
+      "type": "string"
+    },
+    "SessionConfigSelect": {
+      "properties": {
+        "currentValue": {
+          "type": "string"
+        },
+        "options": {
+          "items": {
+            "$ref": "#/$defs/SessionConfigSelectOption"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "currentValue",
+        "options"
+      ],
+      "type": "object"
+    },
+    "SessionConfigSelectOption": {
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "value",
+        "name"
+      ],
       "type": "object"
     },
     "SessionInfo": {
@@ -2930,6 +3002,32 @@
           "properties": {
             "sessionUpdate": {
               "const": "session_info_update",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/CurrentModeUpdate",
+          "properties": {
+            "sessionUpdate": {
+              "const": "current_mode_update",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/ConfigOptionUpdate",
+          "properties": {
+            "sessionUpdate": {
+              "const": "config_option_update",
               "type": "string"
             }
           },
@@ -3294,9 +3392,6 @@
     "cancelled": {
       "$ref": "#/$defs/Cancelled"
     },
-    "effortAck": {
-      "$ref": "#/$defs/EffortAck"
-    },
     "egressReply": {
       "$ref": "#/$defs/EgressReply"
     },
@@ -3312,9 +3407,6 @@
     "loadSession": {
       "$ref": "#/$defs/LoadSessionResponse"
     },
-    "modeAck": {
-      "$ref": "#/$defs/ModeAck"
-    },
     "modelAck": {
       "$ref": "#/$defs/ModelAck"
     },
@@ -3323,9 +3415,6 @@
     },
     "permissionReply": {
       "$ref": "#/$defs/PermissionReply"
-    },
-    "planAck": {
-      "$ref": "#/$defs/PlanAck"
     },
     "promptResult": {
       "$ref": "#/$defs/PromptResult"
@@ -3378,9 +3467,6 @@
     "promptResult",
     "sessionUpdate",
     "ack",
-    "planAck",
-    "modeAck",
-    "effortAck",
     "modelAck",
     "goalAck",
     "stoppedAck",

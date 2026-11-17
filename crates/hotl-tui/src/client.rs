@@ -246,12 +246,36 @@ fn decode_diff(v: Option<&Value>) -> Vec<DiffLine> {
         .collect()
 }
 
+fn standard_update(kind: &str, update: &Value) -> Option<Value> {
+    match kind {
+        "current_mode_update" => {
+            let mode = update.get("currentModeId").and_then(Value::as_str)?;
+            Some(json!({"type": "mode_changed", "mode": mode}))
+        }
+        "config_option_update" => {
+            let options = update.get("configOptions").and_then(Value::as_array)?;
+            let current = |id: &str| {
+                options
+                    .iter()
+                    .find(|o| o.get("id").and_then(Value::as_str) == Some(id))
+                    .and_then(|o| o.get("currentValue"))
+            };
+            Some(json!({
+                "type": "config_options",
+                "plan": current("plan").and_then(Value::as_bool),
+                "effort": current("effort").and_then(Value::as_str),
+            }))
+        }
+        _ => None,
+    }
+}
+
 fn decode(msg: &Value) -> Option<ServerMsg> {
     match msg.get("method").and_then(Value::as_str) {
         Some("session/update") => {
             let update = msg.pointer("/params/update")?;
-            if update.get("sessionUpdate").is_some() {
-                return None;
+            if let Some(kind) = update.get("sessionUpdate").and_then(Value::as_str) {
+                return standard_update(kind, update).map(ServerMsg::Update);
             }
             Some(ServerMsg::Update(update.clone()))
         }
@@ -372,6 +396,8 @@ pub fn translate(
             }
             if let Some(pos) = model_ids.iter().position(|&p| p == id) {
                 model_ids.remove(pos);
+                let result =
+                    result.map(|v| v.pointer("/_meta/hotl.dev~1model").cloned().unwrap_or(v));
                 return Some(Msg::ModelAck { result });
             }
             if let Some(pos) = remember_ids.iter().position(|&p| p == id) {
@@ -457,25 +483,34 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
         }
         Cmd::SetMode(mode) => {
             client
-                .request("session/set_mode", json!({"mode": mode}))
+                .request("session/set_mode", json!({"modeId": mode}))
                 .await?;
         }
         Cmd::SetPlan(plan) => {
             client
-                .request("session/set_plan", json!({"plan": plan}))
+                .request(
+                    "session/set_config_option",
+                    json!({"configId": "plan", "type": "boolean", "value": plan}),
+                )
                 .await?;
         }
         Cmd::SetEffort(effort) => {
             let wire = effort.as_deref().unwrap_or("default");
             client
-                .request("session/set_effort", json!({"effort": wire}))
+                .request(
+                    "session/set_config_option",
+                    json!({"configId": "effort", "value": wire}),
+                )
                 .await?;
         }
         // The ack is read (0067): queued-or-applied, warnings, or a refusal.
         Cmd::SetModel(spec) => {
             model_ids.push_back(
                 client
-                    .request("session/set_model", json!({"model": spec}))
+                    .request(
+                        "session/set_config_option",
+                        json!({"configId": "model", "value": spec}),
+                    )
                     .await?,
             );
         }
@@ -779,6 +814,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decode(&msg), None);
+    }
+
+    #[test]
+    fn the_mode_and_option_updates_decode_into_the_old_kinds() {
+        let mode: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"current_mode_update","currentModeId":"bypass"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decode(&mode),
+            Some(ServerMsg::Update(
+                json!({"type": "mode_changed", "mode": "bypass"})
+            ))
+        );
+        let options: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"config_option_update","configOptions":[
+                {"id":"model","type":"select","currentValue":"m","options":[]},
+                {"id":"effort","type":"select","currentValue":"max","options":[]},
+                {"id":"plan","type":"boolean","currentValue":true}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decode(&options),
+            Some(ServerMsg::Update(
+                json!({"type": "config_options", "plan": true, "effort": "max"})
+            ))
+        );
+    }
+
+    #[test]
+    fn the_model_ack_reads_the_extension_meta() {
+        let result = json!({"configOptions": [], "_meta": {"hotl.dev/model": {"applied": false, "model": "x"}}});
+        let msg = translate(
+            ServerMsg::Response {
+                id: 5,
+                result: Ok(result),
+            },
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::from([5]),
+            &mut VecDeque::new(),
+        );
+        assert_eq!(
+            msg,
+            Some(Msg::ModelAck {
+                result: Ok(json!({"applied": false, "model": "x"}))
+            })
+        );
     }
 
     #[tokio::test]
