@@ -38,7 +38,11 @@ pub fn prompt_from_blocks(blocks: &[ContentBlock]) -> Result<(String, Vec<UserIm
         }
     }
     let images = crate::images::check_images(&raw_images)?;
-    Ok((lines.join("\n"), images))
+    let text = lines.join("\n");
+    if text.trim().is_empty() && images.is_empty() {
+        return Err("the prompt is empty; send at least one text, image or resource block".into());
+    }
+    Ok((text, images))
 }
 
 fn fenced(uri: &str, text: &str) -> String {
@@ -816,6 +820,13 @@ mod tests {
         ])))
         .unwrap_err();
         assert!(err.contains("prompt[0]"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_prompt_is_refused() {
+        assert!(prompt_from_blocks(&[]).is_err());
+        let err = prompt_from_blocks(&blocks(json!([{"type": "text", "text": "  "}]))).unwrap_err();
+        assert!(err.contains("empty"), "{err}");
     }
 
     #[test]

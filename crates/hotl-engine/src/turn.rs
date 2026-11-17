@@ -1388,6 +1388,9 @@ impl Turn {
             prune_unsigned_trailing_thinking(&mut blocks);
         }
         self.last_usage = usage;
+        self.shared.meter.set_context_tokens(
+            usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens,
+        );
         self.usage += usage;
         // Session spend, and the one-per-threshold notice it may cross
         // (0059 T5). Priced at the model this sample actually used.

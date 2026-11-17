@@ -5141,7 +5141,7 @@ async fn next_matching_raw(
 
 type Script = Vec<Result<hotl_provider::StreamEvent, hotl_provider::ProviderError>>;
 
-fn provider_factory(provider: Arc<ScriptedProvider>) -> acp::SessionFactory {
+fn provider_factory(provider: Arc<ScriptedProvider>, model: &'static str) -> acp::SessionFactory {
     Box::new(move |_spec| {
         let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
@@ -5168,6 +5168,7 @@ fn provider_factory(provider: Arc<ScriptedProvider>) -> acp::SessionFactory {
                 plan_files: None,
                 initial_goal: None,
                 config: EngineConfig {
+                    model: model.into(),
                     max_turns: 6,
                     ..Default::default()
                 },
@@ -5199,8 +5200,21 @@ async fn open_with(
     impl AsyncWriteExt + Unpin,
     tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
 ) {
+    open_with_model(scripts, init, "m").await
+}
+
+async fn open_with_model(
+    scripts: Vec<Script>,
+    init: Value,
+    model: &'static str,
+) -> (
+    Arc<ScriptedProvider>,
+    String,
+    impl AsyncWriteExt + Unpin,
+    tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
+) {
     let provider = Arc::new(ScriptedProvider::new(scripts));
-    let (mut w, mut lines) = connect_caps(provider_factory(provider.clone()), init).await;
+    let (mut w, mut lines) = connect_caps(provider_factory(provider.clone(), model), init).await;
     send(
         &mut w,
         json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
@@ -5386,8 +5400,15 @@ async fn cancel_denies_an_open_permission_request() {
         json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId": sid}}),
     )
     .await;
-    let (_, reply) = frames_through_reply(&mut lines, 3).await;
+    let (before, reply) = frames_through_reply(&mut lines, 3).await;
     assert_eq!(reply["result"]["stopReason"], "cancelled", "{reply}");
+    assert!(
+        before
+            .iter()
+            .any(|m| m["params"]["update"]["type"] == "tool_denied"
+                && m["params"]["update"]["id"] == "t1"),
+        "the parked ask resolved as a denial before the reply: {before:?}"
+    );
     send(
         &mut w,
         json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"allow":true}}),
@@ -5543,4 +5564,281 @@ async fn an_error_outcome_is_a_32603_carrying_the_outcome() {
         reply["error"]["data"]["_meta"]["hotl.dev/turn"]["usage"].is_object(),
         "{reply}"
     );
+}
+
+fn with_input(mut script: Script, input_tokens: u64) -> Script {
+    for event in script.iter_mut() {
+        if let Ok(hotl_provider::StreamEvent::Completed { usage, .. }) = event {
+            usage.input_tokens = input_tokens;
+        }
+    }
+    script
+}
+
+async fn answer_through_reply(
+    w: &mut (impl AsyncWriteExt + Unpin),
+    lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
+    id: u64,
+) -> (Vec<Value>, Value) {
+    let mut before = Vec::new();
+    loop {
+        let m = next_raw(lines).await;
+        if m["id"] == json!(id) && m.get("method").is_none() {
+            return (before, m);
+        }
+        if m["method"] == "session/request_permission" {
+            send(
+                w,
+                json!({"jsonrpc":"2.0","id":m["id"].clone(),"result":{"allow":true}}),
+            )
+            .await;
+        }
+        before.push(m);
+    }
+}
+
+fn last_usage_update(frames: &[Value]) -> Value {
+    frames
+        .iter()
+        .rev()
+        .find(|m| m["params"]["update"]["sessionUpdate"] == "usage_update")
+        .map(|m| m["params"]["update"].clone())
+        .expect("a usage_update")
+}
+
+#[tokio::test]
+async fn usage_update_counts_the_context_in_use_not_the_turn_sum() {
+    let (_provider, sid, mut w, mut lines) = open_with(
+        vec![
+            with_input(
+                ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
+                1000,
+            ),
+            with_input(ScriptedProvider::text_reply("done"), 1200),
+        ],
+        init_params(),
+    )
+    .await;
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "go"}])),
+    )
+    .await;
+    let (before, reply) = answer_through_reply(&mut w, &mut lines, 3).await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+    assert_eq!(last_usage_update(&before)["used"], 1200);
+}
+
+#[tokio::test]
+async fn usage_update_cost_is_the_session_total() {
+    let (_provider, sid, mut w, mut lines) = open_with_model(
+        vec![
+            ScriptedProvider::text_reply("one"),
+            ScriptedProvider::text_reply("two"),
+        ],
+        init_params(),
+        "claude-opus-5",
+    )
+    .await;
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "a"}])),
+    )
+    .await;
+    let (first, _) = answer_through_reply(&mut w, &mut lines, 3).await;
+    send(
+        &mut w,
+        prompt_msg(4, &sid, json!([{"type": "text", "text": "b"}])),
+    )
+    .await;
+    let (second, _) = answer_through_reply(&mut w, &mut lines, 4).await;
+    let cost = |frames: &[Value]| {
+        last_usage_update(frames)["cost"]["amount"]
+            .as_f64()
+            .expect("a priced model has a cost")
+    };
+    let (one, two) = (cost(&first), cost(&second));
+    assert!(one > 0.0);
+    assert!(
+        (two - 2.0 * one).abs() < 1e-6,
+        "the second turn reports the session total: {one} then {two}"
+    );
+    assert_eq!(last_usage_update(&second)["cost"]["currency"], "USD");
+}
+
+#[tokio::test]
+async fn notifications_get_no_reply() {
+    let (_provider, _sid, mut w, mut lines) =
+        open_with(vec![ScriptedProvider::text_reply("ok")], init_params()).await;
+    for note in [
+        json!({"jsonrpc":"2.0","method":"bogus/thing"}),
+        json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":3}}),
+        json!({"jsonrpc":"2.0","method":"_hotl/whatever","params":{}}),
+        json!({"jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"type":"text","text":"x"}]}}),
+    ] {
+        send(&mut w, note).await;
+    }
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":9,"method":"bogus/method"}),
+    )
+    .await;
+    let (before, reply) = frames_through_reply(&mut lines, 9).await;
+    assert_eq!(reply["error"]["code"], -32601, "{reply}");
+    assert!(
+        before
+            .iter()
+            .all(|m| m.get("result").is_none() && m.get("error").is_none()),
+        "a notification got an answer: {before:?}"
+    );
+}
+
+fn hanging() -> Script {
+    ScriptedProvider::hang_after(ScriptedProvider::partial_text("working"))
+}
+
+#[tokio::test]
+async fn cancel_also_answers_the_queued_prompts_and_runs_none_of_them() {
+    let (provider, sid, mut w, mut lines) = open_with(
+        vec![
+            hanging(),
+            ScriptedProvider::text_reply("should not run"),
+            ScriptedProvider::text_reply("should not run either"),
+        ],
+        init_params(),
+    )
+    .await;
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "a"}])),
+    )
+    .await;
+    wait_for_text(&mut lines).await;
+    send(
+        &mut w,
+        prompt_msg(4, &sid, json!([{"type": "text", "text": "b"}])),
+    )
+    .await;
+    send(
+        &mut w,
+        prompt_msg(5, &sid, json!([{"type": "text", "text": "c"}])),
+    )
+    .await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId": sid}}),
+    )
+    .await;
+    let got = stop_reasons_for(&mut lines, 3..6).await;
+    assert!(got.values().all(|r| r == "cancelled"), "{got:?}");
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":9,"method":"session/rename","params":{"name":"x"}}),
+    )
+    .await;
+    read_until_id(&mut lines, 9).await;
+    assert_eq!(provider.request_count(), 1, "no queued prompt ran");
+}
+
+#[tokio::test]
+async fn a_full_prompt_queue_refuses_instead_of_folding() {
+    let (_provider, sid, mut w, mut lines) = open_with(vec![hanging()], init_params()).await;
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "a"}])),
+    )
+    .await;
+    wait_for_text(&mut lines).await;
+    let last = 4 + acp::PROMPT_QUEUE_MAX as u64;
+    for id in 4..=last {
+        send(
+            &mut w,
+            prompt_msg(id, &sid, json!([{"type": "text", "text": "more"}])),
+        )
+        .await;
+    }
+    let refused = read_until_id(&mut lines, last).await;
+    assert_eq!(refused["error"]["code"], -32603, "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("too many queued prompts"),
+        "{refused}"
+    );
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId": sid}}),
+    )
+    .await;
+    let got = stop_reasons_for(&mut lines, 3..last).await;
+    assert!(got.values().all(|r| r == "cancelled"), "{got:?}");
+}
+
+#[tokio::test]
+async fn a_foreign_session_id_is_32002_and_its_cancel_is_ignored() {
+    let (_provider, sid, mut w, mut lines) = open_with(vec![hanging()], init_params()).await;
+    send(
+        &mut w,
+        prompt_msg(3, "no-such-session", json!([{"type": "text", "text": "a"}])),
+    )
+    .await;
+    let reply = read_until_id(&mut lines, 3).await;
+    assert_eq!(reply["error"]["code"], -32002, "{reply}");
+    send(
+        &mut w,
+        prompt_msg(4, &sid, json!([{"type": "text", "text": "a"}])),
+    )
+    .await;
+    wait_for_text(&mut lines).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId": "no-such-session"}}),
+    )
+    .await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":9,"method":"session/rename","params":{"name":"x"}}),
+    )
+    .await;
+    let (before, _) = frames_through_reply(&mut lines, 9).await;
+    assert!(
+        before.iter().all(|m| m["id"] != json!(4)),
+        "a cancel for another session stopped this one: {before:?}"
+    );
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId": sid}}),
+    )
+    .await;
+    let reply = read_until_id(&mut lines, 4).await;
+    assert_eq!(reply["result"]["stopReason"], "cancelled", "{reply}");
+}
+
+#[tokio::test]
+async fn an_empty_prompt_is_32602() {
+    let (provider, sid, mut w, mut lines) =
+        open_with(vec![ScriptedProvider::text_reply("x")], init_params()).await;
+    for (id, blocks) in [(3, json!([])), (4, json!([{"type": "text", "text": ""}]))] {
+        send(&mut w, prompt_msg(id, &sid, blocks)).await;
+        let reply = read_until_id(&mut lines, id).await;
+        assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    }
+    assert_eq!(provider.request_count(), 0);
+}
+
+async fn stop_reasons_for(
+    lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
+    ids: std::ops::Range<u64>,
+) -> std::collections::BTreeMap<u64, Value> {
+    let mut got = std::collections::BTreeMap::new();
+    while got.len() < ids.end.saturating_sub(ids.start) as usize {
+        let m = next_raw(lines).await;
+        if let Some(id) = m["id"].as_u64() {
+            if ids.contains(&id) && m.get("method").is_none() {
+                got.insert(id, m["result"]["stopReason"].clone());
+            }
+        }
+    }
+    got
 }

@@ -677,7 +677,7 @@ pub(crate) struct SharedDeps {
     /// Session spend in micro-dollars, against `config.max_cost_usd`.
     /// Integer so the running total is an atomic; the price of one turn is
     /// far above a millionth of a dollar, so nothing meaningful rounds away.
-    spend_micros: AtomicU64,
+    pub(crate) meter: crate::Meter,
     /// Which budget thresholds have already been announced (bit 0 = 50%,
     /// 1 = 80%, 2 = 100%), so each fires once per session.
     budget_notices: AtomicU8,
@@ -808,7 +808,6 @@ impl SharedDeps {
         let effort = AtomicU8::new(effort_to_u8(deps.config.effort));
         let effort_pinned = AtomicBool::new(false);
         let tool_calls = AtomicU64::new(0);
-        let spend_micros = AtomicU64::new(0);
         let budget_notices = AtomicU8::new(0);
         let keepalive_rejected = Arc::new(AtomicBool::new(false));
         let last_batch_verified = AtomicBool::new(false);
@@ -852,7 +851,7 @@ impl SharedDeps {
             effort,
             effort_pinned,
             tool_calls,
-            spend_micros,
+            meter: crate::Meter::default(),
             budget_notices,
             keepalive_rejected,
             last_batch_verified,
@@ -1045,15 +1044,14 @@ impl SharedDeps {
 
     /// Session spend so far, in USD.
     pub(crate) fn spent_usd(&self) -> f64 {
-        self.spend_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0
+        self.meter.spent_usd()
     }
 
     /// Fold one sample's cost into the session total and report any spend
     /// threshold it just crossed. Each threshold is announced once.
     pub(crate) fn add_spend(&self, usd: f64) -> Option<u8> {
         if usd > 0.0 {
-            self.spend_micros
-                .fetch_add((usd * 1_000_000.0) as u64, Ordering::Relaxed);
+            self.meter.add_spend_micros((usd * 1_000_000.0) as u64);
         }
         let cap = self.config.max_cost_usd;
         if cap <= 0.0 {
@@ -1225,6 +1223,7 @@ impl SharedDeps {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     mut deps: SessionDeps,
     mut cmd_rx: mpsc::Receiver<SessionCmd>,
@@ -1233,6 +1232,7 @@ pub(crate) async fn run(
     current_turn: Arc<Mutex<CancellationToken>>,
     notifications: crate::hooks::NotificationDrain,
     head_tx: tokio::sync::watch::Sender<Arc<ProjectionHead>>,
+    meter: crate::Meter,
 ) {
     // Resumed history is repaired on the way in, both for a steer that landed
     // mid-batch (`pair_tool_results`) and for a crash that persisted an
@@ -1337,7 +1337,8 @@ pub(crate) async fn run(
     let children = Arc::new(hotl_tools::children::Children::new(
         deps.config.max_children,
     ));
-    let (shared, mut log) = SharedDeps::new(deps, notifications, head_rx, jobs, children);
+    let (mut shared, mut log) = SharedDeps::new(deps, notifications, head_rx, jobs, children);
+    shared.meter = meter;
     let shared = Arc::new(shared);
     // Usage carried across compaction respawns within one logical turn.
     let mut carry_usage = TokenUsage::default();

@@ -1454,7 +1454,44 @@ impl TurnCancel {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct Meter(Arc<MeterCounts>);
+
+#[derive(Debug, Default)]
+struct MeterCounts {
+    spend_micros: std::sync::atomic::AtomicU64,
+    context_tokens: std::sync::atomic::AtomicU64,
+}
+
+impl Meter {
+    pub fn spent_usd(&self) -> f64 {
+        self.0
+            .spend_micros
+            .load(std::sync::atomic::Ordering::Relaxed) as f64
+            / 1_000_000.0
+    }
+
+    pub fn context_tokens(&self) -> u64 {
+        self.0
+            .context_tokens
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn add_spend_micros(&self, micros: u64) {
+        self.0
+            .spend_micros
+            .fetch_add(micros, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_context_tokens(&self, tokens: u64) {
+        self.0
+            .context_tokens
+            .store(tokens, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub struct SessionHandle {
+    meter: Meter,
     cmd: mpsc::Sender<SessionCmd>,
     pub events: mpsc::Receiver<EngineEvent>,
     current_turn: Arc<Mutex<CancellationToken>>,
@@ -1481,6 +1518,10 @@ impl SessionHandle {
     /// session from this one's history.
     pub fn head(&self) -> tokio::sync::watch::Receiver<Arc<ProjectionHead>> {
         self.head.clone()
+    }
+
+    pub fn meter(&self) -> Meter {
+        self.meter.clone()
     }
 
     pub async fn prompt(&self, text: String) {
@@ -1845,6 +1886,7 @@ pub fn spawn_session_with_channels(
     // `SessionHandle::head` can hand it out immediately: the actor takes the
     // `Sender` and never gives it up.
     let (head_tx, head_rx) = actor::head_channel();
+    let meter = Meter::default();
     // The actor gets only a weak sender: strong senders are the handle and
     // any in-flight turn task, so dropping the handle lets the command
     // channel close and the actor task exit instead of leaking.
@@ -1856,8 +1898,10 @@ pub fn spawn_session_with_channels(
         current_turn.clone(),
         notifications.clone(),
         head_tx,
+        meter.clone(),
     ));
     SessionHandle {
+        meter,
         cmd: cmd_tx,
         events: event_rx,
         current_turn,

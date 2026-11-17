@@ -21,14 +21,14 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::acp_ext::codes;
 use crate::acp_types::{
-    AgentCapabilities, AuthMethod, AuthenticateRequest, CloseSessionRequest, ConfigOptionUpdate,
-    Cost, CurrentModeUpdate, ErrorObject, Implementation, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse, Notice, NoticeSeverity,
-    PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
-    SessionCapabilities, SessionInfo, SessionInfoUpdate, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    UsageUpdate,
+    AgentCapabilities, AuthMethod, AuthenticateRequest, CancelNotification, CloseSessionRequest,
+    ConfigOptionUpdate, Cost, CurrentModeUpdate, ErrorObject, Implementation, InitializeRequest,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    LoadSessionResponse, McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse, Notice,
+    NoticeSeverity, PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest,
+    ResumeSessionResponse, SessionCapabilities, SessionInfo, SessionInfoUpdate,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, UsageUpdate,
 };
 
 /// Stable schema version of `session/update` / prompt-result payloads (an MD
@@ -158,7 +158,28 @@ fn question_answer_from_result(result: Option<&Value>) -> hotl_types::QuestionAn
 
 /// JSON-RPC ids of in-flight prompt requests, answered in order on TurnDone
 /// (the engine queues overlapping prompts and finishes them FIFO).
-type PendingPrompt = Arc<std::sync::Mutex<VecDeque<Value>>>;
+type PendingPrompt = Arc<std::sync::Mutex<PromptQueue>>;
+
+pub const PROMPT_QUEUE_MAX: usize = 64;
+
+#[derive(Default)]
+struct PromptQueue {
+    running: VecDeque<Value>,
+    waiting: VecDeque<WaitingPrompt>,
+    cancelled: bool,
+}
+
+struct WaitingPrompt {
+    id: Value,
+    text: String,
+    images: Vec<hotl_types::UserImage>,
+}
+
+fn lock_prompts(queue: &PendingPrompt) -> std::sync::MutexGuard<'_, PromptQueue> {
+    queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// How much of a forked-from session's projection the fork keeps.
 ///
@@ -445,7 +466,7 @@ pub async fn serve(
     let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let pending_questions: PendingQuestions = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let pending_egress: PendingEgress = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let pending_prompt: PendingPrompt = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+    let pending_prompt: PendingPrompt = PendingPrompt::default();
     let mut next_id: u64 = 1;
     let mut session: Option<SessionState> = None;
 
@@ -479,6 +500,11 @@ pub async fn serve(
                     let _ = reply.send(ask_reply_from_result(msg.get("result")));
                 }
             }
+            continue;
+        }
+        if msg.get("id").is_none()
+            && msg.get("method").and_then(Value::as_str) != Some("session/cancel")
+        {
             continue;
         }
         handle_request(
@@ -877,6 +903,18 @@ async fn handle_request(
                         .await
                     }
                 };
+            if request.session_id.as_ref().is_some_and(|s| *s != state.id) {
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    &format!(
+                        "unknown session `{}`",
+                        request.session_id.unwrap_or_default()
+                    ),
+                )
+                .await;
+            }
             let (text, images) = match crate::acp_map::prompt_from_blocks(&request.prompt) {
                 Ok(v) => v,
                 Err(e) => {
@@ -889,11 +927,37 @@ async fn handle_request(
                     .await
                 }
             };
-            pending_prompt
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push_back(id);
-            state.handle.prompt_with(text, images).await;
+            let start = {
+                let mut queue = lock_prompts(pending_prompt);
+                if queue.running.is_empty() {
+                    queue.running.push_back(id.clone());
+                    Some(true)
+                } else if queue.waiting.len() >= PROMPT_QUEUE_MAX {
+                    Some(false)
+                } else {
+                    queue.waiting.push_back(WaitingPrompt {
+                        id: id.clone(),
+                        text: text.clone(),
+                        images: images.clone(),
+                    });
+                    None
+                }
+            };
+            match start {
+                Some(true) => state.handle.prompt_with(text, images).await,
+                Some(false) => {
+                    reply_err(
+                        writer,
+                        id,
+                        codes::INTERNAL,
+                        &format!(
+                            "too many queued prompts (the limit is {PROMPT_QUEUE_MAX}); wait for a turn to end"
+                        ),
+                    )
+                    .await
+                }
+                None => {}
+            }
         }
         "session/rename" => {
             let Some(state) = session.as_ref() else {
@@ -1374,9 +1438,22 @@ async fn handle_request(
             }
         }
         "session/cancel" => {
-            if let Some(state) = session.as_ref() {
-                state.handle.interrupt();
+            let request: CancelNotification = msg
+                .get("params")
+                .and_then(|p| serde_json::from_value(p.clone()).ok())
+                .unwrap_or_default();
+            let Some(state) = session.as_ref() else {
+                return;
+            };
+            if request.session_id.is_some_and(|s| s != state.id) {
+                return;
             }
+            let dropped: Vec<Value> = {
+                let mut queue = lock_prompts(pending_prompt);
+                queue.cancelled = !queue.running.is_empty();
+                queue.waiting.drain(..).map(|w| w.id).collect()
+            };
+            state.handle.interrupt();
             for (_, reply) in pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1397,6 +1474,17 @@ async fn handle_request(
                 .drain()
             {
                 let _ = reply.send(hotl_tools::net::EgressDecision::NoAnswer);
+            }
+            for prompt_id in dropped {
+                reply_ok(
+                    writer,
+                    prompt_id,
+                    to_json(&PromptResponse {
+                        stop_reason: crate::acp_types::StopReason::Cancelled,
+                        meta: None,
+                    }),
+                )
+                .await;
             }
         }
         // Re-read `config.toml` and rebuild the engine behind this connection,
@@ -2105,10 +2193,7 @@ fn retire_session(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
-    pending_prompt
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clear();
+    *lock_prompts(pending_prompt) = PromptQueue::default();
 }
 
 fn lock_config(config: &SharedConfig) -> std::sync::MutexGuard<'_, crate::acp_map::ConfigState> {
@@ -2205,6 +2290,10 @@ fn start_session(
     let events = std::mem::replace(&mut handle.events, mpsc::channel(1).1);
     let sid = id.clone();
     let drain_config = Arc::clone(&config);
+    let link = EngineLink {
+        meter: handle.meter(),
+        commands: handle.commands(),
+    };
     let (go, held) = oneshot::channel::<()>();
     let drain = tokio::spawn(async move {
         if held.await.is_ok() {
@@ -2219,6 +2308,7 @@ fn start_session(
                 req_id_seed,
                 model,
                 drain_config,
+                link,
             )
             .await;
         }
@@ -2234,6 +2324,11 @@ fn start_session(
         go: Some(go),
         _lease: None,
     }
+}
+
+struct EngineLink {
+    meter: hotl_engine::Meter,
+    commands: mpsc::WeakSender<hotl_engine::SessionCmd>,
 }
 
 /// Bounds one coalesced delta line's size; a burst that large is already a
@@ -2256,6 +2351,7 @@ async fn drain_events(
     mut req_id: u64,
     model: String,
     config: SharedConfig,
+    link: EngineLink,
 ) {
     let mut held: Option<EngineEvent> = None;
     loop {
@@ -2463,61 +2559,56 @@ async fn drain_events(
                     let state = lock_config(&config);
                     (state.context_window, state.ext)
                 };
+                let spent = link.meter.spent_usd();
                 send_update(
                     &writer,
                     &session_id,
                     SessionUpdate::UsageUpdate(UsageUpdate {
-                        used: usage.input_tokens
-                            + usage.cache_read_input_tokens
-                            + usage.cache_creation_input_tokens,
+                        used: link.meter.context_tokens(),
                         size,
-                        cost: frame.cost_usd.map(|amount| Cost {
-                            amount,
+                        cost: (spent > 0.0).then(|| Cost {
+                            amount: spent,
                             currency: "USD".into(),
                         }),
                     }),
                 )
                 .await;
-                let prompt_id = pending_prompt
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .pop_front();
-                let Some(id) = prompt_id else {
-                    continue;
+                let (prompt_id, cancelled, next) = {
+                    let mut queue = lock_prompts(&pending_prompt);
+                    let id = queue.running.pop_front();
+                    let cancelled = std::mem::take(&mut queue.cancelled);
+                    let next = match queue.running.is_empty() {
+                        true => queue.waiting.pop_front(),
+                        false => None,
+                    };
+                    if let Some(w) = &next {
+                        queue.running.push_back(w.id.clone());
+                    }
+                    (id, cancelled, next)
                 };
-                let meta = ext.then(|| {
-                    let mut m = serde_json::Map::new();
-                    m.insert(
-                        META_TURN.into(),
-                        to_json(&TurnMeta {
+                if let Some(id) = prompt_id {
+                    reply_turn_end(
+                        &writer,
+                        id,
+                        &outcome,
+                        cancelled,
+                        ext,
+                        TurnMeta {
                             outcome: crate::wire::OutcomeFrame::of(&outcome),
                             usage: frame,
                             mispredictions: misses,
-                        }),
-                    );
-                    m
-                });
-                match crate::acp_map::stop_reason(&outcome) {
-                    Ok(stop_reason) => {
-                        reply_ok(&writer, id, to_json(&PromptResponse { stop_reason, meta })).await
-                    }
-                    Err(mut data) => {
-                        if let (Some(meta), Some(obj)) = (meta, data.as_object_mut()) {
-                            obj.insert("_meta".into(), Value::Object(meta));
-                        }
-                        let message = match &outcome {
-                            Outcome::Error { message } => message.clone(),
-                            _ => "the turn failed".into(),
-                        };
-                        send(
-                            &writer,
-                            &json!({"jsonrpc": "2.0", "id": id, "error": ErrorObject {
-                                code: codes::INTERNAL,
-                                message,
-                                data: Some(data),
-                            }}),
-                        )
-                        .await;
+                        },
+                    )
+                    .await;
+                }
+                if let Some(next) = next {
+                    if let Some(tx) = link.commands.upgrade() {
+                        let _ = tx
+                            .send(hotl_engine::SessionCmd::Prompt {
+                                text: next.text,
+                                images: next.images,
+                            })
+                            .await;
                     }
                 }
             }
@@ -2526,6 +2617,49 @@ async fn drain_events(
                     notify(&writer, &session_id, update).await;
                 }
             }
+        }
+    }
+}
+
+async fn reply_turn_end(
+    writer: &Writer,
+    id: Value,
+    outcome: &Outcome,
+    cancelled: bool,
+    ext: bool,
+    turn: TurnMeta,
+) {
+    let meta = ext.then(|| {
+        let mut m = serde_json::Map::new();
+        m.insert(META_TURN.into(), to_json(&turn));
+        m
+    });
+    let stop = if cancelled {
+        Ok(crate::acp_types::StopReason::Cancelled)
+    } else {
+        crate::acp_map::stop_reason(outcome)
+    };
+    match stop {
+        Ok(stop_reason) => {
+            reply_ok(writer, id, to_json(&PromptResponse { stop_reason, meta })).await
+        }
+        Err(mut data) => {
+            if let (Some(meta), Some(obj)) = (meta, data.as_object_mut()) {
+                obj.insert("_meta".into(), Value::Object(meta));
+            }
+            let message = match outcome {
+                Outcome::Error { message } => message.clone(),
+                _ => "the turn failed".into(),
+            };
+            send(
+                writer,
+                &json!({"jsonrpc": "2.0", "id": id, "error": ErrorObject {
+                    code: codes::INTERNAL,
+                    message,
+                    data: Some(data),
+                }}),
+            )
+            .await;
         }
     }
 }
@@ -2596,6 +2730,13 @@ mod drain_tests {
     /// Run `drain_events` to completion over a pre-closed channel, capturing
     /// every line it writes.
     async fn run_drain_events_capturing_writer(rx: mpsc::Receiver<EngineEvent>) -> Vec<String> {
+        drain_with_queue(rx, PendingPrompt::default()).await
+    }
+
+    async fn drain_with_queue(
+        rx: mpsc::Receiver<EngineEvent>,
+        queue: PendingPrompt,
+    ) -> Vec<String> {
         let (write, mut read) = tokio::io::duplex(1 << 20);
         let writer: Writer = Arc::new(Mutex::new(Box::new(write)));
         drain_events(
@@ -2604,7 +2745,7 @@ mod drain_tests {
             Pending::default(),
             PendingQuestions::default(),
             PendingEgress::default(),
-            PendingPrompt::default(),
+            queue,
             "acp-test".into(),
             0,
             "test-model".into(),
@@ -2616,6 +2757,10 @@ mod drain_tests {
                 ext: false,
                 context_window: 200_000,
             })),
+            EngineLink {
+                meter: hotl_engine::Meter::default(),
+                commands: mpsc::channel(1).0.downgrade(),
+            },
         )
         .await;
         drop(writer); // close the duplex so read_to_string sees EOF
@@ -2630,6 +2775,34 @@ mod drain_tests {
             usage: TokenUsage::default(),
             mispredictions: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn a_turn_cancelled_by_the_client_answers_cancelled_whatever_its_outcome() {
+        let queue = PendingPrompt::default();
+        {
+            let mut q = lock_prompts(&queue);
+            q.running.push_back(json!(7));
+            q.cancelled = true;
+        }
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(EngineEvent::TurnDone {
+            outcome: Outcome::Error {
+                message: "stream aborted".into(),
+            },
+            usage: TokenUsage::default(),
+            mispredictions: 0,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let lines = drain_with_queue(rx, queue.clone()).await;
+        let reply: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(
+            reply,
+            json!({"jsonrpc": "2.0", "id": 7, "result": {"stopReason": "cancelled"}})
+        );
+        assert!(!lock_prompts(&queue).cancelled, "the flag is spent");
     }
 
     /// 0033 Task 2: a burst already sitting in the queue folds into ONE
