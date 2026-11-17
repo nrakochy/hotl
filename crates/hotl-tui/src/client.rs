@@ -308,10 +308,14 @@ fn decode(msg: &Value) -> Option<ServerMsg> {
     match msg.get("method").and_then(Value::as_str) {
         Some("session/update") => {
             let update = msg.pointer("/params/update")?;
-            if let Some(kind) = update.get("sessionUpdate").and_then(Value::as_str) {
-                return standard_update(kind, update).map(ServerMsg::Update);
+            if let Some(frame) = update.pointer("/_meta/hotl.dev~1frame") {
+                return Some(ServerMsg::Update(frame.clone()));
             }
-            Some(ServerMsg::Update(update.clone()))
+            let kind = update.get("sessionUpdate").and_then(Value::as_str)?;
+            standard_update(kind, update).map(ServerMsg::Update)
+        }
+        Some("_hotl/session/update") => {
+            Some(ServerMsg::Update(msg.pointer("/params/update")?.clone()))
         }
         Some("session/request_permission") => Some(ServerMsg::PermissionRequest {
             req_id: msg.get("id").and_then(Value::as_u64)?,
@@ -892,6 +896,35 @@ mod tests {
     }
 
     #[test]
+    fn a_standard_update_with_a_frame_decodes_as_that_frame() {
+        let msg: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"ls","kind":"execute","status":"in_progress","_meta":{"hotl.dev/frame":{"type":"tool_start","id":"t1","name":"bash","summary":"ls"}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decode(&msg),
+            Some(ServerMsg::Update(
+                json!({"type": "tool_start", "id": "t1", "name": "bash", "summary": "ls"})
+            ))
+        );
+        let ext: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"_hotl/session/update","params":{"sessionId":"s","update":{"type":"goal_changed","goal":null}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decode(&ext),
+            Some(ServerMsg::Update(
+                json!({"type": "goal_changed", "goal": null})
+            ))
+        );
+        let old: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"schemaVersion":1,"sessionId":"s","update":{"type":"text_delta","text":"hi"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(decode(&old), None);
+    }
+
+    #[test]
     fn the_mode_and_option_updates_decode_into_the_old_kinds() {
         let mode: Value = serde_json::from_str(
             r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"current_mode_update","currentModeId":"bypass"}}}"#,
@@ -958,7 +991,7 @@ mod tests {
     async fn a_dropped_read_keeps_the_partial_line() {
         let (client, mut server) = tokio::io::duplex(4096);
         let mut r = FrameReader::new(client);
-        let line = r#"{"jsonrpc":"2.0","method":"session/update","params":{"schemaVersion":1,"sessionId":"s","update":{"type":"text_delta","text":"hi"}}}"#;
+        let line = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"},"_meta":{"hotl.dev/frame":{"type":"text_delta","text":"hi"}}}}}"#;
         let (head, tail) = line.split_at(40);
         tokio::io::AsyncWriteExt::write_all(&mut server, head.as_bytes())
             .await
@@ -986,7 +1019,7 @@ mod tests {
     async fn read_decodes_update_permission_and_response() {
         let (client, mut server) = tokio::io::duplex(4096);
         let feed = concat!(
-            r#"{"jsonrpc":"2.0","method":"session/update","params":{"schemaVersion":1,"sessionId":"s","update":{"type":"text_delta","text":"hi"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"_hotl/session/update","params":{"sessionId":"s","update":{"type":"text_delta","text":"hi"}}}"#,
             "\n",
             "this is not json\n",
             r#"{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"s","summary":"run bash","protectedWhy":"prod"}}"#,

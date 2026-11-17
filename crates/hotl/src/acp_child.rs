@@ -621,6 +621,7 @@ async fn run_prompt(
                 ok: false,
                 lines: 0,
                 bytes: 0,
+                output: String::new(),
             })
             .await;
     }
@@ -752,6 +753,7 @@ async fn record_report(shared: &Arc<Shared>, text: &str, path: &Path) {
             id: id.clone(),
             name: "report_result".into(),
             summary,
+            input: Value::Null,
         })
         .await;
     shared
@@ -761,6 +763,7 @@ async fn record_report(shared: &Arc<Shared>, text: &str, path: &Path) {
             ok,
             lines: 0,
             bytes: 0,
+            output: String::new(),
         })
         .await;
 }
@@ -925,6 +928,7 @@ async fn on_update(shared: &Arc<Shared>, u: &Value) {
                     id: id.clone(),
                     name: name.clone(),
                     summary: hotl_types::sanitize::safe_summary(&summary),
+                    input: u.get("rawInput").cloned().unwrap_or(Value::Null),
                 })
                 .await;
             if let Some(ok) = settled(s("status")) {
@@ -954,6 +958,7 @@ async fn on_update(shared: &Arc<Shared>, u: &Value) {
                         id: id.clone(),
                         name: name.clone(),
                         summary: hotl_types::sanitize::safe_summary(&summary),
+                        input: u.get("rawInput").cloned().unwrap_or(Value::Null),
                     })
                     .await;
             }
@@ -1007,6 +1012,7 @@ fn tool_done(id: String, name: String, ok: bool) -> EngineEvent {
         ok,
         lines: 0,
         bytes: 0,
+        output: String::new(),
     }
 }
 
@@ -1530,9 +1536,9 @@ pub(crate) mod tests {
         let tools: Vec<String> = events
             .iter()
             .filter_map(|e| match e {
-                EngineEvent::ToolStart { id, name, summary } => {
-                    Some(format!("start {id} {name} {summary}"))
-                }
+                EngineEvent::ToolStart {
+                    id, name, summary, ..
+                } => Some(format!("start {id} {name} {summary}")),
                 EngineEvent::ToolDone { id, name, ok, .. } => {
                     Some(format!("done {id} {name} {ok}"))
                 }

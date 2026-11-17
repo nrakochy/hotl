@@ -1,16 +1,415 @@
-use hotl_engine::Outcome;
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use hotl_engine::{EngineEvent, Outcome};
 use hotl_types::{Item, SyntheticReason, TodoStatus, UserImage};
 use serde_json::Value;
 
-use crate::acp::{SessionOpen, SessionOpenExtras, WorktreeInfo};
+use crate::acp::{ClientCaps, SessionOpen, SessionOpenExtras, WorktreeInfo};
 use crate::acp_types::{
-    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, Content, ContentBlock,
-    ContentChunk, EmbeddedResource, EmbeddedResourceResource, McpServer, Plan, PlanEntry,
+    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, CompactionStatus,
+    CompactionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
+    EmbeddedResourceResource, McpServer, Meta, Notice, NoticeSeverity, Plan, PlanEntry,
     PlanEntryPriority, PlanEntryStatus, SessionConfigBoolean, SessionConfigKind,
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelect,
-    SessionConfigSelectOption, SessionMode, SessionModeState, SessionUpdate, StopReason, ToolCall,
-    ToolCallContent, ToolCallStatus, ToolKind, UnstructuredCommandInput,
+    SessionConfigSelectOption, SessionInfoUpdate, SessionMode, SessionModeState, SessionUpdate,
+    StopReason, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
+
+pub const META_FRAME: &str = "hotl.dev/frame";
+pub const META_DENIED: &str = "hotl.dev/denied";
+pub const META_AUTO_ALLOWED: &str = "hotl.dev/autoAllowed";
+pub const META_FLAGGED: &str = "hotl.dev/flagged";
+pub const META_CHILD: &str = "hotl.dev/child";
+
+const CHILD_TEXT_MAX: usize = 8 * 1024;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outgoing {
+    Update(SessionUpdate),
+    Ext(Value),
+}
+
+#[derive(Debug, Default)]
+pub struct ToolCalls {
+    root: PathBuf,
+    open: HashMap<String, Value>,
+    child_text: HashMap<String, String>,
+    fold: Option<String>,
+    folds: u64,
+}
+
+impl ToolCalls {
+    pub fn rooted(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            ..Self::default()
+        }
+    }
+}
+
+impl ToolCalls {
+    fn path(&self, input: &Value) -> Option<String> {
+        let path = input.get("path").and_then(Value::as_str)?;
+        Some(self.root.join(path).display().to_string())
+    }
+
+    fn locations(&self, name: &str, input: &Value) -> Option<Vec<ToolCallLocation>> {
+        if !matches!(name, "read" | "edit" | "write" | "grep") {
+            return None;
+        }
+        let line = input
+            .get("offset")
+            .and_then(Value::as_u64)
+            .and_then(|l| u32::try_from(l).ok());
+        Some(vec![ToolCallLocation {
+            path: self.path(input)?,
+            line,
+        }])
+    }
+
+    fn diff(&self, name: &str, input: &Value) -> Option<ToolCallContent> {
+        let text = |key: &str| input.get(key).and_then(Value::as_str).map(str::to_string);
+        let (old_text, new_text) = match name {
+            "edit" => (text("old_string"), text("new_string")?),
+            "write" => (None, text("content")?),
+            _ => return None,
+        };
+        Some(ToolCallContent::Diff(Diff {
+            path: self.path(input)?,
+            old_text,
+            new_text,
+        }))
+    }
+
+    fn touch(
+        &mut self,
+        id: &str,
+        name: &str,
+        fields: ToolCallUpdateFields,
+        meta: Option<Meta>,
+    ) -> SessionUpdate {
+        let settled = matches!(
+            fields.status,
+            Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
+        );
+        let known = self.open.contains_key(id);
+        if settled {
+            self.open.remove(id);
+            self.child_text.remove(id);
+        } else if let Some(input) = &fields.raw_input {
+            self.open.insert(id.to_string(), input.clone());
+        } else {
+            self.open.entry(id.to_string()).or_insert(Value::Null);
+        }
+        if known {
+            return SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                tool_call_id: id.to_string(),
+                fields,
+                meta,
+            });
+        }
+        SessionUpdate::ToolCall(ToolCall {
+            tool_call_id: id.to_string(),
+            title: fields.title.unwrap_or_else(|| name.to_string()),
+            kind: fields.kind.unwrap_or_else(|| tool_kind(name)),
+            status: fields.status.unwrap_or(ToolCallStatus::Pending),
+            content: fields.content.unwrap_or_default(),
+            locations: fields.locations.unwrap_or_default(),
+            raw_input: fields.raw_input,
+            raw_output: fields.raw_output,
+            meta,
+        })
+    }
+
+    fn child_text(&mut self, parent: &str, text: &str) -> Option<SessionUpdate> {
+        if !self.open.contains_key(parent) {
+            return None;
+        }
+        let all = self.child_text.entry(parent.to_string()).or_default();
+        all.push_str(text);
+        if all.len() > CHILD_TEXT_MAX {
+            let mut cut = all.len() - CHILD_TEXT_MAX;
+            while !all.is_char_boundary(cut) {
+                cut += 1;
+            }
+            all.drain(..cut);
+        }
+        Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+            tool_call_id: parent.to_string(),
+            fields: ToolCallUpdateFields {
+                content: Some(vec![text_content(all)]),
+                ..ToolCallUpdateFields::default()
+            },
+            meta: None,
+        }))
+    }
+
+    fn fold_id(&mut self) -> String {
+        self.folds += 1;
+        format!("fold-{}", self.folds)
+    }
+}
+
+fn text_content(text: &str) -> ToolCallContent {
+    ToolCallContent::Content(Content {
+        content: ContentBlock::text(text),
+    })
+}
+
+fn meta_of(key: &str, value: Value) -> Meta {
+    let mut m = Meta::new();
+    m.insert(key.to_string(), value);
+    m
+}
+
+fn notice(severity: NoticeSeverity, title: String, description: String) -> SessionUpdate {
+    SessionUpdate::Notice(Notice {
+        severity,
+        title,
+        description: Some(description),
+        meta: None,
+    })
+}
+
+fn add_meta(update: &mut SessionUpdate, key: &str, value: Value) {
+    let slot = match update {
+        SessionUpdate::UserMessageChunk(c)
+        | SessionUpdate::AgentMessageChunk(c)
+        | SessionUpdate::AgentThoughtChunk(c) => &mut c.meta,
+        SessionUpdate::ToolCall(t) => &mut t.meta,
+        SessionUpdate::ToolCallUpdate(t) => &mut t.meta,
+        SessionUpdate::Plan(p) => &mut p.meta,
+        SessionUpdate::SessionInfoUpdate(i) => &mut i.meta,
+        SessionUpdate::ConfigOptionUpdate(c) => &mut c.meta,
+        SessionUpdate::Notice(n) => &mut n.meta,
+        SessionUpdate::CompactionUpdate(c) => &mut c.meta,
+        SessionUpdate::AvailableCommandsUpdate(_)
+        | SessionUpdate::UsageUpdate(_)
+        | SessionUpdate::CurrentModeUpdate(_) => return,
+    };
+    slot.get_or_insert_with(Meta::new)
+        .insert(key.to_string(), value);
+}
+
+pub fn outgoing(event: &EngineEvent, caps: &ClientCaps, calls: &mut ToolCalls) -> Option<Outgoing> {
+    if matches!(
+        event,
+        EngineEvent::ModelChanged { .. } | EngineEvent::FallbackModel { .. }
+    ) {
+        return None;
+    }
+    let frame = crate::wire::update_frame(event)?;
+    match standard(event, caps, calls) {
+        Some(mut update) => {
+            if caps.ext {
+                add_meta(&mut update, META_FRAME, frame);
+            }
+            Some(Outgoing::Update(update))
+        }
+        None => caps.ext.then_some(Outgoing::Ext(frame)),
+    }
+}
+
+fn standard(
+    event: &EngineEvent,
+    caps: &ClientCaps,
+    calls: &mut ToolCalls,
+) -> Option<SessionUpdate> {
+    let ext_meta = |key: &str, value: Value| caps.ext.then(|| meta_of(key, value));
+    Some(match event {
+        EngineEvent::TextDelta(t) => SessionUpdate::AgentMessageChunk(chunk(t)),
+        EngineEvent::ThinkingDelta(t) => SessionUpdate::AgentThoughtChunk(chunk(t)),
+        EngineEvent::ToolQueued {
+            id, name, summary, ..
+        } => calls.touch(
+            id,
+            name,
+            ToolCallUpdateFields {
+                status: Some(ToolCallStatus::Pending),
+                title: Some(summary.clone()),
+                kind: Some(tool_kind(name)),
+                ..ToolCallUpdateFields::default()
+            },
+            None,
+        ),
+        EngineEvent::ToolStart {
+            id,
+            name,
+            summary,
+            input,
+        } => {
+            let locations = calls.locations(name, input);
+            calls.touch(
+                id,
+                name,
+                ToolCallUpdateFields {
+                    kind: Some(tool_kind(name)),
+                    status: Some(ToolCallStatus::InProgress),
+                    title: Some(summary.clone()),
+                    locations,
+                    raw_input: Some(input.clone()),
+                    ..ToolCallUpdateFields::default()
+                },
+                None,
+            )
+        }
+        EngineEvent::ToolProgress { id, name, tail, .. } => {
+            if !calls.open.contains_key(id) {
+                return None;
+            }
+            calls.touch(
+                id,
+                name,
+                ToolCallUpdateFields {
+                    content: Some(vec![text_content(tail)]),
+                    ..ToolCallUpdateFields::default()
+                },
+                None,
+            )
+        }
+        EngineEvent::ToolDone {
+            id,
+            name,
+            ok,
+            output,
+            ..
+        } => {
+            let diff = match (ok, calls.open.get(id)) {
+                (true, Some(input)) => calls.diff(name, input),
+                _ => None,
+            };
+            calls.touch(
+                id,
+                name,
+                ToolCallUpdateFields {
+                    status: Some(if *ok {
+                        ToolCallStatus::Completed
+                    } else {
+                        ToolCallStatus::Failed
+                    }),
+                    content: diff.map(|d| vec![d]),
+                    raw_output: Some(Value::String(output.clone())),
+                    ..ToolCallUpdateFields::default()
+                },
+                None,
+            )
+        }
+        EngineEvent::ToolDenied { id, name } => calls.touch(
+            id,
+            name,
+            ToolCallUpdateFields {
+                status: Some(ToolCallStatus::Failed),
+                ..ToolCallUpdateFields::default()
+            },
+            ext_meta(META_DENIED, Value::Bool(true)),
+        ),
+        EngineEvent::ToolAutoAllowed { id, name, rule } => {
+            let meta = ext_meta(META_AUTO_ALLOWED, Value::String(rule.clone()))?;
+            calls.touch(id, name, ToolCallUpdateFields::default(), Some(meta))
+        }
+        EngineEvent::ToolFlagged {
+            id,
+            name,
+            summary,
+            why,
+            denied,
+        } => {
+            let meta = ext_meta(
+                META_FLAGGED,
+                serde_json::json!({"why": why, "denied": denied}),
+            )?;
+            calls.touch(
+                id,
+                name,
+                ToolCallUpdateFields {
+                    status: denied.then_some(ToolCallStatus::Failed),
+                    title: Some(summary.clone()),
+                    ..ToolCallUpdateFields::default()
+                },
+                Some(meta),
+            )
+        }
+        EngineEvent::ChildText { parent_id, text } => calls.child_text(parent_id, text)?,
+        EngineEvent::ChildTool { parent_id, .. } => {
+            if !calls.open.contains_key(parent_id) {
+                return None;
+            }
+            let meta = ext_meta(META_CHILD, crate::wire::update_frame(event)?)?;
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                tool_call_id: parent_id.clone(),
+                fields: ToolCallUpdateFields::default(),
+                meta: Some(meta),
+            })
+        }
+        EngineEvent::TodosChanged { items } => SessionUpdate::Plan(plan_of(items)),
+        EngineEvent::SessionTitled { title, .. } => {
+            SessionUpdate::SessionInfoUpdate(SessionInfoUpdate {
+                title: Some(title.clone()?),
+                updated_at: None,
+                meta: None,
+            })
+        }
+        EngineEvent::Compacting { .. } if caps.compaction => {
+            let id = calls.fold_id();
+            calls.fold = Some(id.clone());
+            SessionUpdate::CompactionUpdate(CompactionUpdate {
+                compaction_id: id,
+                status: CompactionStatus::InProgress,
+                error: None,
+                meta: None,
+            })
+        }
+        EngineEvent::Compacted { .. } if caps.compaction => {
+            let id = match calls.fold.take() {
+                Some(id) => id,
+                None => calls.fold_id(),
+            };
+            SessionUpdate::CompactionUpdate(CompactionUpdate {
+                compaction_id: id,
+                status: CompactionStatus::Completed,
+                error: None,
+                meta: None,
+            })
+        }
+        EngineEvent::Retrying {
+            attempt,
+            max,
+            reason,
+            delay_ms,
+            ..
+        } if caps.notices => notice(
+            NoticeSeverity::Warning,
+            format!("Retrying ({attempt}/{max})"),
+            format!("{reason}; next try in {:.1}s", *delay_ms as f64 / 1000.0),
+        ),
+        EngineEvent::BudgetNotice {
+            pct,
+            used_usd,
+            cap_usd,
+        } if caps.notices => notice(
+            if *pct >= 100 {
+                NoticeSeverity::Error
+            } else {
+                NoticeSeverity::Warning
+            },
+            format!("Spend is at {pct}% of the session budget"),
+            format!("${used_usd:.2} of ${cap_usd:.2}"),
+        ),
+        EngineEvent::FoldSkipped { reason } if caps.notices => notice(
+            NoticeSeverity::Info,
+            "Nothing was folded".into(),
+            reason.clone(),
+        ),
+        EngineEvent::AsideFailed { question, reason } if caps.notices => notice(
+            NoticeSeverity::Warning,
+            "The side question failed".into(),
+            format!("{question}: {reason}"),
+        ),
+        _ => return None,
+    })
+}
 
 pub fn prompt_from_blocks(blocks: &[ContentBlock]) -> Result<(String, Vec<UserImage>), String> {
     let mut lines: Vec<String> = Vec::new();
@@ -107,11 +506,11 @@ pub fn stop_reason(outcome: &Outcome) -> Result<StopReason, Value> {
 pub fn tool_kind(name: &str) -> ToolKind {
     match name {
         "read" => ToolKind::Read,
-        "edit" | "write" | "multi_edit" => ToolKind::Edit,
-        "bash" | "bash_output" => ToolKind::Execute,
-        "grep" | "glob" | "ls" | "search" => ToolKind::Search,
+        "edit" | "write" => ToolKind::Edit,
+        "bash" => ToolKind::Execute,
+        "grep" | "glob" | "recall" => ToolKind::Search,
         "web_fetch" | "web_search" => ToolKind::Fetch,
-        "todo_write" | "plan" => ToolKind::Think,
+        "todo_write" | "present_plan" => ToolKind::Think,
         _ => ToolKind::Other,
     }
 }
@@ -135,13 +534,17 @@ fn tool_call(tool: OpenTool, status: ToolCallStatus, output: Option<&str>) -> Se
                 })]
             })
             .unwrap_or_default(),
+        locations: Vec::new(),
         raw_input: Some(tool.input),
+        raw_output: None,
+        meta: None,
     })
 }
 
 fn chunk(text: &str) -> ContentChunk {
     ContentChunk {
         content: ContentBlock::text(text),
+        meta: None,
     }
 }
 
@@ -353,6 +756,7 @@ pub fn plan_of(todos: &[hotl_types::Todo]) -> Plan {
                 },
             })
             .collect(),
+        meta: None,
     }
 }
 
@@ -584,17 +988,6 @@ mod tests {
                 ("bypass", "Bypass")
             ]
         );
-    }
-
-    #[test]
-    fn tool_kinds_follow_the_plan_mapping() {
-        assert_eq!(tool_kind("read"), ToolKind::Read);
-        assert_eq!(tool_kind("multi_edit"), ToolKind::Edit);
-        assert_eq!(tool_kind("bash"), ToolKind::Execute);
-        assert_eq!(tool_kind("glob"), ToolKind::Search);
-        assert_eq!(tool_kind("web_fetch"), ToolKind::Fetch);
-        assert_eq!(tool_kind("todo_write"), ToolKind::Think);
-        assert_eq!(tool_kind("mcp__x__y"), ToolKind::Other);
     }
 
     #[test]
@@ -841,5 +1234,713 @@ mod tests {
         ])))
         .unwrap_err();
         assert!(blob.contains("binary"), "{blob}");
+    }
+
+    fn plain() -> ClientCaps {
+        ClientCaps::default()
+    }
+
+    fn opted_in() -> ClientCaps {
+        ClientCaps {
+            ext: true,
+            ..ClientCaps::default()
+        }
+    }
+
+    fn root() -> PathBuf {
+        std::env::temp_dir().join("acp-map-root")
+    }
+
+    fn at(rel: &str) -> String {
+        root().join(rel).display().to_string()
+    }
+
+    fn update_json(out: Option<Outgoing>) -> Value {
+        match out {
+            Some(Outgoing::Update(u)) => serde_json::to_value(u).unwrap(),
+            other => panic!("expected a standard update, got {other:?}"),
+        }
+    }
+
+    fn start(id: &str, name: &str, input: Value) -> EngineEvent {
+        EngineEvent::ToolStart {
+            id: id.into(),
+            name: name.into(),
+            summary: format!("{name} call"),
+            input,
+        }
+    }
+
+    fn done(id: &str, name: &str, ok: bool, output: &str) -> EngineEvent {
+        EngineEvent::ToolDone {
+            id: id.into(),
+            name: name.into(),
+            ok,
+            lines: 1,
+            bytes: output.len() as u64,
+            output: output.into(),
+        }
+    }
+
+    #[test]
+    fn text_delta_is_agent_message_chunk() {
+        let mut calls = ToolCalls::rooted(root());
+        let event = EngineEvent::TextDelta("hi".into());
+        assert_eq!(
+            update_json(outgoing(&event, &plain(), &mut calls)),
+            json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "hi"}})
+        );
+        assert_eq!(
+            update_json(outgoing(
+                &EngineEvent::ThinkingDelta("hm".into()),
+                &plain(),
+                &mut calls
+            )),
+            json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "hm"}})
+        );
+        let ext = update_json(outgoing(&event, &opted_in(), &mut calls));
+        assert_eq!(
+            ext["_meta"][META_FRAME],
+            json!({"type": "text_delta", "text": "hi"})
+        );
+    }
+
+    #[test]
+    fn queued_then_start_is_one_tool_call_then_an_update() {
+        let mut calls = ToolCalls::rooted(root());
+        let queued = EngineEvent::ToolQueued {
+            id: "t1".into(),
+            name: "read".into(),
+            summary: "read src/a.rs".into(),
+            ahead: 1,
+        };
+        assert_eq!(
+            update_json(outgoing(&queued, &plain(), &mut calls)),
+            json!({"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "read src/a.rs",
+                   "kind": "read", "status": "pending"})
+        );
+        let input = json!({"path": "src/a.rs", "offset": 40});
+        assert_eq!(
+            update_json(outgoing(
+                &start("t1", "read", input.clone()),
+                &plain(),
+                &mut calls
+            )),
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "title": "read call",
+                   "kind": "read", "status": "in_progress", "rawInput": input,
+                   "locations": [{"path": at("src/a.rs"), "line": 40}]})
+        );
+        assert_eq!(
+            update_json(outgoing(
+                &done("t1", "read", true, "fn a() {}"),
+                &plain(),
+                &mut calls
+            )),
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed",
+                   "rawOutput": "fn a() {}"})
+        );
+        let fresh = update_json(outgoing(
+            &start("t2", "bash", json!({"command": "ls"})),
+            &plain(),
+            &mut calls,
+        ));
+        assert_eq!(fresh["sessionUpdate"], "tool_call");
+        assert_eq!(fresh["status"], "in_progress");
+        assert_eq!(fresh["kind"], "execute");
+        assert!(fresh.get("locations").is_none(), "{fresh}");
+    }
+
+    #[test]
+    fn a_settled_call_never_announced_is_a_whole_tool_call() {
+        let mut calls = ToolCalls::rooted(root());
+        let denied = update_json(outgoing(
+            &EngineEvent::ToolDenied {
+                id: "t9".into(),
+                name: "write".into(),
+            },
+            &plain(),
+            &mut calls,
+        ));
+        assert_eq!(
+            denied,
+            json!({"sessionUpdate": "tool_call", "toolCallId": "t9", "title": "write",
+                   "kind": "edit", "status": "failed"})
+        );
+        let answered = update_json(outgoing(
+            &done("t8", "bash", true, "by hand"),
+            &plain(),
+            &mut calls,
+        ));
+        assert_eq!(answered["sessionUpdate"], "tool_call");
+        assert_eq!(answered["status"], "completed");
+        assert_eq!(answered["rawOutput"], "by hand");
+    }
+
+    #[test]
+    fn edit_done_carries_a_diff() {
+        let mut calls = ToolCalls::rooted(root());
+        let input = json!({"path": "a.rs", "old_string": "let x = 1;", "new_string": "let x = 2;"});
+        outgoing(&start("e1", "edit", input), &plain(), &mut calls);
+        let edit = update_json(outgoing(
+            &done("e1", "edit", true, "edited"),
+            &plain(),
+            &mut calls,
+        ));
+        assert_eq!(
+            edit["content"],
+            json!([{"type": "diff", "path": at("a.rs"), "oldText": "let x = 1;", "newText": "let x = 2;"}])
+        );
+        outgoing(
+            &start(
+                "w1",
+                "write",
+                json!({"path": "/abs/new.rs", "content": "fn main() {}\n"}),
+            ),
+            &plain(),
+            &mut calls,
+        );
+        let write = update_json(outgoing(
+            &done("w1", "write", true, "wrote"),
+            &plain(),
+            &mut calls,
+        ));
+        assert_eq!(
+            write["content"],
+            json!([{"type": "diff", "path": std::path::Path::new("/abs/new.rs").display().to_string(), "newText": "fn main() {}\n"}])
+        );
+        outgoing(
+            &start(
+                "e2",
+                "edit",
+                json!({"path": "a.rs", "old_string": "a", "new_string": "b"}),
+            ),
+            &plain(),
+            &mut calls,
+        );
+        let failed = update_json(outgoing(
+            &done("e2", "edit", false, "no match"),
+            &plain(),
+            &mut calls,
+        ));
+        assert!(failed.get("content").is_none(), "{failed}");
+        assert_eq!(failed["status"], "failed");
+    }
+
+    #[test]
+    fn progress_and_child_text_land_on_the_call() {
+        let mut calls = ToolCalls::rooted(root());
+        outgoing(
+            &start("b1", "bash", json!({"command": "make"})),
+            &plain(),
+            &mut calls,
+        );
+        let progress = update_json(outgoing(
+            &EngineEvent::ToolProgress {
+                id: "b1".into(),
+                name: "bash".into(),
+                tail: "Compiling".into(),
+                lines: 3,
+                bytes: 30,
+            },
+            &plain(),
+            &mut calls,
+        ));
+        assert_eq!(
+            progress,
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "b1",
+                   "content": [{"type": "content", "content": {"type": "text", "text": "Compiling"}}]})
+        );
+        outgoing(
+            &start("s1", "spawn", json!({"prompt": "look"})),
+            &plain(),
+            &mut calls,
+        );
+        let text = |t: &str| EngineEvent::ChildText {
+            parent_id: "s1".into(),
+            text: t.into(),
+        };
+        outgoing(&text("one "), &plain(), &mut calls);
+        let second = update_json(outgoing(&text("two"), &plain(), &mut calls));
+        assert_eq!(second["toolCallId"], "s1");
+        assert_eq!(second["content"][0]["content"]["text"], "one two");
+        let child_tool = EngineEvent::ChildTool {
+            parent_id: "s1".into(),
+            id: "c1".into(),
+            name: "read".into(),
+            summary: "read x".into(),
+            ok: None,
+            tokens: None,
+        };
+        assert_eq!(outgoing(&child_tool, &plain(), &mut calls), None);
+        let ext = update_json(outgoing(&child_tool, &opted_in(), &mut calls));
+        assert_eq!(ext["toolCallId"], "s1");
+        assert_eq!(ext["_meta"][META_CHILD]["id"], "c1");
+    }
+
+    #[test]
+    fn todos_become_a_plan() {
+        let mut calls = ToolCalls::rooted(root());
+        let items: Vec<hotl_types::Todo> = serde_json::from_value(json!([
+            {"content": "a", "status": "in_progress"},
+            {"content": "b", "status": "pending"}
+        ]))
+        .unwrap();
+        assert_eq!(
+            update_json(outgoing(
+                &EngineEvent::TodosChanged { items },
+                &plain(),
+                &mut calls
+            )),
+            json!({"sessionUpdate": "plan", "entries": [
+                {"content": "a", "priority": "medium", "status": "in_progress"},
+                {"content": "b", "priority": "medium", "status": "pending"}
+            ]})
+        );
+    }
+
+    #[test]
+    fn a_title_is_session_info() {
+        let mut calls = ToolCalls::rooted(root());
+        let titled = EngineEvent::SessionTitled {
+            title: Some("Fix the parser".into()),
+            usage: Default::default(),
+        };
+        assert_eq!(
+            update_json(outgoing(&titled, &plain(), &mut calls)),
+            json!({"sessionUpdate": "session_info_update", "title": "Fix the parser"})
+        );
+        let untitled = EngineEvent::SessionTitled {
+            title: None,
+            usage: Default::default(),
+        };
+        assert_eq!(outgoing(&untitled, &plain(), &mut calls), None);
+    }
+
+    fn verdict() -> EngineEvent {
+        EngineEvent::GoalVerdict {
+            verdict: hotl_engine::GoalVerdictKind::Met,
+            reason: "tests pass".into(),
+            turns: 2,
+            usage: Default::default(),
+            evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn goal_verdict_is_none_for_a_plain_client() {
+        let mut calls = ToolCalls::rooted(root());
+        assert_eq!(outgoing(&verdict(), &plain(), &mut calls), None);
+    }
+
+    #[test]
+    fn goal_verdict_is_ext_for_an_opted_in_client() {
+        let mut calls = ToolCalls::rooted(root());
+        match outgoing(&verdict(), &opted_in(), &mut calls) {
+            Some(Outgoing::Ext(frame)) => {
+                assert_eq!(frame, crate::wire::update_frame(&verdict()).unwrap())
+            }
+            other => panic!("expected an extension update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retrying_is_a_notice_only_when_offered() {
+        let retrying = EngineEvent::Retrying {
+            attempt: 2,
+            max: 5,
+            reason: "overloaded".into(),
+            delay_ms: 1_500,
+            status: Some(529),
+            request_id: None,
+            scope: hotl_engine::RetryScope::Sample,
+            discarded_partial: false,
+        };
+        let notices = ClientCaps {
+            notices: true,
+            ..ClientCaps::default()
+        };
+        let mut calls = ToolCalls::rooted(root());
+        let notice = update_json(outgoing(&retrying, &notices, &mut calls));
+        assert_eq!(notice["sessionUpdate"], "notice");
+        assert_eq!(notice["severity"], "warning");
+        assert!(
+            notice["title"].as_str().unwrap().contains("2/5"),
+            "{notice}"
+        );
+        assert_eq!(outgoing(&retrying, &plain(), &mut calls), None);
+        assert!(matches!(
+            outgoing(&retrying, &opted_in(), &mut calls),
+            Some(Outgoing::Ext(_))
+        ));
+    }
+
+    #[test]
+    fn a_fold_is_one_compaction_from_start_to_end() {
+        let caps = ClientCaps {
+            compaction: true,
+            ..ClientCaps::default()
+        };
+        let mut calls = ToolCalls::rooted(root());
+        let started = update_json(outgoing(
+            &EngineEvent::Compacting { items: 9 },
+            &caps,
+            &mut calls,
+        ));
+        assert_eq!(started["sessionUpdate"], "compaction_update");
+        assert_eq!(started["status"], "in_progress");
+        let ended = update_json(outgoing(
+            &EngineEvent::Compacted {
+                degraded: false,
+                focus: None,
+                usage: Default::default(),
+                estimate: 10,
+            },
+            &caps,
+            &mut calls,
+        ));
+        assert_eq!(ended["status"], "completed");
+        assert_eq!(ended["compactionId"], started["compactionId"]);
+        assert_eq!(
+            outgoing(&EngineEvent::Compacting { items: 9 }, &plain(), &mut calls),
+            None
+        );
+    }
+
+    fn variant(event: &EngineEvent) -> &'static str {
+        match event {
+            EngineEvent::TextDelta(_) => "TextDelta",
+            EngineEvent::ThinkingDelta(_) => "ThinkingDelta",
+            EngineEvent::ToolStart { .. } => "ToolStart",
+            EngineEvent::ToolDone { .. } => "ToolDone",
+            EngineEvent::GoalEvaluating { .. } => "GoalEvaluating",
+            EngineEvent::ToolQueued { .. } => "ToolQueued",
+            EngineEvent::Compacting { .. } => "Compacting",
+            EngineEvent::ToolProgress { .. } => "ToolProgress",
+            EngineEvent::ToolInputProgress { .. } => "ToolInputProgress",
+            EngineEvent::ToolDenied { .. } => "ToolDenied",
+            EngineEvent::ToolAutoAllowed { .. } => "ToolAutoAllowed",
+            EngineEvent::ToolFlagged { .. } => "ToolFlagged",
+            EngineEvent::ChildTool { .. } => "ChildTool",
+            EngineEvent::ChildText { .. } => "ChildText",
+            EngineEvent::Delegation { .. } => "Delegation",
+            EngineEvent::CacheWarmed { .. } => "CacheWarmed",
+            EngineEvent::Retrying { .. } => "Retrying",
+            EngineEvent::FallbackModel { .. } => "FallbackModel",
+            EngineEvent::ModelChanged { .. } => "ModelChanged",
+            EngineEvent::PromptQueued => "PromptQueued",
+            EngineEvent::BudgetNotice { .. } => "BudgetNotice",
+            EngineEvent::Compacted { .. } => "Compacted",
+            EngineEvent::FoldSkipped { .. } => "FoldSkipped",
+            EngineEvent::Cleared { .. } => "Cleared",
+            EngineEvent::Ask { .. } => "Ask",
+            EngineEvent::Question { .. } => "Question",
+            EngineEvent::EgressAsk { .. } => "EgressAsk",
+            EngineEvent::TurnStarted { .. } => "TurnStarted",
+            EngineEvent::TurnDone { .. } => "TurnDone",
+            EngineEvent::TodosChanged { .. } => "TodosChanged",
+            EngineEvent::GoalChanged { .. } => "GoalChanged",
+            EngineEvent::MemoryChanged { .. } => "MemoryChanged",
+            EngineEvent::JobStarted { .. } => "JobStarted",
+            EngineEvent::JobDone { .. } => "JobDone",
+            EngineEvent::SessionTitled { .. } => "SessionTitled",
+            EngineEvent::AsideDone { .. } => "AsideDone",
+            EngineEvent::AsideFailed { .. } => "AsideFailed",
+            EngineEvent::PlanPresented { .. } => "PlanPresented",
+            EngineEvent::GoalVerdict { .. } => "GoalVerdict",
+            EngineEvent::LedgerReport(_) => "LedgerReport",
+        }
+    }
+
+    const VARIANTS: usize = 40;
+
+    fn every_event() -> Vec<EngineEvent> {
+        let usage = hotl_types::TokenUsage::default();
+        let todo: Vec<hotl_types::Todo> =
+            serde_json::from_value(json!([{"content": "a", "status": "pending"}])).unwrap();
+        vec![
+            EngineEvent::ToolQueued {
+                id: "t1".into(),
+                name: "edit".into(),
+                summary: "edit a.rs".into(),
+                ahead: 0,
+            },
+            EngineEvent::ToolAutoAllowed {
+                id: "t1".into(),
+                name: "edit".into(),
+                rule: "edit*".into(),
+            },
+            start(
+                "t1",
+                "edit",
+                json!({"path": "a.rs", "old_string": "a", "new_string": "b"}),
+            ),
+            EngineEvent::ToolInputProgress { calls: 1, bytes: 9 },
+            EngineEvent::ToolProgress {
+                id: "t1".into(),
+                name: "edit".into(),
+                tail: "x".into(),
+                lines: 1,
+                bytes: 1,
+            },
+            done("t1", "edit", true, "ok"),
+            EngineEvent::ToolFlagged {
+                id: "t2".into(),
+                name: "write".into(),
+                summary: "write /etc/x".into(),
+                why: "outside".into(),
+                denied: true,
+            },
+            EngineEvent::ToolDenied {
+                id: "t3".into(),
+                name: "bash".into(),
+            },
+            start("s1", "spawn", json!({"prompt": "go"})),
+            EngineEvent::ChildTool {
+                parent_id: "s1".into(),
+                id: "c1".into(),
+                name: "read".into(),
+                summary: "read x".into(),
+                ok: Some(true),
+                tokens: Some(5),
+            },
+            EngineEvent::ChildText {
+                parent_id: "s1".into(),
+                text: "child says".into(),
+            },
+            EngineEvent::Delegation {
+                subagent_runs: 1,
+                duplicate_work_paths: 0,
+                false_completions: 0,
+                usage,
+                tool_calls: 1,
+            },
+            done("s1", "spawn", true, "child done"),
+            EngineEvent::TextDelta("hi".into()),
+            EngineEvent::ThinkingDelta("hm".into()),
+            EngineEvent::GoalEvaluating { turn: 1 },
+            EngineEvent::Compacting { items: 3 },
+            EngineEvent::Compacted {
+                degraded: true,
+                focus: Some("tests".into()),
+                usage,
+                estimate: 5,
+            },
+            EngineEvent::CacheWarmed {
+                usage,
+                cost_usd: Some(0.1),
+            },
+            EngineEvent::Retrying {
+                attempt: 1,
+                max: 3,
+                reason: "429".into(),
+                delay_ms: 100,
+                status: Some(429),
+                request_id: Some("req".into()),
+                scope: hotl_engine::RetryScope::Sample,
+                discarded_partial: true,
+            },
+            EngineEvent::FallbackModel { model: "m2".into() },
+            EngineEvent::ModelChanged {
+                model: "m2".into(),
+                previous: "m".into(),
+                context_tokens: 1,
+                context_window: 2,
+            },
+            EngineEvent::PromptQueued,
+            EngineEvent::BudgetNotice {
+                pct: 80,
+                used_usd: 8.0,
+                cap_usd: 10.0,
+            },
+            EngineEvent::FoldSkipped {
+                reason: "nothing to fold".into(),
+            },
+            EngineEvent::Cleared { count: 2 },
+            EngineEvent::Ask {
+                summary: "bash: ls".into(),
+                protected_why: None,
+                reply: tokio::sync::oneshot::channel().0,
+            },
+            EngineEvent::Question {
+                id: "q".into(),
+                question: hotl_types::Question {
+                    header: "h".into(),
+                    prompt: "p".into(),
+                    options: Vec::new(),
+                    multi: false,
+                },
+                reply: tokio::sync::oneshot::channel().0,
+            },
+            EngineEvent::EgressAsk {
+                host: "example.com".into(),
+                reply: tokio::sync::oneshot::channel().0,
+            },
+            EngineEvent::TurnStarted { tags: vec![1] },
+            EngineEvent::TurnDone {
+                outcome: Outcome::Done { text: "x".into() },
+                usage,
+                mispredictions: 0,
+            },
+            EngineEvent::TodosChanged {
+                items: todo.clone(),
+            },
+            EngineEvent::GoalChanged {
+                condition: Some("ship".into()),
+            },
+            EngineEvent::MemoryChanged {
+                note: "n".into(),
+                date: "2026-11-17".into(),
+                bytes: 3,
+                path: "/m".into(),
+            },
+            EngineEvent::JobStarted {
+                id: Some("t4".into()),
+                job: "j1".into(),
+                pid: 7,
+                command: "sleep 1".into(),
+                detached: false,
+            },
+            EngineEvent::JobDone {
+                id: Some("t4".into()),
+                job: "j1".into(),
+                rc: "0".into(),
+                secs: 1,
+                stopped_by: None,
+            },
+            EngineEvent::SessionTitled {
+                title: Some("t".into()),
+                usage,
+            },
+            EngineEvent::AsideDone {
+                question: "q".into(),
+                text: "a".into(),
+                usage,
+            },
+            EngineEvent::AsideFailed {
+                question: "q".into(),
+                reason: "r".into(),
+            },
+            EngineEvent::PlanPresented {
+                summary: "s".into(),
+                nodes: todo,
+                path: None,
+            },
+            verdict(),
+            EngineEvent::LedgerReport(hotl_engine::LedgerSummary {
+                sample_count: 1,
+                overhead_p50_ns: 1,
+                overhead_p99_ns: 1,
+                phase_deltas: Vec::new(),
+                max_rss_bytes: 1,
+                samples: Vec::new(),
+            }),
+        ]
+    }
+
+    #[test]
+    fn every_event_walks_every_variant() {
+        let names: std::collections::BTreeSet<&str> = every_event().iter().map(variant).collect();
+        assert_eq!(names.len(), VARIANTS, "{names:?}");
+    }
+
+    fn hotl_keys(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::Object(map) => {
+                for (k, child) in map {
+                    if k.starts_with("hotl.dev/") || k.starts_with("_hotl") {
+                        out.push(k.clone());
+                    }
+                    hotl_keys(child, out);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|i| hotl_keys(i, out)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn no_hotl_meta_for_a_plain_client() {
+        let every_cap = ClientCaps {
+            notices: true,
+            compaction: true,
+            ..ClientCaps::default()
+        };
+        for caps in [plain(), every_cap] {
+            let mut calls = ToolCalls::rooted(root());
+            for event in every_event() {
+                match outgoing(&event, &caps, &mut calls) {
+                    None => {}
+                    Some(Outgoing::Ext(v)) => {
+                        panic!("{} went out as an extension: {v}", variant(&event))
+                    }
+                    Some(Outgoing::Update(u)) => {
+                        let v = serde_json::to_value(u).unwrap();
+                        let mut keys = Vec::new();
+                        hotl_keys(&v, &mut keys);
+                        assert!(keys.is_empty(), "{}: {keys:?} in {v}", variant(&event));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_frame_reaches_an_opted_in_client_exactly_once() {
+        let drained_elsewhere = ["ModelChanged", "FallbackModel"];
+        let mut calls = ToolCalls::rooted(root());
+        for event in every_event() {
+            let name = variant(&event);
+            let frame = crate::wire::update_frame(&event);
+            let out = outgoing(&event, &opted_in(), &mut calls);
+            if frame.is_none() || drained_elsewhere.contains(&name) {
+                assert_eq!(out, None, "{name}");
+                continue;
+            }
+            let carried = match out {
+                Some(Outgoing::Ext(v)) => v,
+                Some(Outgoing::Update(u)) => {
+                    serde_json::to_value(u).unwrap()["_meta"][META_FRAME].clone()
+                }
+                None => panic!("{name} never reached the client"),
+            };
+            assert_eq!(Some(carried), frame, "{name}");
+        }
+    }
+
+    #[test]
+    fn tool_kind_covers_every_builtin() {
+        let table = [
+            ("read", ToolKind::Read),
+            ("edit", ToolKind::Edit),
+            ("write", ToolKind::Edit),
+            ("bash", ToolKind::Execute),
+            ("glob", ToolKind::Search),
+            ("grep", ToolKind::Search),
+            ("recall", ToolKind::Search),
+            ("web_fetch", ToolKind::Fetch),
+            ("web_search", ToolKind::Fetch),
+            ("todo_write", ToolKind::Think),
+            ("present_plan", ToolKind::Think),
+            ("ask_user", ToolKind::Other),
+            ("remember", ToolKind::Other),
+            ("report_result", ToolKind::Other),
+            ("skill", ToolKind::Other),
+            ("spawn", ToolKind::Other),
+            ("wait", ToolKind::Other),
+            ("send", ToolKind::Other),
+            ("resume", ToolKind::Other),
+            ("workflow", ToolKind::Other),
+            ("mcp", ToolKind::Other),
+        ];
+        for def in hotl_tools::Registry::builtin().defs() {
+            assert!(
+                table.iter().any(|(name, _)| *name == def.name),
+                "builtin `{}` has no tool kind decision",
+                def.name
+            );
+        }
+        for (name, kind) in table {
+            assert_eq!(tool_kind(name), kind, "{name}");
+        }
     }
 }

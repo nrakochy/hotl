@@ -708,7 +708,7 @@ async fn handle_request(
                 next_id,
                 &info.model,
                 &info.fallback_models,
-                client_caps.ext,
+                *client_caps,
                 info.context_window,
             )
             .await;
@@ -819,6 +819,7 @@ async fn handle_request(
                     SessionUpdate::SessionInfoUpdate(SessionInfoUpdate {
                         title: Some(title),
                         updated_at: None,
+                        meta: None,
                     }),
                 )
                 .await;
@@ -1269,7 +1270,8 @@ async fn handle_request(
                     .await;
                 };
                 reply_ok(writer, id, to_json(&Ack { ok: true })).await;
-                notify(
+                send_report(
+                    client_caps,
                     writer,
                     &state.id,
                     to_json(&AcpOnlyUpdate::MemoryReport {
@@ -1491,7 +1493,8 @@ async fn handle_request(
                 Err(e) => {
                     if let Some(state) = session.as_ref() {
                         let sid = state.id.clone();
-                        notify(
+                        send_report(
+                            client_caps,
                             writer,
                             &sid,
                             to_json(&AcpOnlyUpdate::ConfigReloadFailed {
@@ -1567,7 +1570,7 @@ async fn handle_request(
                         next_id,
                         &info.model,
                         &info.fallback_models,
-                        client_caps.ext,
+                        *client_caps,
                         info.context_window,
                     )
                     .await;
@@ -1594,7 +1597,8 @@ async fn handle_request(
                     // `mode_changed`: every attached surface needs the new
                     // roster, and a client's loop needs no id-plumbing to get
                     // it. Additive, so `UPDATE_SCHEMA_VERSION` stands.
-                    notify(
+                    send_report(
+                        client_caps,
                         writer,
                         &sid,
                         to_json(&AcpOnlyUpdate::ConfigReloaded {
@@ -1673,7 +1677,8 @@ async fn handle_request(
                     // id-plumbing to get it. Additive, so
                     // `UPDATE_SCHEMA_VERSION` stands.
                     reply_ok(writer, id, to_json(&Ack { ok: true })).await;
-                    notify(
+                    send_report(
+                        client_caps,
                         writer,
                         &sid,
                         to_json(&AcpOnlyUpdate::ContextReport {
@@ -1711,7 +1716,7 @@ async fn handle_request(
             reply_ok(writer, id, to_json(&Ack { ok: true })).await;
             let mut payload = (info.workflows_report)();
             payload["type"] = json!("workflows_report");
-            notify(writer, &sid, payload).await;
+            send_report(client_caps, writer, &sid, payload).await;
         }
         // `/jobs` (0064): thin ack, `jobs_report` broadcast — the
         // `session/workflows` shape. Additive, so `UPDATE_SCHEMA_VERSION` stands.
@@ -1752,7 +1757,8 @@ async fn handle_request(
                 })
                 .collect();
             reply_ok(writer, id, to_json(&Ack { ok: true })).await;
-            notify(
+            send_report(
+                client_caps,
                 writer,
                 &state.id,
                 to_json(&AcpOnlyUpdate::JobsReport { jobs: rows }),
@@ -1800,7 +1806,8 @@ async fn handle_request(
                 })
                 .collect();
             reply_ok(writer, id, to_json(&Ack { ok: true })).await;
-            notify(
+            send_report(
+                client_caps,
                 writer,
                 &state.id,
                 to_json(&AcpOnlyUpdate::ChildrenReport { children: rows }),
@@ -2216,7 +2223,7 @@ async fn install_session(
     next_id: &mut u64,
     model: &str,
     fallbacks: &[String],
-    ext: bool,
+    caps: ClientCaps,
     context_window: u64,
 ) {
     retire_session(writer, session, pending, pending_questions, pending_egress).await;
@@ -2227,13 +2234,15 @@ async fn install_session(
         models: std::iter::once(model.to_string())
             .chain(fallbacks.iter().cloned())
             .collect(),
-        ext,
+        ext: caps.ext,
         context_window,
     }));
     let lease = open.lease;
     let mut state = start_session(
         open.handle,
         config,
+        caps,
+        crate::acp_map::ToolCalls::rooted(&cwd),
         id,
         open.session_id,
         writer.clone(),
@@ -2255,6 +2264,8 @@ async fn install_session(
 fn start_session(
     mut handle: SessionHandle,
     config: SharedConfig,
+    caps: ClientCaps,
+    calls: crate::acp_map::ToolCalls,
     id: String,
     store_id: String,
     writer: Writer,
@@ -2291,6 +2302,8 @@ fn start_session(
                 model,
                 drain_config,
                 link,
+                caps,
+                calls,
             )
             .await;
         }
@@ -2334,6 +2347,8 @@ async fn drain_events(
     model: String,
     config: SharedConfig,
     link: EngineLink,
+    caps: ClientCaps,
+    mut calls: crate::acp_map::ToolCalls,
 ) {
     let mut held: Option<EngineEvent> = None;
     loop {
@@ -2420,6 +2435,30 @@ async fn drain_events(
                         "contextWindow": context_window,
                     }),
                 );
+                m
+            });
+            send_update(
+                &writer,
+                &session_id,
+                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate {
+                    config_options,
+                    meta,
+                }),
+            )
+            .await;
+            continue;
+        }
+        if let EngineEvent::FallbackModel { model } = &event {
+            let config_options = {
+                let mut state = lock_config(&config);
+                state.model = model.clone();
+                crate::acp_map::config_options(&state)
+            };
+            let meta = caps.ext.then(|| {
+                let mut m = serde_json::Map::new();
+                if let Some(frame) = crate::wire::update_frame(&event) {
+                    m.insert(crate::acp_map::META_FRAME.into(), frame);
+                }
                 m
             });
             send_update(
@@ -2580,11 +2619,15 @@ async fn drain_events(
             EngineEvent::TurnStarted { tags } => {
                 lock_prompts(&pending_prompt).current = tags;
             }
-            other => {
-                if let Some(update) = update_payload(&other) {
-                    notify(&writer, &session_id, update).await;
+            other => match crate::acp_map::outgoing(&other, &caps, &mut calls) {
+                Some(crate::acp_map::Outgoing::Update(update)) => {
+                    send_update(&writer, &session_id, update).await
                 }
-            }
+                Some(crate::acp_map::Outgoing::Ext(update)) => {
+                    notify_ext(&writer, &session_id, update).await
+                }
+                None => {}
+            },
         }
     }
 }
@@ -2645,11 +2688,21 @@ pub(crate) fn outcome_tag(outcome: &Outcome) -> Value {
     crate::wire::outcome_frame(outcome)
 }
 
-async fn notify(writer: &Writer, session_id: &str, update: Value) {
-    send(writer, &json!({
-        "jsonrpc": "2.0", "method": "session/update",
-        "params": {"schemaVersion": UPDATE_SCHEMA_VERSION, "sessionId": session_id, "update": update},
-    }))
+async fn send_report(caps: &ClientCaps, writer: &Writer, session_id: &str, update: Value) {
+    if caps.ext {
+        notify_ext(writer, session_id, update).await;
+    }
+}
+
+async fn notify_ext(writer: &Writer, session_id: &str, update: Value) {
+    send(
+        writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": crate::acp_ext::ext("session/update"),
+            "params": {"sessionId": session_id, "update": update},
+        }),
+    )
     .await;
 }
 
@@ -2728,6 +2781,11 @@ mod drain_tests {
             EngineLink {
                 meter: hotl_engine::Meter::default(),
             },
+            ClientCaps {
+                ext: true,
+                ..ClientCaps::default()
+            },
+            crate::acp_map::ToolCalls::default(),
         )
         .await;
         drop(writer); // close the duplex so read_to_string sees EOF
@@ -2860,6 +2918,7 @@ mod drain_tests {
             id: "t1".into(),
             name: "bash".into(),
             summary: "ls".into(),
+            input: serde_json::Value::Null,
         })
         .await
         .unwrap();
@@ -2877,7 +2936,7 @@ mod drain_tests {
             .iter()
             .filter_map(|l| {
                 let v: Value = serde_json::from_str(l).ok()?;
-                match v["params"]["update"]["type"].as_str()? {
+                match v["params"]["update"]["_meta"][crate::acp_map::META_FRAME]["type"].as_str()? {
                     "text_delta" => Some("text"),
                     "thinking_delta" => Some("thinking"),
                     "tool_start" => Some("tool"),
@@ -3331,11 +3390,9 @@ pub enum AcpUpdate {
     Acp(AcpOnlyUpdate),
 }
 
-/// `session/update` params.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionUpdateParams {
-    pub schema_version: u32,
+pub struct ExtSessionUpdateParams {
     pub session_id: String,
     pub update: AcpUpdate,
 }
@@ -3422,7 +3479,7 @@ pub struct AcpPayloads {
     session_open_extras: SessionOpenExtras,
     prompt_response: PromptResponse,
     turn_meta: TurnMeta,
-    session_update: SessionUpdateParams,
+    ext_session_update: ExtSessionUpdateParams,
     ack: Ack,
     model_ack: ModelAck,
     goal_ack: GoalAck,

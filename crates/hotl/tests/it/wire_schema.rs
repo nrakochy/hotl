@@ -98,6 +98,7 @@ fn every_pinned_frame_validates_against_the_published_schema() {
             id: "t1".into(),
             name: "read".into(),
             summary: "read ./x".into(),
+            input: serde_json::Value::Null,
         },
         EngineEvent::ToolDone {
             id: "t1".into(),
@@ -105,6 +106,7 @@ fn every_pinned_frame_validates_against_the_published_schema() {
             ok: true,
             lines: 3,
             bytes: 5,
+            output: String::new(),
         },
         EngineEvent::ChildTool {
             parent_id: "p".into(),
@@ -226,8 +228,8 @@ fn every_acp_payload_validates_against_the_published_schema() {
         &json!({"outcome": {"kind": "done", "text": "x"}, "usage": wire::usage_frame("claude-opus-5", &TokenUsage { input_tokens: 3, ..Default::default() })}),
     );
     acp_valid(
-        "SessionUpdateParams",
-        &json!({"schemaVersion": 1, "sessionId": "s", "update": wire::update_frame(&EngineEvent::TextDelta("x".into())).unwrap()}),
+        "ExtSessionUpdateParams",
+        &json!({"sessionId": "s", "update": wire::update_frame(&EngineEvent::TextDelta("x".into())).unwrap()}),
     );
     acp_valid(
         "SessionNotification",

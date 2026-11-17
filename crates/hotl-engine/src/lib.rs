@@ -511,6 +511,7 @@ pub enum EngineEvent {
         id: String,
         name: String,
         summary: String,
+        input: serde_json::Value,
     },
     /// 0061 T1: `lines`/`bytes` count `outcome.content` — the result the model
     /// receives, after the output cap and any PostToolUse rewrite — so a
@@ -521,6 +522,7 @@ pub enum EngineEvent {
         ok: bool,
         lines: u64,
         bytes: u64,
+        output: String,
     },
     /// A goal evaluation is about to reach the model (0061 T18). A verdict a
     /// machine leaf settled needs no model and announces nothing — this

@@ -460,6 +460,43 @@
       ],
       "type": "object"
     },
+    "CompactionStatus": {
+      "enum": [
+        "in_progress",
+        "completed",
+        "failed",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "CompactionUpdate": {
+      "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "compactionId": {
+          "type": "string"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/CompactionStatus"
+        }
+      },
+      "required": [
+        "compactionId",
+        "status"
+      ],
+      "type": "object"
+    },
     "ConfigOptionUpdate": {
       "properties": {
         "_meta": {
@@ -563,6 +600,13 @@
     },
     "ContentChunk": {
       "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
         "content": {
           "$ref": "#/$defs/ContentBlock"
         }
@@ -644,6 +688,27 @@
       ],
       "type": "object"
     },
+    "Diff": {
+      "properties": {
+        "newText": {
+          "type": "string"
+        },
+        "oldText": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "newText"
+      ],
+      "type": "object"
+    },
     "EgressReply": {
       "description": "What a client answers `session/request_egress` with. Schema only.",
       "properties": {
@@ -678,6 +743,21 @@
       ]
     },
     "EmptyCapability": {
+      "type": "object"
+    },
+    "ExtSessionUpdateParams": {
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "update": {
+          "$ref": "#/$defs/AcpUpdate"
+        }
+      },
+      "required": [
+        "sessionId",
+        "update"
+      ],
       "type": "object"
     },
     "Frame": {
@@ -2350,6 +2430,13 @@
     },
     "Plan": {
       "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
         "entries": {
           "items": {
             "$ref": "#/$defs/PlanEntry"
@@ -2908,6 +2995,13 @@
     },
     "SessionInfoUpdate": {
       "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
         "title": {
           "type": [
             "string",
@@ -3140,6 +3234,19 @@
           "type": "object"
         },
         {
+          "$ref": "#/$defs/ToolCallUpdate",
+          "properties": {
+            "sessionUpdate": {
+              "const": "tool_call_update",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ],
+          "type": "object"
+        },
+        {
           "$ref": "#/$defs/Plan",
           "properties": {
             "sessionUpdate": {
@@ -3229,30 +3336,21 @@
             "sessionUpdate"
           ],
           "type": "object"
+        },
+        {
+          "$ref": "#/$defs/CompactionUpdate",
+          "properties": {
+            "sessionUpdate": {
+              "const": "compaction_update",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ],
+          "type": "object"
         }
       ]
-    },
-    "SessionUpdateParams": {
-      "description": "`session/update` params.",
-      "properties": {
-        "schemaVersion": {
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "sessionId": {
-          "type": "string"
-        },
-        "update": {
-          "$ref": "#/$defs/AcpUpdate"
-        }
-      },
-      "required": [
-        "schemaVersion",
-        "sessionId",
-        "update"
-      ],
-      "type": "object"
     },
     "StopReason": {
       "enum": [
@@ -3434,6 +3532,13 @@
     },
     "ToolCall": {
       "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
         "content": {
           "items": {
             "$ref": "#/$defs/ToolCallContent"
@@ -3443,7 +3548,14 @@
         "kind": {
           "$ref": "#/$defs/ToolKind"
         },
+        "locations": {
+          "items": {
+            "$ref": "#/$defs/ToolCallLocation"
+          },
+          "type": "array"
+        },
         "rawInput": true,
+        "rawOutput": true,
         "status": {
           "$ref": "#/$defs/ToolCallStatus"
         },
@@ -3459,7 +3571,8 @@
         "title",
         "kind",
         "status",
-        "content"
+        "content",
+        "locations"
       ],
       "type": "object"
     },
@@ -3477,8 +3590,40 @@
             "type"
           ],
           "type": "object"
+        },
+        {
+          "$ref": "#/$defs/Diff",
+          "properties": {
+            "type": {
+              "const": "diff",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
         }
       ]
+    },
+    "ToolCallLocation": {
+      "properties": {
+        "line": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
     },
     "ToolCallStatus": {
       "enum": [
@@ -3488,6 +3633,70 @@
         "failed"
       ],
       "type": "string"
+    },
+    "ToolCallUpdate": {
+      "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "content": {
+          "items": {
+            "$ref": "#/$defs/ToolCallContent"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "locations": {
+          "items": {
+            "$ref": "#/$defs/ToolCallLocation"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "rawInput": true,
+        "rawOutput": true,
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolCallStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "toolCallId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "toolCallId"
+      ],
+      "type": "object"
     },
     "ToolKind": {
       "enum": [
@@ -3650,6 +3859,9 @@
     "egressReply": {
       "$ref": "#/$defs/EgressReply"
     },
+    "extSessionUpdate": {
+      "$ref": "#/$defs/ExtSessionUpdateParams"
+    },
     "goalAck": {
       "$ref": "#/$defs/GoalAck"
     },
@@ -3704,9 +3916,6 @@
     "sessionOpenExtras": {
       "$ref": "#/$defs/SessionOpenExtras"
     },
-    "sessionUpdate": {
-      "$ref": "#/$defs/SessionUpdateParams"
-    },
     "stoppedAck": {
       "$ref": "#/$defs/StoppedAck"
     },
@@ -3724,7 +3933,7 @@
     "sessionOpenExtras",
     "promptResponse",
     "turnMeta",
-    "sessionUpdate",
+    "extSessionUpdate",
     "ack",
     "modelAck",
     "goalAck",

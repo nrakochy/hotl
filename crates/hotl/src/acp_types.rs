@@ -347,6 +347,7 @@ pub enum SessionUpdate {
     AgentMessageChunk(ContentChunk),
     AgentThoughtChunk(ContentChunk),
     ToolCall(ToolCall),
+    ToolCallUpdate(ToolCallUpdate),
     Plan(Plan),
     AvailableCommandsUpdate(AvailableCommandsUpdate),
     UsageUpdate(UsageUpdate),
@@ -354,6 +355,7 @@ pub enum SessionUpdate {
     CurrentModeUpdate(CurrentModeUpdate),
     ConfigOptionUpdate(ConfigOptionUpdate),
     Notice(Notice),
+    CompactionUpdate(CompactionUpdate),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -378,6 +380,8 @@ pub struct Notice {
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct ContentChunk {
     pub content: ContentBlock,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -508,8 +512,50 @@ pub struct ToolCall {
     pub status: ToolCallStatus,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub content: Vec<ToolCallContent>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<ToolCallLocation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_input: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_output: Option<Value>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallUpdate {
+    pub tool_call_id: String,
+    #[serde(flatten)]
+    pub fields: ToolCallUpdateFields,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallUpdateFields {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ToolKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<ToolCallStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<Vec<ToolCallContent>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locations: Option<Vec<ToolCallLocation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_input: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_output: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct ToolCallLocation {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -540,6 +586,16 @@ pub enum ToolCallStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolCallContent {
     Content(Content),
+    Diff(Diff),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Diff {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    pub new_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
@@ -550,6 +606,8 @@ pub struct Content {
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct Plan {
     pub entries: Vec<PlanEntry>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
@@ -621,6 +679,28 @@ pub struct SessionInfoUpdate {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionStatus {
+    InProgress,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionUpdate {
+    pub compaction_id: String,
+    pub status: CompactionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]

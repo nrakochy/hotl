@@ -2046,6 +2046,7 @@ impl Turn {
                         ok: true,
                         lines,
                         bytes,
+                        output: content.clone(),
                     })
                     .await;
                     return Gate::Resolved {
@@ -2167,6 +2168,7 @@ impl Turn {
             id: tu.id.clone(),
             name: tu.name.clone(),
             summary,
+            input: input.clone(),
         })
         .await;
         // The sink captures the id `ToolStart` just carried, so every frame is
@@ -2249,6 +2251,7 @@ impl Turn {
             ok: !outcome.is_error,
             lines,
             bytes,
+            output: outcome.content.clone(),
         })
         .await;
         // A tool that actually ran and failed is exactly what the budget is for.

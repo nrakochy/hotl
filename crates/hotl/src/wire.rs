@@ -348,7 +348,9 @@ impl Frame {
         Some(match event {
             EngineEvent::TextDelta(t) => Frame::TextDelta { text: t.clone() },
             EngineEvent::ThinkingDelta(t) => Frame::ThinkingDelta { text: t.clone() },
-            EngineEvent::ToolStart { id, name, summary } => Frame::ToolStart {
+            EngineEvent::ToolStart {
+                id, name, summary, ..
+            } => Frame::ToolStart {
                 id: id.clone(),
                 name: name.clone(),
                 summary: summary.clone(),
@@ -359,6 +361,7 @@ impl Frame {
                 ok,
                 lines,
                 bytes,
+                ..
             } => Frame::ToolDone {
                 id: id.clone(),
                 name: name.clone(),

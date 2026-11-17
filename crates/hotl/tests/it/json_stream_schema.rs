@@ -23,6 +23,7 @@ fn every_frame_is_tagged_and_versioned() {
             id: "t1".into(),
             name: "read".into(),
             summary: "read ./x".into(),
+            input: serde_json::Value::Null,
         },
         EngineEvent::ToolDone {
             id: "t1".into(),
@@ -30,6 +31,7 @@ fn every_frame_is_tagged_and_versioned() {
             ok: true,
             lines: 3,
             bytes: 5,
+            output: String::new(),
         },
         EngineEvent::ToolProgress {
             id: "t1".into(),
@@ -458,6 +460,7 @@ fn tool_frames_carry_the_call_id() {
             id: "toolu_1".into(),
             name: "read".into(),
             summary: "read ./x".into(),
+            input: serde_json::Value::Null,
         },
         EngineEvent::ToolDone {
             id: "toolu_1".into(),
@@ -465,6 +468,7 @@ fn tool_frames_carry_the_call_id() {
             ok: true,
             lines: 3,
             bytes: 5,
+            output: String::new(),
         },
         EngineEvent::ToolDenied {
             id: "toolu_1".into(),
@@ -500,6 +504,7 @@ fn tool_done_carries_result_line_and_byte_counts() {
         ok: true,
         lines: 1204,
         bytes: 51_233,
+        output: String::new(),
     })
     .expect("tool_done is a stream frame");
     assert_eq!(f["type"], "tool_done");
@@ -514,6 +519,7 @@ fn tool_done_carries_result_line_and_byte_counts() {
         ok: true,
         lines: 0,
         bytes: 0,
+        output: String::new(),
     })
     .expect("tool_done is a stream frame");
     assert_eq!(empty["lines"], 0);

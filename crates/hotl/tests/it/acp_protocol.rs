@@ -851,7 +851,6 @@ async fn session_context_returns_an_ack_and_broadcasts_a_report() {
     })
     .await;
     let update = &report["params"]["update"];
-    assert_eq!(report["params"]["schemaVersion"], 1);
     assert_eq!(update["window"], 200_000);
     let rows = update["rows"].as_array().expect("rows");
     assert_eq!(rows.len(), 12, "every row is emitted, zeros included");
@@ -1008,10 +1007,6 @@ async fn session_fold_at_idle_acks_now_and_relays_the_outcome() {
         .as_str()
         .unwrap()
         .is_empty());
-    assert_eq!(
-        skipped["params"]["schemaVersion"],
-        acp::UPDATE_SCHEMA_VERSION
-    );
 }
 
 #[tokio::test]
@@ -1210,11 +1205,16 @@ async fn initialize_new_prompt_permission_and_result() {
     )
     .await;
 
-    let mut saw_tool_start = false;
+    let mut tool_updates: Vec<(String, String)> = Vec::new();
     let mut prompt_result: Option<Value> = None;
     // Read frames until the prompt (id 3) result arrives.
     while prompt_result.is_none() {
-        let msg = next(&mut lines).await;
+        let msg = next_raw(&mut lines).await;
+        let text = msg.to_string();
+        assert!(
+            !text.contains("hotl.dev/") && !text.contains("_hotl/"),
+            "a plain client saw an extension: {text}"
+        );
         match msg.get("method").and_then(Value::as_str) {
             Some("session/request_permission") => {
                 // The bash call is gated → the server asks us. Approve it.
@@ -1227,9 +1227,13 @@ async fn initialize_new_prompt_permission_and_result() {
                 .await;
             }
             Some("session/update") => {
-                assert_eq!(msg["params"]["schemaVersion"], acp::UPDATE_SCHEMA_VERSION);
-                if msg["params"]["update"]["type"] == "tool_start" {
-                    saw_tool_start = true;
+                let update = &msg["params"]["update"];
+                assert!(msg["params"].get("schemaVersion").is_none(), "{msg}");
+                if update["toolCallId"].is_string() && update["status"].is_string() {
+                    tool_updates.push((
+                        update["sessionUpdate"].as_str().unwrap().to_string(),
+                        update["status"].as_str().unwrap().to_string(),
+                    ));
                 }
             }
             _ if msg.get("id") == Some(&json!(3)) => prompt_result = Some(msg),
@@ -1243,7 +1247,18 @@ async fn initialize_new_prompt_permission_and_result() {
         json!({"stopReason": "end_turn"}),
         "a client that did not opt in gets the bare standard reply"
     );
-    assert!(saw_tool_start, "tool status streamed as an update");
+    let kinds: Vec<(&str, &str)> = tool_updates
+        .iter()
+        .map(|(k, s)| (k.as_str(), s.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("tool_call", "in_progress"),
+            ("tool_call_update", "completed")
+        ],
+        "tool status streamed as one tool call, then its update"
+    );
 
     // 4. unknown method → JSON-RPC error, no crash.
     send(
@@ -2827,7 +2842,15 @@ async fn the_open_reply_carries_the_resumed_goal_and_a_forks_is_null() {
 async fn next(lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>) -> Value {
     loop {
         let m = next_raw(lines).await;
-        if m["params"]["update"].get("sessionUpdate").is_none() {
+        if m["method"] == "_hotl/session/update" {
+            return json!({"jsonrpc": "2.0", "method": "session/update", "params": m["params"]});
+        }
+        let update = &m["params"]["update"];
+        if let Some(frame) = update.pointer("/_meta/hotl.dev~1frame") {
+            return json!({"jsonrpc": "2.0", "method": "session/update",
+                          "params": {"sessionId": m["params"]["sessionId"], "update": frame}});
+        }
+        if update.get("sessionUpdate").is_none() {
             return m;
         }
     }
@@ -5414,8 +5437,9 @@ async fn cancel_denies_an_open_permission_request() {
     assert!(
         before
             .iter()
-            .any(|m| m["params"]["update"]["type"] == "tool_denied"
-                && m["params"]["update"]["id"] == "t1"),
+            .any(|m| m["params"]["update"]["toolCallId"] == "t1"
+                && m["params"]["update"]["status"] == "failed"
+                && m["params"]["update"]["_meta"]["hotl.dev/denied"] == true),
         "the parked ask resolved as a denial before the reply: {before:?}"
     );
     send(

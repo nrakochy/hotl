@@ -472,6 +472,7 @@ mod tests {
                 id: "t1".into(),
                 name: "read".into(),
                 summary: "read ./x".into(),
+                input: serde_json::Value::Null,
             },
             EngineEvent::ToolDone {
                 id: "t1".into(),
@@ -479,6 +480,7 @@ mod tests {
                 ok: true,
                 lines: 3,
                 bytes: 5,
+                output: String::new(),
             },
             EngineEvent::ToolProgress {
                 id: "t1".into(),
@@ -624,6 +626,7 @@ mod tests {
             ok: false,
             lines: 1,
             bytes: 4,
+            output: String::new(),
         })
         .unwrap();
         assert!(update_line(&failed).is_some(), "a tool error must be shown");

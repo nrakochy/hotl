@@ -1746,7 +1746,9 @@ pub(crate) async fn drain_child(
                     first_byte!();
                     forward_child_text(&forward, text).await;
                 }
-                Some(EngineEvent::ToolStart { id, name, summary }) => {
+                Some(EngineEvent::ToolStart {
+                    id, name, summary, ..
+                }) => {
                     first_byte!();
                     tool_calls += 1;
                     forward_child_tool(&forward, id, name, summary, None).await;
