@@ -4,14 +4,18 @@
 //! and answers parked permission asks. `Ctrl-D` detaches (the session lives on);
 //! `/stop` shuts the session down. Bare `hotl attach` lists live sessions.
 
+use hotl_tui::client::{AcpClient, ServerMsg};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::session_server::list_live;
 use hotl_platform::Ipc as _;
 
 type WriteHalf = tokio::io::WriteHalf<<hotl_platform::ActiveIpc as hotl_platform::Ipc>::Stream>;
+type ReadHalf = tokio::io::ReadHalf<<hotl_platform::ActiveIpc as hotl_platform::Ipc>::Stream>;
+type Client = AcpClient<WriteHalf>;
+type Lines = tokio::io::Lines<BufReader<ReadHalf>>;
 
 pub async fn attach_main(id: Option<&str>) -> i32 {
     let Some(id) = id else {
@@ -43,6 +47,63 @@ fn list_sessions() -> i32 {
     0
 }
 
+pub(crate) fn initialize_params(token: &str, client: &str) -> Value {
+    json!({
+        "protocolVersion": 1,
+        "clientInfo": {"name": client, "version": env!("CARGO_PKG_VERSION")},
+        "clientCapabilities": {
+            "session": {"notices": {}},
+            "elicitation": {"form": {}},
+            "_meta": {"hotl.dev/extensions": 1},
+        },
+        "_meta": {crate::session_server::META_SOCKET_TOKEN: token},
+    })
+}
+
+pub(crate) enum Opened {
+    Attached,
+    Refused(String),
+    Closed,
+}
+
+pub(crate) async fn open(client: &mut Client, lines: &mut Lines, id: &str, token: &str) -> Opened {
+    let Ok(init) = client
+        .request("initialize", initialize_params(token, "hotl-attach"))
+        .await
+    else {
+        return Opened::Closed;
+    };
+    match response(lines, init).await {
+        Some(Ok(_)) => {}
+        Some(Err(e)) => return Opened::Refused(e),
+        None => return Opened::Closed,
+    }
+    client.set_session_id(id);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let Ok(resume) = client.request("session/resume", json!({"cwd": cwd})).await else {
+        return Opened::Closed;
+    };
+    match response(lines, resume).await {
+        Some(Ok(_)) => Opened::Attached,
+        Some(Err(e)) => Opened::Refused(e),
+        None => Opened::Closed,
+    }
+}
+
+async fn response(lines: &mut Lines, id: u64) -> Option<Result<Value, String>> {
+    loop {
+        let line = lines.next_line().await.ok()??;
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some(ServerMsg::Response { id: got, result }) = hotl_tui::client::decode(&msg) {
+            if got == id {
+                return Some(result);
+            }
+        }
+    }
+}
+
 async fn connect(id: &str) -> i32 {
     let stream = match hotl_platform::IPC.connect(id).await {
         Ok(s) => s,
@@ -51,20 +112,26 @@ async fn connect(id: &str) -> i32 {
             return 1;
         }
     };
-    let (read, mut write) = tokio::io::split(stream);
+    let (read, write) = tokio::io::split(stream);
     // Authenticate with the per-session token before anything else (Vuln 1).
-    match std::fs::read_to_string(crate::session_server::token_path(id)) {
-        Ok(token) => {
-            let mut frame = json!({"t": "auth", "token": token.trim()}).to_string();
-            frame.push('\n');
-            if write.write_all(frame.as_bytes()).await.is_err() {
-                eprintln!("hotl attach: could not authenticate to `{id}`");
-                return 1;
-            }
-        }
+    let token = match std::fs::read_to_string(crate::session_server::token_path(id)) {
+        Ok(token) => token,
         Err(e) => {
             eprintln!("hotl attach: no session token for `{id}` ({e}); is it still running?");
             return 1;
+        }
+    };
+    let mut client = AcpClient::new(write);
+    let mut server = BufReader::new(read).lines();
+    match open(&mut client, &mut server, id, token.trim()).await {
+        Opened::Attached => {}
+        Opened::Refused(e) => {
+            eprintln!("hotl attach: `{id}` refused the attach: {e}");
+            return 1;
+        }
+        Opened::Closed => {
+            println!("\n(session closed)");
+            return 0;
         }
     }
     println!("attached to {id} — type to prompt · Ctrl-D detaches · /stop ends the session");
@@ -87,39 +154,54 @@ async fn connect(id: &str) -> i32 {
         }
     });
 
-    let mut server = BufReader::new(read).lines();
-    // The prompt currently awaiting a y/N answer, if any.
-    let mut pending_ask: Option<Parked> = None;
-    let mut turn_running = false;
-
+    let mut state = Attached::default();
     loop {
         tokio::select! {
-            frame = server.next_line() => match frame {
+            line = server.next_line() => match line {
                 Ok(Some(line)) => {
                     if let Ok(msg) = serde_json::from_str::<Value>(&line) {
-                        if render(&msg, &mut pending_ask, &mut turn_running) {
-                            turn_running = true;
-                        }
+                        state.on_server(&msg);
                     }
                 }
                 _ => { println!("\n(session closed)"); return 0; }
             },
             line = stdin_rx.recv() => {
-                let Some(line) = line else { return detach(&mut write).await };
-                match on_input(line.trim(), &mut write, &mut pending_ask, turn_running).await {
-                    Input::Continue => {}
-                    Input::StartedTurn => turn_running = true,
-                    Input::Stop => return 0,
+                let Some(line) = line else { return detach(&mut client).await };
+                if on_input(line.trim(), &mut client, &mut state).await {
+                    return 0;
                 }
             }
         }
     }
 }
 
-enum Input {
-    Continue,
-    StartedTurn,
-    Stop,
+#[derive(Default)]
+struct Attached {
+    pending_ask: Option<Parked>,
+    turn_running: bool,
+    prompts: Vec<u64>,
+}
+
+impl Attached {
+    fn on_server(&mut self, msg: &Value) {
+        if msg
+            .pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("usage_update")
+        {
+            if self.prompts.is_empty() && self.turn_running {
+                self.turn_running = false;
+                show_prompt();
+            }
+            return;
+        }
+        let Some(msg) = hotl_tui::client::decode(msg) else {
+            return;
+        };
+        if let Some(running) = render(msg, &mut self.pending_ask, &mut self.prompts) {
+            self.turn_running = running;
+        }
+    }
 }
 
 /// What a typed line means: answer a pending ask, steer a running turn, start
@@ -168,98 +250,133 @@ fn route(text: &str, turn_running: bool, pending_ask: Option<&Parked>) -> Action
     }
 }
 
-async fn on_input(
-    text: &str,
-    write: &mut WriteHalf,
-    pending_ask: &mut Option<Parked>,
-    turn_running: bool,
-) -> Input {
-    match route(text, turn_running, pending_ask.as_ref()) {
+async fn on_input(text: &str, client: &mut Client, state: &mut Attached) -> bool {
+    match route(text, state.turn_running, state.pending_ask.as_ref()) {
         Action::Stop => {
-            let _ = send(write, json!({"t": "shutdown"})).await;
-            Input::Stop
+            let _ = client.request("_hotl/session/stop", json!({})).await;
+            true
         }
-        Action::Nothing => Input::Continue,
+        Action::Nothing => false,
         Action::AnswerAsk { parked, allow } => {
-            *pending_ask = None;
-            let method = match &parked.egress {
-                Some(_) => "egress_reply",
-                None => "ask_reply",
+            state.pending_ask = None;
+            let _ = match &parked.egress {
+                Some(_) => client.reply_egress(parked.id, allow).await,
+                None => client.reply_permission(parked.id, allow, false, None).await,
             };
-            let _ = send(write, json!({"t": method, "id": parked.id, "allow": allow})).await;
             if let (Some(host), true) = (&parked.egress, allow) {
                 eprintln!("{}", crate::session_server::paste_hint(host));
             }
-            Input::Continue
+            false
         }
         // Expansion happens here, not in `route`: reading files is I/O, and
         // the transcript should show what the human typed.
         Action::Steer(text) => {
             let text = crate::setup::expand_file_refs(&text);
-            let _ = send(write, json!({"t": "steer", "text": text})).await;
-            Input::Continue
+            let _ = client
+                .request("_hotl/session/steer", json!({"text": text}))
+                .await;
+            false
         }
         Action::Prompt(text) => {
             let text = crate::setup::expand_file_refs(&text);
-            let _ = send(write, json!({"t": "prompt", "text": text})).await;
-            Input::StartedTurn
+            if let Ok(id) = client
+                .request(
+                    "session/prompt",
+                    json!({"prompt": [{"type": "text", "text": text}]}),
+                )
+                .await
+            {
+                state.prompts.push(id);
+                state.turn_running = true;
+            }
+            false
         }
     }
 }
 
-/// Render a server frame; returns true if it implies a turn is now running.
-fn render(msg: &Value, pending_ask: &mut Option<Parked>, turn_running: &mut bool) -> bool {
-    match msg.get("t").and_then(Value::as_str).unwrap_or("") {
-        "hello" => false,
-        "ask" => {
-            if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                if let Some(why) = msg.get("protectedWhy").and_then(Value::as_str) {
-                    eprintln!("⚠ PROTECTED PATH — {why}");
-                }
-                eprint!(
-                    "allow {}? [y/N] ",
-                    msg.get("summary").and_then(Value::as_str).unwrap_or("?")
-                );
-                let _ = std::io::Write::flush(&mut std::io::stderr());
-                *pending_ask = Some(Parked { id, egress: None });
+fn show_prompt() {
+    eprint!("\n❯ ");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+}
+
+fn turn_end_kind(result: &Result<Value, String>) -> &str {
+    let Ok(v) = result else {
+        return "error";
+    };
+    if let Some(kind) = v
+        .pointer("/_meta/hotl.dev~1turn/outcome/kind")
+        .and_then(Value::as_str)
+    {
+        return kind;
+    }
+    match v.get("stopReason").and_then(Value::as_str) {
+        Some("end_turn") => "done",
+        Some("cancelled") => "cancelled",
+        Some("max_turn_requests") => "turn_limit",
+        Some("refusal") => "refused",
+        _ => "error",
+    }
+}
+
+/// Render a server message; returns whether it says a turn is running, or
+/// `None` when it says nothing either way.
+fn render(
+    msg: ServerMsg,
+    pending_ask: &mut Option<Parked>,
+    prompts: &mut Vec<u64>,
+) -> Option<bool> {
+    match msg {
+        ServerMsg::PermissionRequest {
+            req_id,
+            summary,
+            protected_why,
+            ..
+        } => {
+            if let Some(why) = protected_why {
+                eprintln!("⚠ PROTECTED PATH — {why}");
             }
-            true
+            eprint!("allow {summary}? [y/N] ");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            *pending_ask = Some(Parked {
+                id: req_id,
+                egress: None,
+            });
+            Some(true)
         }
         // Deliberately different wording and framing from the tool ask above:
         // a human who just approved `npm install` must not read this as a
         // duplicate and reflex-key it.
-        "egress" => {
-            if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                let host = msg.get("host").and_then(Value::as_str).unwrap_or("?");
-                eprintln!("\nnetwork: reaching \"{host}\" was not in the approved command");
-                eprintln!("this host is not in [network].allow");
-                eprint!("allow for this session? [y/N] ");
-                let _ = std::io::Write::flush(&mut std::io::stderr());
-                *pending_ask = Some(Parked {
-                    id,
-                    egress: Some(host.to_string()),
-                });
-            }
-            true
+        ServerMsg::EgressRequest { req_id, host } => {
+            eprintln!("\nnetwork: reaching \"{host}\" was not in the approved command");
+            eprintln!("this host is not in [network].allow");
+            eprint!("allow for this session? [y/N] ");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            *pending_ask = Some(Parked {
+                id: req_id,
+                egress: Some(host),
+            });
+            Some(true)
         }
-        "update" => {
-            render_update(msg.get("update").unwrap_or(&Value::Null));
-            true
+        ServerMsg::QuestionRequest { .. } => Some(true),
+        ServerMsg::Update(update) => {
+            render_update(&update);
+            Some(true)
         }
-        "turn_done" => {
-            *turn_running = false;
-            let kind = msg
-                .pointer("/outcome/kind")
-                .and_then(Value::as_str)
-                .unwrap_or("done");
+        ServerMsg::Response { id, result } => {
+            let Some(pos) = prompts.iter().position(|p| *p == id) else {
+                if let Err(e) = result {
+                    eprintln!("\n[{e}]");
+                }
+                return None;
+            };
+            prompts.remove(pos);
+            let kind = turn_end_kind(&result);
             if kind != "done" {
                 eprintln!("\n[turn ended: {kind}]");
             }
-            eprint!("\n❯ ");
-            let _ = std::io::Write::flush(&mut std::io::stderr());
-            false
+            show_prompt();
+            Some(!prompts.is_empty())
         }
-        _ => false,
     }
 }
 
@@ -415,6 +532,7 @@ fn update_line(update: &Value) -> Option<String> {
                 line
             }
             "mode_changed" => format!("· permission mode → {}", s("mode")),
+            "server_notice" => format!("· {}", s("text")),
             "cache_warm" => {
                 let read = update
                     .get("usage")
@@ -445,17 +563,10 @@ fn render_update(update: &Value) {
     }
 }
 
-async fn detach(write: &mut WriteHalf) -> i32 {
-    let _ = send(write, json!({"t": "detach"})).await;
+async fn detach(client: &mut Client) -> i32 {
+    let _ = client.request("session/close", json!({})).await;
     println!("\n(detached — session still running; `hotl attach` to return)");
     0
-}
-
-async fn send(write: &mut WriteHalf, frame: Value) -> std::io::Result<()> {
-    let mut line = frame.to_string();
-    line.push('\n');
-    write.write_all(line.as_bytes()).await?;
-    write.flush().await
 }
 
 #[cfg(test)]
@@ -700,5 +811,65 @@ mod tests {
         assert_eq!(route("", false, None), Action::Nothing);
         assert_eq!(route("hi", true, None), Action::Steer("hi".into()));
         assert_eq!(route("hi", false, None), Action::Prompt("hi".into()));
+    }
+
+    fn usage_update() -> Value {
+        json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s",
+            "update": {"sessionUpdate": "usage_update", "used": 1, "size": 2}}})
+    }
+
+    #[test]
+    fn a_turn_someone_else_started_ends_on_its_usage_update() {
+        let mut state = Attached::default();
+        state.on_server(&json!({"jsonrpc": "2.0", "method": "_hotl/session/update",
+            "params": {"sessionId": "s", "update": {"type": "prompt_queued"}}}));
+        assert!(state.turn_running);
+        state.on_server(&usage_update());
+        assert!(
+            !state.turn_running,
+            "a typed line is a prompt again, not a steer"
+        );
+    }
+
+    #[test]
+    fn our_prompt_ends_on_its_reply_and_a_steer_ack_changes_nothing() {
+        let mut state = Attached {
+            prompts: vec![3],
+            turn_running: true,
+            ..Attached::default()
+        };
+        state.on_server(&usage_update());
+        assert!(
+            state.turn_running,
+            "the reply, not the usage, ends our turn"
+        );
+        state.on_server(&json!({"jsonrpc": "2.0", "id": 4, "result": {"queued": true}}));
+        assert!(state.turn_running);
+        state.on_server(&json!({"jsonrpc": "2.0", "id": 3, "result": {"stopReason": "end_turn"}}));
+        assert!(!state.turn_running);
+        assert!(state.prompts.is_empty());
+    }
+
+    #[test]
+    fn the_turn_end_kind_prefers_the_hotl_outcome() {
+        assert_eq!(
+            turn_end_kind(&Ok(json!({"stopReason": "end_turn",
+                "_meta": {"hotl.dev/turn": {"outcome": {"kind": "doom_loop"}}}}))),
+            "doom_loop"
+        );
+        assert_eq!(
+            turn_end_kind(&Ok(json!({"stopReason": "cancelled"}))),
+            "cancelled"
+        );
+        assert_eq!(turn_end_kind(&Err("boom".into())), "error");
+    }
+
+    #[test]
+    fn a_server_notice_gets_a_line() {
+        assert_eq!(
+            update_line(&json!({"type": "server_notice", "text": "1 parked ask(s) expired"}))
+                .as_deref(),
+            Some("· 1 parked ask(s) expired")
+        );
     }
 }

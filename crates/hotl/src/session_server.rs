@@ -12,16 +12,17 @@
 //! durability (surviving a reboot) is planned durable-asks work
 //! and is deliberately out of scope; this parks in memory, in the live server.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use hotl_engine::{EngineEvent, SessionHandle};
+use hotl_engine::SessionHandle;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::io::{AsyncBufReadExt, AsyncWrite, BufReader};
 
+use crate::acp::{ClientCaps, Connection, Hosted};
+use crate::acp_ext::codes;
 use hotl_platform::{Ipc as _, IpcListener as _};
 
 /// The session transport, bound in one place: a unix socket on Unix, a named
@@ -31,10 +32,9 @@ type Stream = <hotl_platform::ActiveIpc as hotl_platform::Ipc>::Stream;
 type Listener = <hotl_platform::ActiveIpc as hotl_platform::Ipc>::Listener;
 type ReadHalf = tokio::io::ReadHalf<Stream>;
 type WriteHalf = tokio::io::WriteHalf<Stream>;
+type Lines = tokio::io::Lines<BufReader<ReadHalf>>;
 
-use crate::acp::{outcome_tag, update_payload, UPDATE_SCHEMA_VERSION};
-
-type ClientWriter = AsyncMutex<Option<WriteHalf>>;
+pub const META_SOCKET_TOKEN: &str = "hotl.dev/socketToken";
 
 /// What a surface prints after a human allows a host: the grant is
 /// session-scoped, and hotl does not write `config.toml` for you.
@@ -51,48 +51,25 @@ pub fn paste_hint(host: &str) -> String {
     )
 }
 
-struct Shared {
-    handle: SessionHandle,
-    client: ClientWriter,
-    /// Parked permission asks: id → (reply channel, the request frame to
-    /// re-send, when it was parked). The instant is what `ask_expiry` reads.
-    pending: Mutex<HashMap<u64, Parked<hotl_engine::AskReply>>>,
-    /// Parked `ask_user` questions (0058 T9), same shape as `pending`. These
-    /// used to fall through the catch-all and resolve `NoHuman` the moment
-    /// the sender dropped — a question asked while nobody was attached was
-    /// answered by nobody and never re-issued.
-    ///
-    /// **Deliberately not swept by `ask_expiry`** (0059 T5), which denies a
-    /// parked *permission* ask after an hour. A question authorizes nothing,
-    /// so leaving one parked risks nothing — and the case that would break is
-    /// exactly the one worth protecting: a `human_input` workflow step is a
-    /// recipe deliberately waiting for a person, with its own `timeout_secs`
-    /// chosen by whoever wrote it. A global hour would silently override that.
-    pending_question: Mutex<HashMap<u64, Parked<hotl_types::QuestionAnswer>>>,
-    /// Parked egress asks (plan 0026), same shape as `pending`.
-    ///
-    /// A separate map, sharing `next_ask`: the two carry different reply types
-    /// (`AskReply` vs `EgressDecision`), so one map could not hold both, and
-    /// the shared counter is what keeps an id from ever meaning two different
-    /// things — the same arrangement `acp.rs`'s `PendingQuestions` documents.
-    pending_egress: Mutex<HashMap<u64, Parked<hotl_tools::net::EgressDecision>>>,
-    next_ask: AtomicU64,
-    session_id: String,
-    /// Per-session secret a client must present before it can drive the session
-    /// or evict the attached human (Vuln 1).
-    token: String,
-    /// The session's primary model — prices `turn_done.usage.cost_usd`
-    /// (Task 5). See `wire::usage_frame` for the fallback-model imprecision
-    /// this accepts.
-    model: String,
-    /// How long a parked ask waits for a human before it is denied (0059 T5).
-    /// `Duration::ZERO` disables expiry.
-    ask_expiry: std::time::Duration,
+pub struct Served {
+    pub session_id: String,
+    pub info: crate::acp::ServerInfo,
+    pub cwd: PathBuf,
+    pub effort: Option<String>,
+    pub handle: SessionHandle,
+    pub prompt: Option<String>,
+    pub ask_expiry: std::time::Duration,
 }
 
-/// One parked ask: its reply channel, the frame to re-send on attach, and
-/// when it was parked.
-type Parked<T> = (tokio::sync::oneshot::Sender<T>, Value, std::time::Instant);
+pub fn detached_caps() -> ClientCaps {
+    ClientCaps {
+        ext: true,
+        notices: true,
+        compaction: true,
+        elicitation_form: true,
+        auth_terminal: false,
+    }
+}
 
 /// The coarsest the expiry sweep ever runs. An hour-scale deadline does not
 /// need a fine-grained sweep, and the loop must stay cheap while a session
@@ -109,56 +86,6 @@ fn sweep_period(ask_expiry: std::time::Duration) -> std::time::Duration {
     ask_expiry
         .min(ASK_SWEEP_INTERVAL)
         .max(std::time::Duration::from_millis(50))
-}
-
-/// Deny every parked ask older than `shared.ask_expiry`. Denying is what
-/// closes the loop: the engine's `ask` is still awaiting this channel, so the
-/// turn resumes and commits its own `AskResolved`. Returns how many expired,
-/// for the test and for the notice.
-fn sweep_expired_asks(shared: &Shared) -> usize {
-    if shared.ask_expiry.is_zero() {
-        return 0;
-    }
-    let secs = shared.ask_expiry.as_secs();
-    let message = format!("expired after {secs} s with no human");
-    let now = std::time::Instant::now();
-    let expired = |at: &std::time::Instant| now.duration_since(*at) >= shared.ask_expiry;
-    let mut n = 0;
-    {
-        let mut pending = shared
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let ids: Vec<u64> = pending
-            .iter()
-            .filter(|(_, (_, _, at))| expired(at))
-            .map(|(id, _)| *id)
-            .collect();
-        for id in ids {
-            if let Some((tx, _, _)) = pending.remove(&id) {
-                let _ = tx.send(hotl_engine::AskReply::Deny {
-                    message: Some(message.clone()),
-                });
-                n += 1;
-            }
-        }
-    }
-    let mut egress = shared
-        .pending_egress
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let ids: Vec<u64> = egress
-        .iter()
-        .filter(|(_, (_, _, at))| expired(at))
-        .map(|(id, _)| *id)
-        .collect();
-    for id in ids {
-        if let Some((tx, _, _)) = egress.remove(&id) {
-            let _ = tx.send(hotl_tools::net::EgressDecision::Deny);
-            n += 1;
-        }
-    }
-    n
 }
 
 /// Directory holding one `<id>.sock` per live backgrounded session.
@@ -191,41 +118,34 @@ fn tokens_match(a: &str, b: &str) -> bool {
 }
 
 /// A connecting peer must be the same uid (defence in depth behind the 0600
-/// socket) and present the session token as its first frame. Returns the reader
-/// half to promote, or None (rejected — the caller leaves the incumbent alone).
-async fn authenticate(
-    stream: Stream,
-    token: &str,
-) -> Option<(tokio::io::Lines<BufReader<ReadHalf>>, WriteHalf)> {
+/// socket) and open with an `initialize` carrying the session token. Returns
+/// the reader, the writer and that `initialize`, or None — the connection is
+/// closed without a reply and the incumbent is left alone.
+async fn authenticate(stream: Stream, token: &str) -> Option<(Lines, WriteHalf, Value)> {
     if let Err(why) = hotl_platform::IPC.authenticate_peer(&stream) {
         // Defence in depth behind the endpoint's own access control, which is
         // the actual boundary — a `0600` socket mode or the pipe's DACL.
         let _ = why;
         return None;
     }
-    let (read, mut write) = tokio::io::split(stream);
+    let (read, write) = tokio::io::split(stream);
     let mut lines = BufReader::new(read).lines();
     // Bound the handshake so a silent connect cannot stall the accept loop.
-    let ok = matches!(
-        tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line()).await,
-        Ok(Ok(Some(line))) if auth_frame_ok(&line, token)
-    );
-    if !ok {
-        let _ = write
-            .write_all(b"{\"t\":\"error\",\"message\":\"unauthorized\"}\n")
-            .await;
-        return None;
-    }
-    Some((lines, write))
+    let line =
+        match tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line()).await {
+            Ok(Ok(Some(line))) => line,
+            _ => return None,
+        };
+    let msg = serde_json::from_str::<Value>(&line).ok()?;
+    initialize_carries(&msg, token).then_some((lines, write, msg))
 }
 
-fn auth_frame_ok(line: &str, token: &str) -> bool {
-    let Ok(msg) = serde_json::from_str::<Value>(line) else {
-        return false;
-    };
-    msg.get("t").and_then(Value::as_str) == Some("auth")
+fn initialize_carries(msg: &Value, token: &str) -> bool {
+    msg.get("method").and_then(Value::as_str) == Some("initialize")
+        && msg.get("id").is_some()
         && msg
-            .get("token")
+            .pointer("/params/_meta")
+            .and_then(|m| m.get(META_SOCKET_TOKEN))
             .and_then(Value::as_str)
             .is_some_and(|t| tokens_match(t, token))
 }
@@ -237,16 +157,9 @@ pub fn list_live() -> Vec<String> {
     ids
 }
 
-/// Run a detached session bound to `run_dir/<session_id>.sock`. `handle` is a
-/// freshly spawned engine session; `prompt` is an optional opening prompt;
-/// `model` is the session's primary model (Task 5 cost telemetry).
-pub async fn serve(
-    session_id: String,
-    model: String,
-    handle: SessionHandle,
-    prompt: Option<String>,
-    ask_expiry: std::time::Duration,
-) -> i32 {
+/// Run a detached session bound to `run_dir/<session_id>.sock`.
+pub async fn serve(served: Served) -> i32 {
+    let session_id = served.session_id.clone();
     // A *live* endpoint means this id collides with a running session (pid
     // reuse, a repeated --id) — refuse rather than silently steal it. A dead
     // one is cleared by `bind_private`.
@@ -270,10 +183,7 @@ pub async fn serve(
     };
     let _guard = EndpointGuard::new(&session_id);
     let _token_guard = TokenGuard(token_path(&session_id));
-    serve_on(
-        listener, session_id, model, handle, prompt, token, ask_expiry,
-    )
-    .await;
+    serve_on(listener, served, token).await;
     0
 }
 
@@ -298,36 +208,85 @@ fn write_token(id: &str, token: &str) -> std::io::Result<()> {
         .write_all(token.as_bytes())
 }
 
-/// The socket-server core over a pre-bound listener (testable without the
-/// filesystem run-dir): spawn the drain, submit the opening prompt, then serve
-/// clients one at a time — the session lives across attach/detach.
-pub async fn serve_on(
-    listener: Listener,
-    session_id: String,
-    model: String,
-    mut handle: SessionHandle,
-    prompt: Option<String>,
-    token: String,
-    ask_expiry: std::time::Duration,
-) {
-    let events = std::mem::replace(&mut handle.events, tokio::sync::mpsc::channel(1).1);
-    let shared = Arc::new(Shared {
-        handle,
-        client: AsyncMutex::new(None),
-        pending: Mutex::new(HashMap::new()),
-        pending_question: Mutex::new(HashMap::new()),
-        pending_egress: Mutex::new(HashMap::new()),
-        next_ask: AtomicU64::new(1),
-        session_id,
-        token,
-        model,
-        ask_expiry,
-    });
-    tokio::spawn(drain_events(events, shared.clone()));
-    if let Some(p) = prompt {
-        shared.handle.prompt(p).await;
+#[derive(Clone, Default)]
+struct ClientSlot(Arc<std::sync::Mutex<Option<WriteHalf>>>);
+
+impl ClientSlot {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<WriteHalf>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-    accept_loop(listener, shared).await;
+
+    fn poll_with(
+        &self,
+        cx: &mut Context<'_>,
+        f: impl FnOnce(Pin<&mut WriteHalf>, &mut Context<'_>) -> Poll<std::io::Result<()>>,
+    ) -> Poll<std::io::Result<()>> {
+        let mut guard = self.lock();
+        let Some(w) = guard.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match f(Pin::new(w), cx) {
+            Poll::Ready(Err(_)) => {
+                *guard = None;
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl AsyncWrite for ClientSlot {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut guard = self.lock();
+        let Some(w) = guard.as_mut() else {
+            return Poll::Ready(Ok(buf.len()));
+        };
+        match Pin::new(w).poll_write(cx, buf) {
+            Poll::Ready(Err(_)) => {
+                *guard = None;
+                Poll::Ready(Ok(buf.len()))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.poll_with(cx, |w, cx| w.poll_flush(cx))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.poll_with(cx, |w, cx| w.poll_shutdown(cx))
+    }
+}
+
+/// The socket-server core over a pre-bound listener (testable without the
+/// filesystem run-dir): host the session on one ACP connection whose writer
+/// follows the attached client, submit the opening prompt, then serve
+/// clients one at a time — the session lives across attach/detach.
+pub async fn serve_on(listener: Listener, served: Served, token: String) {
+    let slot = ClientSlot::default();
+    let writer: crate::acp::Writer = Arc::new(tokio::sync::Mutex::new(Box::new(slot.clone())));
+    let connection = Connection::hosting(
+        writer,
+        served.info,
+        Hosted {
+            handle: served.handle,
+            session_id: served.session_id,
+            cwd: served.cwd,
+            effort: served.effort,
+            caps: detached_caps(),
+        },
+    );
+    if let (Some(p), Some(handle)) = (served.prompt, connection.handle()) {
+        handle.prompt(p).await;
+    }
+    accept_loop(listener, connection, slot, token, served.ask_expiry).await;
 }
 
 /// Removes the endpoint's on-disk artifact when the server exits — but only
@@ -363,19 +322,30 @@ impl Drop for EndpointGuard {
     }
 }
 
-/// What one client frame asks of the server.
+/// What one client message asks of the server.
 enum ClientAction {
     Continue,
     Detach,
     Shutdown,
 }
 
+async fn attach_writer(writer: &crate::acp::Writer, slot: &ClientSlot, write: Option<WriteHalf>) {
+    let _held = writer.lock().await;
+    *slot.lock() = write;
+}
+
 /// Accepting stays live while a client is attached — a second `hotl attach`
-/// takes over (the previous client is told and dropped) instead of hanging
-/// unread in the listener backlog.
-async fn accept_loop(mut listener: Listener, shared: Arc<Shared>) {
-    let mut reader: Option<tokio::io::Lines<BufReader<ReadHalf>>> = None;
-    let mut sweep = tokio::time::interval(sweep_period(shared.ask_expiry));
+/// takes over (the previous client's connection is closed) instead of
+/// hanging unread in the listener backlog.
+async fn accept_loop(
+    mut listener: Listener,
+    mut connection: Connection,
+    slot: ClientSlot,
+    token: String,
+    ask_expiry: std::time::Duration,
+) {
+    let mut reader: Option<Lines> = None;
+    let mut sweep = tokio::time::interval(sweep_period(ask_expiry));
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
@@ -383,16 +353,14 @@ async fn accept_loop(mut listener: Listener, shared: Arc<Shared>) {
             // (0059 T5). Denying it is the fail-closed answer, and the engine
             // commits the `AskResolved` when its await returns.
             _ = sweep.tick() => {
-                let n = sweep_expired_asks(&shared);
+                let n = connection.expire_parked(ask_expiry);
                 if n > 0 {
-                    send(
-                        &shared,
-                        &json!({"t": "error", "message": format!(
+                    connection
+                        .notice(format!(
                             "{n} parked ask(s) expired after {} s with no human and were denied",
-                            shared.ask_expiry.as_secs()
-                        )}),
-                    )
-                    .await;
+                            ask_expiry.as_secs()
+                        ))
+                        .await;
                 }
             }
             accepted = listener.accept() => {
@@ -405,43 +373,37 @@ async fn accept_loop(mut listener: Listener, shared: Arc<Shared>) {
                 // Authenticate before touching the incumbent (Vuln 1): an
                 // unauthenticated connect can neither drive the session nor
                 // evict the attached human.
-                let Some((new_reader, write)) = authenticate(stream, &shared.token).await else {
+                let Some((new_reader, write, init)) = authenticate(stream, &token).await else {
                     continue;
                 };
-                if reader.is_some() {
-                    send(
-                        &shared,
-                        &json!({"t": "detached", "reason": "another client attached"}),
-                    )
-                    .await;
-                }
-                *shared.client.lock().await = Some(write);
+                attach_writer(connection.writer(), &slot, Some(write)).await;
                 reader = Some(new_reader);
-                resend_pending(&shared).await;
+                connection.forget_prompts();
+                connection.on_message(&init).await;
+                connection.adopt_client_caps();
             }
             // Lines::next_line is cancel-safe: a frame half-read when the
             // accept arm wins stays buffered.
             line = next_line(&mut reader), if reader.is_some() => {
-                match line {
-                    Some(line) => match handle_frame(&line, &shared).await {
-                        ClientAction::Continue => {}
-                        ClientAction::Detach => {
-                            reader = None;
-                            *shared.client.lock().await = None;
-                        }
-                        ClientAction::Shutdown => break,
-                    },
-                    None => { // EOF or read error = detach
+                let action = match line {
+                    Some(line) => on_line(&line, &mut connection).await,
+                    None => ClientAction::Detach,
+                };
+                match action {
+                    ClientAction::Continue => {}
+                    ClientAction::Detach => {
                         reader = None;
-                        *shared.client.lock().await = None;
+                        attach_writer(connection.writer(), &slot, None).await;
+                        connection.forget_prompts();
                     }
+                    ClientAction::Shutdown => break,
                 }
             }
         }
     }
 }
 
-async fn next_line(reader: &mut Option<tokio::io::Lines<BufReader<ReadHalf>>>) -> Option<String> {
+async fn next_line(reader: &mut Option<Lines>) -> Option<String> {
     match reader {
         Some(lines) => lines.next_line().await.ok().flatten(),
         // Unreachable behind the select guard; never resolve regardless.
@@ -449,283 +411,87 @@ async fn next_line(reader: &mut Option<tokio::io::Lines<BufReader<ReadHalf>>>) -
     }
 }
 
-/// Apply one client frame to the session.
-async fn handle_frame(line: &str, shared: &Arc<Shared>) -> ClientAction {
+async fn on_line(line: &str, connection: &mut Connection) -> ClientAction {
     let Ok(msg) = serde_json::from_str::<Value>(line) else {
         return ClientAction::Continue;
     };
-    match msg.get("t").and_then(Value::as_str).unwrap_or("") {
-        // Attach-protocol parity: images ride at the frame's top level, same
-        // {media_type, data} objects and the same validation as ACP. A frame
-        // that fails validation is dropped whole — committing its text while
-        // discarding its attachments would silently change what the human
-        // said — and the client is told why.
-        "prompt" => match crate::images::parse_images(&msg) {
-            Ok(images) => {
-                shared
-                    .handle
-                    .prompt_with(str_field(&msg, "text"), images)
-                    .await
-            }
-            Err(e) => {
-                send(
-                    shared,
-                    &json!({"t": "error", "message": format!("prompt: {e}")}),
-                )
-                .await
-            }
-        },
-        "steer" => match crate::images::parse_images(&msg) {
-            Ok(images) => {
-                shared
-                    .handle
-                    .steer_with(str_field(&msg, "text"), images)
-                    .await
-            }
-            Err(e) => {
-                send(
-                    shared,
-                    &json!({"t": "error", "message": format!("steer: {e}")}),
-                )
-                .await
-            }
-        },
-        "continue" => shared.handle.continue_turn().await,
-        "cancel" => shared.handle.interrupt(),
-        "ask_reply" => {
-            if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                if let Some((reply, _, _)) = shared
-                    .pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&id)
-                {
-                    let allow = msg.get("allow").and_then(Value::as_bool).unwrap_or(false);
-                    let deny_msg = msg.get("message").and_then(Value::as_str).map(String::from);
-                    let ans = if allow {
-                        hotl_engine::AskReply::Allow
-                    } else {
-                        hotl_engine::AskReply::Deny { message: deny_msg }
-                    };
-                    let _ = reply.send(ans);
+    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+    let writer = connection.writer().clone();
+    let session_id = connection.session_id().unwrap_or_default().to_string();
+    match msg.get("method").and_then(Value::as_str) {
+        Some("initialize") => {
+            connection.on_message(&msg).await;
+            connection.adopt_client_caps();
+        }
+        Some(method @ ("session/new" | "session/load" | "_hotl/session/fork")) => {
+            crate::acp::reply_err(
+                &writer,
+                id,
+                codes::INVALID_PARAMS,
+                &format!(
+                    "{method}: this socket hosts the live session `{session_id}` — attach with session/resume"
+                ),
+            )
+            .await;
+        }
+        Some("session/resume") => {
+            let request = msg
+                .get("params")
+                .cloned()
+                .map(serde_json::from_value::<crate::acp_types::ResumeSessionRequest>);
+            match request {
+                Some(Ok(r)) if r.session_id == session_id => {
+                    crate::acp::reply_ok(&writer, id, connection.resume_result()).await;
+                    for request in connection.parked_requests() {
+                        crate::acp::send(&writer, &request).await;
+                    }
+                }
+                Some(Ok(r)) => {
+                    crate::acp::reply_err(
+                        &writer,
+                        id,
+                        codes::NOT_FOUND,
+                        &format!(
+                            "unknown session `{}` — this socket hosts `{session_id}`",
+                            r.session_id
+                        ),
+                    )
+                    .await;
+                }
+                _ => {
+                    crate::acp::reply_err(
+                        &writer,
+                        id,
+                        codes::INVALID_PARAMS,
+                        "session/resume requires params.sessionId and params.cwd",
+                    )
+                    .await;
                 }
             }
         }
-        "question_reply" => {
-            if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                if let Some((reply, ..)) = shared
-                    .pending_question
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&id)
-                {
-                    // An option label, free text, or neither — a malformed
-                    // answer is `NoHuman`, never a made-up selection.
-                    let ans = match (
-                        msg.get("option").and_then(Value::as_str),
-                        msg.get("text").and_then(Value::as_str),
-                    ) {
-                        (Some(o), _) => hotl_types::QuestionAnswer::Selected(vec![o.to_string()]),
-                        (None, Some(t)) => hotl_types::QuestionAnswer::FreeText(t.to_string()),
-                        (None, None) => hotl_types::QuestionAnswer::NoHuman,
-                    };
-                    let _ = reply.send(ans);
-                }
-            }
+        Some("session/close") => {
+            crate::acp::reply_ok(&writer, id, json!({})).await;
+            return ClientAction::Detach;
         }
-        "egress_reply" => {
-            if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                if let Some((reply, _, _)) = shared
-                    .pending_egress
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&id)
-                {
-                    // An absent or non-boolean `allow` denies, exactly as
-                    // `ask_reply` above: a malformed answer is not a grant.
-                    let allow = msg.get("allow").and_then(Value::as_bool).unwrap_or(false);
-                    let _ = reply.send(if allow {
-                        hotl_tools::net::EgressDecision::Allow
-                    } else {
-                        hotl_tools::net::EgressDecision::Deny
-                    });
-                }
-            }
+        Some("_hotl/session/stop") => {
+            connection.on_message(&msg).await;
+            return ClientAction::Shutdown;
         }
-        "detach" => return ClientAction::Detach,
-        "shutdown" => return ClientAction::Shutdown,
-        _ => {}
+        _ => connection.on_message(&msg).await,
     }
     ClientAction::Continue
-}
-
-/// Re-issue every parked ask to the newly-attached client (the whole point).
-async fn resend_pending(shared: &Arc<Shared>) {
-    let frames: Vec<Value> = {
-        // Prune asks whose reply channel died (turn cancelled/ended) so a
-        // reattach never sees an ask that can no longer be answered.
-        let mut pending = shared
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.retain(|_, (tx, _, _)| !tx.is_closed());
-        let mut questions = shared
-            .pending_question
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        questions.retain(|_, (tx, _, _)| !tx.is_closed());
-        let mut egress = shared
-            .pending_egress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        egress.retain(|_, (tx, _, _)| !tx.is_closed());
-        // An egress ask raised while the TUI was detached must still be
-        // answerable on reattach, or the blocked connection just waits out the
-        // proxy's deadline.
-        pending
-            .values()
-            .map(|(_, f, _)| f.clone())
-            .chain(questions.values().map(|(_, f, _)| f.clone()))
-            .chain(egress.values().map(|(_, f, _)| f.clone()))
-            .collect()
-    };
-    // Tell the client the current session id first (a lightweight hello).
-    send(
-        shared,
-        &json!({"t": "hello", "sessionId": shared.session_id}),
-    )
-    .await;
-    for frame in frames {
-        send(shared, &frame).await;
-    }
-}
-
-async fn drain_events(mut events: tokio::sync::mpsc::Receiver<EngineEvent>, shared: Arc<Shared>) {
-    while let Some(event) = events.recv().await {
-        match event {
-            EngineEvent::Ask {
-                summary,
-                protected_why,
-                reply,
-                ..
-            } => {
-                let id = shared.next_ask.fetch_add(1, Ordering::Relaxed);
-                let frame = json!({
-                    "t": "ask", "id": id, "summary": summary, "protectedWhy": protected_why,
-                });
-                shared
-                    .pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(id, (reply, frame.clone(), std::time::Instant::now()));
-                send(&shared, &frame).await; // no-op if detached; re-sent on attach
-            }
-            EngineEvent::Question {
-                id: qid,
-                question,
-                reply,
-            } => {
-                let id = shared.next_ask.fetch_add(1, Ordering::Relaxed);
-                let frame = json!({
-                    "t": "question",
-                    "id": id,
-                    "questionId": qid,
-                    "header": question.header,
-                    "prompt": question.prompt,
-                    "options": question.options,
-                    "multi": question.multi,
-                });
-                shared
-                    .pending_question
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(id, (reply, frame.clone(), std::time::Instant::now()));
-                send(&shared, &frame).await; // no-op if detached; re-sent on attach
-            }
-            EngineEvent::EgressAsk { host, reply } => {
-                let id = shared.next_ask.fetch_add(1, Ordering::Relaxed);
-                let frame = json!({"t": "egress", "id": id, "host": host});
-                shared
-                    .pending_egress
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(id, (reply, frame.clone(), std::time::Instant::now()));
-                send(&shared, &frame).await; // no-op if detached; re-sent on attach
-            }
-            EngineEvent::TurnDone {
-                outcome,
-                usage,
-                mispredictions,
-            } => {
-                // A turn that ended without its asks being answered left dead
-                // reply channels behind — drop them so they never re-issue.
-                shared
-                    .pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .retain(|_, (tx, _, _)| !tx.is_closed());
-                shared
-                    .pending_egress
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .retain(|_, (tx, _, _)| !tx.is_closed());
-                let mut done = json!({
-                    "t": "turn_done",
-                    "schemaVersion": UPDATE_SCHEMA_VERSION,
-                    "outcome": outcome_tag(&outcome),
-                    "usage": crate::wire::usage_frame(&shared.model, &usage),
-                });
-                if mispredictions > 0 {
-                    done["mispredictions"] = json!(mispredictions);
-                }
-                send(&shared, &done).await;
-            }
-            other => {
-                if let Some(update) = update_payload(&other) {
-                    send(&shared, &json!({"t": "update", "update": update})).await;
-                }
-            }
-        }
-    }
-}
-
-/// Write a frame to the attached client, if any. A broken pipe drops the client.
-async fn send(shared: &Arc<Shared>, frame: &Value) {
-    let mut guard = shared.client.lock().await;
-    if let Some(w) = guard.as_mut() {
-        let mut line = frame.to_string();
-        line.push('\n');
-        if w.write_all(line.as_bytes()).await.is_err() || w.flush().await.is_err() {
-            *guard = None;
-        }
-    }
-}
-
-fn str_field(v: &Value, field: &str) -> String {
-    v.get(field)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hotl_engine::{spawn_session, EngineConfig, SessionDeps};
+    use hotl_engine::{spawn_session, EngineConfig, EngineEvent, SessionDeps};
     use hotl_platform::SystemClock;
     use hotl_provider::ScriptedProvider;
     use hotl_store::{Masker, SessionLog};
     use hotl_tools::{rules::Rules, Registry};
-    use tokio::io::AsyncRead;
+    use tokio::io::AsyncWriteExt;
 
-    /// A unique endpoint id per test, so two tests never collide on the
-    /// machine-wide pipe namespace Windows has and Unix does not.
-    ///
-    /// Short on purpose, and it has to stay that way: a unix socket path is
-    /// capped at 103 bytes on macOS, and under `nix flake check` the run dir
-    /// alone eats 78 of them, leaving 20 for the whole id. `tag` is a label,
-    /// not a sentence — the test's own name carries the meaning. Overrun it and
-    /// hotl-platform's socket-path check names the path and the overage.
     fn endpoint_id(tag: &str) -> String {
         use std::sync::atomic::{AtomicU32, Ordering};
         static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -736,33 +502,10 @@ mod tests {
         )
     }
 
-    /// A connected `(client, server)` pair through the platform seam, so the
-    /// same test body exercises a unix socket or a named pipe.
-    ///
-    /// The listener is dropped once both ends exist — the pair is the point,
-    /// not the accept loop. Tests that want a live server hand the listener to
-    /// `serve_on` instead.
-    async fn connected_pair(tag: &str) -> (Stream, Stream) {
-        let id = endpoint_id(tag);
-        let mut listener = hotl_platform::IPC.bind_private(&id).unwrap();
-        let connecting = {
-            let id = id.clone();
-            tokio::spawn(async move { hotl_platform::IPC.connect(&id).await.unwrap() })
-        };
-        let server = listener.accept().await.unwrap();
-        let client = connecting.await.unwrap();
-        if let Some(p) = hotl_platform::IPC.artifact_path(&id) {
-            let _ = std::fs::remove_file(p);
-        }
-        (client, server)
-    }
-
     fn scripted_session() -> SessionHandle {
         scripted_session_logged().0
     }
 
-    /// The same session, plus the path of the log it writes — the expiry test
-    /// asserts on the `AskResolved` the engine commits when its ask is denied.
     fn scripted_session_logged() -> (SessionHandle, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).unwrap();
@@ -796,31 +539,164 @@ mod tests {
         (handle, log_path)
     }
 
-    async fn next(
-        lines: &mut tokio::io::Lines<tokio::io::BufReader<impl AsyncRead + Unpin>>,
-    ) -> Value {
-        let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+    fn info() -> crate::acp::ServerInfo {
+        crate::acp::ServerInfo {
+            skills: Vec::new(),
+            workflows: Vec::new(),
+            workflows_report: || json!({"runs": []}),
+            default_mode: "ask".into(),
+            default_plan: false,
+            context_window: 200_000,
+            stream_idle_secs: 90,
+            model_resolver: None,
+            key_available: true,
+            sessions_dir: None,
+            fallback_models: Vec::new(),
+            model: "m".into(),
+        }
+    }
+
+    fn served(handle: SessionHandle, ask_expiry: std::time::Duration) -> Served {
+        Served {
+            session_id: "test".into(),
+            info: info(),
+            cwd: std::env::temp_dir(),
+            effort: None,
+            handle,
+            prompt: None,
+            ask_expiry,
+        }
+    }
+
+    fn start(
+        handle: SessionHandle,
+        ask_expiry: std::time::Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let id = endpoint_id("serve");
+        let listener = hotl_platform::IPC.bind_private(&id).unwrap();
+        let task = tokio::spawn(serve_on(listener, served(handle, ask_expiry), "tok".into()));
+        (id, task)
+    }
+
+    struct Client {
+        lines: tokio::io::Lines<BufReader<ReadHalf>>,
+        write: WriteHalf,
+        next_id: u64,
+    }
+
+    impl Client {
+        async fn connect(id: &str) -> Client {
+            let (read, write) = tokio::io::split(hotl_platform::IPC.connect(id).await.unwrap());
+            Client {
+                lines: BufReader::new(read).lines(),
+                write,
+                next_id: 0,
+            }
+        }
+
+        async fn send(&mut self, msg: Value) {
+            let mut line = msg.to_string();
+            line.push('\n');
+            self.write.write_all(line.as_bytes()).await.unwrap();
+            self.write.flush().await.unwrap();
+        }
+
+        async fn request(&mut self, method: &str, params: Value) -> u64 {
+            self.next_id += 1;
+            let id = self.next_id;
+            self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+                .await;
+            id
+        }
+
+        async fn next(&mut self) -> Option<Value> {
+            let line =
+                tokio::time::timeout(std::time::Duration::from_secs(5), self.lines.next_line())
+                    .await
+                    .expect("message timeout")
+                    .ok()
+                    .flatten()?;
+            Some(serde_json::from_str(&line).expect("json line"))
+        }
+
+        async fn until(&mut self, mut found: impl FnMut(&Value) -> bool) -> Value {
+            loop {
+                let msg = self.next().await.expect("the server hung up");
+                if found(&msg) {
+                    return msg;
+                }
+            }
+        }
+
+        async fn reply_to(&mut self, id: u64) -> Value {
+            self.until(|m| m.get("method").is_none() && m["id"] == json!(id))
+                .await
+        }
+
+        async fn request_of(&mut self, method: &str) -> Value {
+            self.until(|m| m["method"] == method && m.get("id").is_some())
+                .await
+        }
+
+        async fn initialize(&mut self, token: Option<&str>, caps: Value) -> u64 {
+            let mut params = json!({"protocolVersion": 1, "clientCapabilities": caps});
+            if let Some(t) = token {
+                params["_meta"] = json!({META_SOCKET_TOKEN: t});
+            }
+            self.request("initialize", params).await
+        }
+
+        async fn attach(id: &str, caps: Value) -> Client {
+            let mut client = Client::connect(id).await;
+            let init = client.initialize(Some("tok"), caps).await;
+            let reply = client.reply_to(init).await;
+            assert_eq!(reply["result"]["protocolVersion"], 1, "{reply}");
+            let resume = client
+                .request(
+                    "session/resume",
+                    json!({"sessionId": "test", "cwd": std::env::temp_dir()}),
+                )
+                .await;
+            let reply = client.next().await.expect("the resume reply");
+            assert_eq!(
+                reply["id"],
+                json!(resume),
+                "the resume reply comes first: {reply}"
+            );
+            assert!(reply.get("result").is_some(), "{reply}");
+            client
+        }
+
+        async fn prompt(&mut self, text: &str) -> u64 {
+            self.request(
+                "session/prompt",
+                json!({"sessionId": "test", "prompt": [{"type": "text", "text": text}]}),
+            )
             .await
-            .expect("frame timeout")
-            .expect("io")
-            .expect("eof");
-        serde_json::from_str(&line).expect("json frame")
+        }
+
+        async fn allow(&mut self, id: &Value) {
+            self.send(json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": {"outcome": "selected", "optionId": "allow"}}}))
+                .await;
+        }
+
+        async fn hung_up(&mut self) -> bool {
+            matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), self.lines.next_line())
+                    .await,
+                Ok(Ok(None)) | Ok(Err(_))
+            )
+        }
     }
 
-    async fn send(w: &mut (impl AsyncWriteExt + Unpin), v: Value) {
-        let mut s = v.to_string();
-        s.push('\n');
-        w.write_all(s.as_bytes()).await.unwrap();
-        w.flush().await.unwrap();
+    fn hotl_caps() -> Value {
+        json!({"session": {"notices": {}}, "_meta": {"hotl.dev/extensions": 1}})
     }
 
-    /// Guards the peer check on every supported transport: an endpoint we
-    /// bound and connected to ourselves must authenticate as us.
-    ///
-    /// It is defence in depth — the boundary is the endpoint's own access
-    /// control, a `0600` socket mode or the pipe's DACL — but a peer check that
-    /// silently always passed would be worse than none, because it reads as a
-    /// second layer while being none.
+    fn log_has(path: &std::path::Path, text: &str) -> bool {
+        std::fs::read_to_string(path).is_ok_and(|s| s.contains(text))
+    }
+
     #[tokio::test]
     async fn a_peer_we_opened_ourselves_authenticates() {
         let id = endpoint_id("peer");
@@ -837,33 +713,234 @@ mod tests {
         }
     }
 
-    /// 0058 T9: an `ask_user` question is parked like a permission ask,
-    /// re-issued on attach, and answered by id — before this it fell through
-    /// the catch-all and resolved `NoHuman` the moment the sender dropped,
-    /// which is how a `human_input` phase would have been answered by nobody.
     #[tokio::test]
-    async fn question_frames_park_and_are_re_issued_on_attach() {
-        let (client_side, server_side) = connected_pair("ques").await;
-        let (_cr, cw) = tokio::io::split(client_side);
-        let (sr, _sw) = tokio::io::split(server_side);
-        let mut lines = tokio::io::BufReader::new(sr).lines();
-        let shared = Arc::new(Shared {
-            handle: scripted_session(),
-            client: AsyncMutex::new(Some(cw)),
-            pending: Mutex::new(HashMap::new()),
-            pending_question: Mutex::new(HashMap::new()),
-            pending_egress: Mutex::new(HashMap::new()),
-            next_ask: AtomicU64::new(1),
-            session_id: "test".into(),
-            token: "tok".into(),
-            model: "m".into(),
-            ask_expiry: std::time::Duration::from_secs(3600),
-        });
-        let (events_tx, events_rx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(drain_events(events_rx, shared.clone()));
+    async fn prompt_round_trip_answers_with_a_stop_reason() {
+        let (id, _task) = start(scripted_session(), std::time::Duration::ZERO);
+        let mut client = Client::attach(&id, hotl_caps()).await;
+        let prompt = client.prompt("go").await;
+        let ask = client.request_of("session/request_permission").await;
+        client.allow(&ask["id"]).await;
+        let reply = client.reply_to(prompt).await;
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+        assert_eq!(
+            reply["result"]["_meta"]["hotl.dev/turn"]["outcome"]["text"],
+            "done in the background"
+        );
+    }
 
+    #[tokio::test]
+    async fn attach_receives_a_parked_ask_as_request_permission() {
+        let (id, _task) = start(scripted_session(), std::time::Duration::ZERO);
+        let mut first = Client::attach(&id, hotl_caps()).await;
+        first.prompt("go").await;
+        let asked = first.request_of("session/request_permission").await;
+        drop(first);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut second = Client::attach(&id, hotl_caps()).await;
+        let reissued = second.next().await.expect("the parked ask");
+        assert_eq!(reissued["method"], "session/request_permission");
+        assert_eq!(reissued["id"], asked["id"], "the same parked ask, same id");
+        assert_eq!(reissued["params"], asked["params"]);
+
+        second.allow(&reissued["id"]).await;
+        let done = second
+            .until(|m| m["params"]["update"]["sessionUpdate"] == "usage_update")
+            .await;
+        assert_eq!(done["params"]["sessionId"], "test");
+    }
+
+    #[tokio::test]
+    async fn detached_render_events_are_dropped() {
+        let (handle, log_path) = scripted_session_logged();
+        let (id, _task) = start(handle, std::time::Duration::ZERO);
+        let mut first = Client::attach(&id, hotl_caps()).await;
+        first.prompt("go").await;
+        let ask = first.request_of("session/request_permission").await;
+        first.allow(&ask["id"]).await;
+        drop(first);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !log_has(&log_path, "done in the background") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the turn never finished"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut second = Client::attach(&id, hotl_caps()).await;
+        let quiet = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            second.lines.next_line(),
+        )
+        .await;
+        assert!(
+            quiet.is_err(),
+            "nothing rendered while detached reaches the next client: {quiet:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_client_takes_over_and_the_first_is_closed() {
+        let (id, _task) = start(scripted_session(), std::time::Duration::ZERO);
+        let mut first = Client::attach(&id, hotl_caps()).await;
+        let mut second = Client::attach(&id, hotl_caps()).await;
+        assert!(
+            first.hung_up().await,
+            "the first client is closed on takeover"
+        );
+        let prompt = second.prompt("go").await;
+        let ask = second.request_of("session/request_permission").await;
+        second.allow(&ask["id"]).await;
+        assert_eq!(
+            second.reply_to(prompt).await["result"]["stopReason"],
+            "end_turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_or_missing_token_is_refused_and_keeps_the_incumbent() {
+        let (id, _task) = start(scripted_session(), std::time::Duration::ZERO);
+        let mut incumbent = Client::attach(&id, hotl_caps()).await;
+        let prompt = incumbent.prompt("go").await;
+        let ask = incumbent.request_of("session/request_permission").await;
+
+        for token in [Some("WRONG"), None] {
+            let mut intruder = Client::connect(&id).await;
+            intruder.initialize(token, json!({})).await;
+            assert!(
+                intruder.hung_up().await,
+                "an unauthenticated initialize is closed without a reply ({token:?})"
+            );
+        }
+        let mut wrong_first = Client::connect(&id).await;
+        wrong_first.prompt("hijack").await;
+        assert!(
+            wrong_first.hung_up().await,
+            "anything before initialize is refused"
+        );
+
+        incumbent.allow(&ask["id"]).await;
+        assert_eq!(
+            incumbent.reply_to(prompt).await["result"]["stopReason"],
+            "end_turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_socket_hosts_one_live_session() {
+        let (id, _task) = start(scripted_session(), std::time::Duration::ZERO);
+        let mut client = Client::connect(&id).await;
+        let init = client.initialize(Some("tok"), hotl_caps()).await;
+        client.reply_to(init).await;
+        let other = client
+            .request(
+                "session/resume",
+                json!({"sessionId": "elsewhere", "cwd": std::env::temp_dir()}),
+            )
+            .await;
+        assert_eq!(client.reply_to(other).await["error"]["code"], -32002);
+        let new = client
+            .request(
+                "session/new",
+                json!({"cwd": std::env::temp_dir(), "mcpServers": []}),
+            )
+            .await;
+        assert_eq!(client.reply_to(new).await["error"]["code"], -32602);
+        let resume = client
+            .request(
+                "session/resume",
+                json!({"sessionId": "test", "cwd": std::env::temp_dir()}),
+            )
+            .await;
+        let reply = client.reply_to(resume).await;
+        assert_eq!(reply["result"]["modes"]["currentModeId"], "ask", "{reply}");
+    }
+
+    #[tokio::test]
+    async fn session_close_detaches_and_the_session_lives_on() {
+        let (id, task) = start(scripted_session(), std::time::Duration::ZERO);
+        let mut client = Client::attach(&id, hotl_caps()).await;
+        let close = client
+            .request("session/close", json!({"sessionId": "test"}))
+            .await;
+        assert!(client.reply_to(close).await.get("result").is_some());
+        assert!(client.hung_up().await);
+        assert!(!task.is_finished());
+        let mut again = Client::attach(&id, hotl_caps()).await;
+        let prompt = again.prompt("go").await;
+        let ask = again.request_of("session/request_permission").await;
+        again.allow(&ask["id"]).await;
+        assert_eq!(
+            again.reply_to(prompt).await["result"]["stopReason"],
+            "end_turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_ends_the_session() {
+        let (id, task) = start(scripted_session(), std::time::Duration::ZERO);
+        let mut client = Client::attach(&id, hotl_caps()).await;
+        let stop = client.request("_hotl/session/stop", json!({})).await;
+        assert_eq!(client.reply_to(stop).await["result"]["ok"], true);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the server exits on stop")
+            .unwrap();
+        assert!(client.hung_up().await);
+    }
+
+    #[tokio::test]
+    async fn a_parked_ask_expires_and_is_denied() {
+        let (handle, log_path) = scripted_session_logged();
+        let (id, _task) = start(handle, std::time::Duration::from_millis(200));
+        let mut client = Client::attach(&id, hotl_caps()).await;
+        let prompt = client.prompt("go").await;
+        let notice = client
+            .until(|m| m["params"]["update"]["sessionUpdate"] == "notice")
+            .await;
+        assert!(
+            notice["params"]["update"]["title"]
+                .as_str()
+                .unwrap_or("")
+                .contains("expired"),
+            "{notice}"
+        );
+        assert_eq!(
+            client.reply_to(prompt).await["result"]["stopReason"],
+            "end_turn"
+        );
+        let resolutions: Vec<bool> = std::fs::read_to_string(&log_path)
+            .expect("read log")
+            .lines()
+            .filter_map(|l| serde_json::from_str::<hotl_types::Entry>(l).ok())
+            .filter_map(|e| match e.payload {
+                hotl_types::EntryPayload::AskResolved { allowed, .. } => Some(allowed),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            resolutions,
+            vec![false],
+            "the expiry is recorded as a denial"
+        );
+    }
+
+    fn injected() -> (SessionHandle, tokio::sync::mpsc::Sender<EngineEvent>) {
+        let mut handle = scripted_session();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        handle.events = rx;
+        (handle, tx)
+    }
+
+    #[tokio::test]
+    async fn a_question_parks_and_is_re_issued_on_attach() {
+        let (handle, events) = injected();
+        let (id, _task) = start(handle, std::time::Duration::from_secs(3600));
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        events_tx
+        events
             .send(EngineEvent::Question {
                 id: "q1".into(),
                 question: hotl_types::Question {
@@ -885,465 +962,100 @@ mod tests {
             })
             .await
             .unwrap();
-        let frame = loop {
-            let f = next(&mut lines).await;
-            if f["t"] == "question" {
-                break f;
-            }
-        };
-        assert_eq!(frame["header"], "Approve");
-        assert_eq!(frame["questionId"], "q1");
-        let id = frame["id"].as_u64().unwrap();
-        assert!(shared.pending_question.lock().unwrap().contains_key(&id));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // A reattach re-issues it: the whole point of parking.
-        resend_pending(&shared).await;
-        let re = loop {
-            let f = next(&mut lines).await;
-            if f["t"] == "question" {
-                break f;
-            }
-        };
-        assert_eq!(re["id"], json!(id), "the same question, same id");
-
-        handle_frame(
-            &json!({"t": "question_reply", "id": id, "option": "ship"}).to_string(),
-            &shared,
+        let mut client = Client::attach(
+            &id,
+            json!({"elicitation": {"form": {}}, "_meta": {"hotl.dev/extensions": 1}}),
         )
         .await;
+        let asked = client.next().await.expect("the parked question");
+        assert_eq!(asked["method"], "elicitation/create", "{asked}");
+        assert_eq!(asked["params"]["message"], "Approve: Ship it?");
+        client
+            .send(json!({"jsonrpc": "2.0", "id": asked["id"], "result": {"action": "accept", "content": {"answer": "ship"}}}))
+            .await;
         assert_eq!(
             reply_rx.await.unwrap(),
             hotl_types::QuestionAnswer::Selected(vec!["ship".into()])
         );
     }
 
-    /// A reply naming no option and no text is nobody's answer — never a
-    /// made-up selection.
     #[tokio::test]
-    async fn a_malformed_question_reply_is_no_human() {
-        let (client_side, server_side) = connected_pair("qbad").await;
-        let (_cr, cw) = tokio::io::split(client_side);
-        let (sr, _sw) = tokio::io::split(server_side);
-        let mut lines = tokio::io::BufReader::new(sr).lines();
-        let shared = Arc::new(Shared {
-            handle: scripted_session(),
-            client: AsyncMutex::new(Some(cw)),
-            pending: Mutex::new(HashMap::new()),
-            pending_question: Mutex::new(HashMap::new()),
-            pending_egress: Mutex::new(HashMap::new()),
-            next_ask: AtomicU64::new(1),
-            session_id: "test".into(),
-            token: "tok".into(),
-            model: "m".into(),
-            ask_expiry: std::time::Duration::from_secs(3600),
-        });
-        let (events_tx, events_rx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(drain_events(events_rx, shared.clone()));
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        events_tx
-            .send(EngineEvent::Question {
-                id: "q2".into(),
-                question: hotl_types::Question {
-                    header: "Approve".into(),
-                    prompt: "Ship it?".into(),
-                    options: vec![hotl_types::QuestionOption {
-                        label: "ship".into(),
-                        description: None,
-                    }],
-                    multi: false,
-                },
-                reply: reply_tx,
-            })
-            .await
-            .unwrap();
-        let id = loop {
-            let f = next(&mut lines).await;
-            if f["t"] == "question" {
-                break f["id"].as_u64().unwrap();
-            }
-        };
-        handle_frame(
-            &json!({"t": "question_reply", "id": id}).to_string(),
-            &shared,
-        )
-        .await;
-        assert_eq!(reply_rx.await.unwrap(), hotl_types::QuestionAnswer::NoHuman);
-    }
-
-    /// Plan 0026's egress prompt through the whole server path: framed on the
-    /// wire, parked for a detached client, answered by id, and swept when the
-    /// turn ends. Driven by feeding the event channel directly — the real
-    /// producer is the proxy, which needs a socket and a blocked connection to
-    /// exercise.
-    #[tokio::test]
-    async fn egress_frames_round_trip_and_a_malformed_reply_denies() {
-        let (client_side, server_side) = connected_pair("egress").await;
-        let (_cr, cw) = tokio::io::split(client_side);
-        let (sr, _sw) = tokio::io::split(server_side);
-        let mut lines = tokio::io::BufReader::new(sr).lines();
-        let shared = Arc::new(Shared {
-            handle: scripted_session(),
-            client: AsyncMutex::new(Some(cw)),
-            pending: Mutex::new(HashMap::new()),
-            pending_question: Mutex::new(HashMap::new()),
-            pending_egress: Mutex::new(HashMap::new()),
-            next_ask: AtomicU64::new(1),
-            session_id: "test".into(),
-            token: "tok".into(),
-            model: "m".into(),
-            ask_expiry: std::time::Duration::ZERO,
-        });
-        let (events_tx, events_rx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(drain_events(events_rx, shared.clone()));
-
-        // 1. An allow round-trips.
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        events_tx
+    async fn an_egress_ask_parks_and_a_malformed_reply_denies() {
+        let (handle, events) = injected();
+        let (id, _task) = start(handle, std::time::Duration::ZERO);
+        let (allow_tx, allow_rx) = tokio::sync::oneshot::channel();
+        events
             .send(EngineEvent::EgressAsk {
                 host: "registry.npmjs.org".into(),
-                reply: reply_tx,
+                reply: allow_tx,
             })
             .await
             .unwrap();
-        let frame = loop {
-            let f = next(&mut lines).await;
-            if f["t"] == "egress" {
-                break f;
-            }
-        };
-        assert_eq!(frame["host"], "registry.npmjs.org");
-        let id = frame["id"].as_u64().unwrap();
-        // Parked, so a client that reattaches later can still answer.
-        assert!(shared.pending_egress.lock().unwrap().contains_key(&id));
-        handle_frame(
-            &json!({"t": "egress_reply", "id": id, "allow": true}).to_string(),
-            &shared,
-        )
-        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut client = Client::attach(&id, hotl_caps()).await;
+        let asked = client.next().await.expect("the parked egress ask");
+        assert_eq!(asked["method"], "session/request_permission");
         assert_eq!(
-            reply_rx.await.unwrap(),
+            asked["params"]["toolCall"]["_meta"]["hotl.dev/egress"]["host"],
+            "registry.npmjs.org"
+        );
+        client.allow(&asked["id"]).await;
+        assert_eq!(
+            allow_rx.await.unwrap(),
             hotl_tools::net::EgressDecision::Allow
         );
 
-        // 2. A reply with no `allow` field denies — asserted, not assumed.
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        events_tx
+        let (deny_tx, deny_rx) = tokio::sync::oneshot::channel();
+        events
             .send(EngineEvent::EgressAsk {
                 host: "evil.example".into(),
-                reply: reply_tx,
+                reply: deny_tx,
             })
             .await
             .unwrap();
-        let frame = loop {
-            let f = next(&mut lines).await;
-            if f["t"] == "egress" {
-                break f;
-            }
-        };
-        let id = frame["id"].as_u64().unwrap();
-        handle_frame(&json!({"t": "egress_reply", "id": id}).to_string(), &shared).await;
+        let asked = client.request_of("session/request_permission").await;
+        client
+            .send(json!({"jsonrpc": "2.0", "id": asked["id"], "result": {"allow": true}}))
+            .await;
         assert_eq!(
-            reply_rx.await.unwrap(),
+            deny_rx.await.unwrap(),
             hotl_tools::net::EgressDecision::Deny
         );
-
-        // 3. A dead reply channel is swept on TurnDone, so it never re-issues
-        //    to a reattaching client.
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        events_tx
-            .send(EngineEvent::EgressAsk {
-                host: "stale.example".into(),
-                reply: reply_tx,
-            })
-            .await
-            .unwrap();
-        loop {
-            if next(&mut lines).await["t"] == "egress" {
-                break;
-            }
-        }
-        drop(reply_rx);
-        events_tx
-            .send(EngineEvent::TurnDone {
-                outcome: hotl_engine::Outcome::Done {
-                    text: String::new(),
-                },
-                usage: Default::default(),
-                mispredictions: 0,
-            })
-            .await
-            .unwrap();
-        loop {
-            if next(&mut lines).await["t"] == "turn_done" {
-                break;
-            }
-        }
-        assert!(
-            shared.pending_egress.lock().unwrap().is_empty(),
-            "a dead egress reply channel must not survive the turn"
-        );
     }
 
-    /// 0059 T5: a parked ask nobody answers is denied once `ask_expiry` is up,
-    /// and the engine records the resolution — the turn resumes instead of
-    /// holding the session open forever.
     #[tokio::test]
-    async fn a_parked_ask_expires_and_is_denied() {
-        let id = endpoint_id("expiry");
-        let listener = hotl_platform::IPC.bind_private(&id).unwrap();
-        let (handle, log_path) = scripted_session_logged();
-        tokio::spawn(serve_on(
-            listener,
-            "test".into(),
-            "m".into(),
-            handle,
-            None,
-            "tok".into(),
-            std::time::Duration::from_millis(200),
+    async fn the_attach_client_opens_with_the_token_and_is_closed_without_it() {
+        let (id, _task) = start(scripted_session(), std::time::Duration::ZERO);
+        for (token, attached) in [("tok", true), ("WRONG", false)] {
+            let (read, write) = tokio::io::split(hotl_platform::IPC.connect(&id).await.unwrap());
+            let mut client = hotl_tui::client::AcpClient::new(write);
+            let mut lines = BufReader::new(read).lines();
+            let opened = crate::attach::open(&mut client, &mut lines, "test", token).await;
+            match opened {
+                crate::attach::Opened::Attached => assert!(attached, "{token}"),
+                crate::attach::Opened::Closed => assert!(!attached, "{token}"),
+                crate::attach::Opened::Refused(e) => panic!("{token}: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn only_an_initialize_with_the_token_authenticates() {
+        let init = |meta: Value| json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"_meta": meta}});
+        assert!(initialize_carries(
+            &init(json!({META_SOCKET_TOKEN: "tok"})),
+            "tok"
         ));
-
-        let (r, mut w) = tokio::io::split(hotl_platform::IPC.connect(&id).await.unwrap());
-        let mut lines = tokio::io::BufReader::new(r).lines();
-        send(&mut w, json!({"t":"auth","token":"tok"})).await;
-        send(&mut w, json!({"t":"prompt","text":"go"})).await;
-
-        // Never answer the ask. The sweep denies it, the turn runs on, and the
-        // client is told why.
-        let (mut expired, mut done) = (false, None);
-        while done.is_none() {
-            let f = next(&mut lines).await;
-            match f["t"].as_str().unwrap_or("") {
-                "error" if f["message"].as_str().unwrap_or("").contains("expired") => {
-                    expired = true
-                }
-                "turn_done" => done = Some(f),
-                _ => {}
-            }
-        }
-        assert!(expired, "the client is told the ask expired");
-        assert_eq!(done.unwrap()["outcome"]["kind"], "done");
-
-        let resolutions: Vec<bool> = std::fs::read_to_string(&log_path)
-            .expect("read log")
-            .lines()
-            .filter_map(|l| serde_json::from_str::<hotl_types::Entry>(l).ok())
-            .filter_map(|e| match e.payload {
-                hotl_types::EntryPayload::AskResolved { allowed, .. } => Some(allowed),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            resolutions,
-            vec![false],
-            "the expiry is recorded as a denial"
-        );
-    }
-
-    /// 0058 T9 × 0059 T5: the ask expiry deliberately does **not** reach
-    /// parked questions. A question authorizes nothing, so leaving one parked
-    /// risks nothing — and a `human_input` workflow step is a recipe
-    /// deliberately waiting for a person, with its own `timeout_secs` chosen
-    /// by whoever wrote it. A global hour would silently override that and
-    /// route `on_timeout` behind the author's back.
-    #[tokio::test]
-    async fn the_ask_expiry_never_touches_a_parked_question() {
-        let shared = Arc::new(Shared {
-            handle: scripted_session(),
-            client: AsyncMutex::new(None),
-            pending: Mutex::new(HashMap::new()),
-            pending_question: Mutex::new(HashMap::new()),
-            pending_egress: Mutex::new(HashMap::new()),
-            next_ask: AtomicU64::new(1),
-            session_id: "test".into(),
-            token: "tok".into(),
-            model: "m".into(),
-            ask_expiry: std::time::Duration::from_secs(3600),
-        });
-        let (ask_tx, ask_rx) = tokio::sync::oneshot::channel();
-        let (q_tx, q_rx) = tokio::sync::oneshot::channel();
-        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(7200);
-        shared
-            .pending
-            .lock()
-            .unwrap()
-            .insert(1, (ask_tx, json!({}), long_ago));
-        shared
-            .pending_question
-            .lock()
-            .unwrap()
-            .insert(2, (q_tx, json!({}), long_ago));
-
-        // Both are two hours old; only the permission ask expires.
-        assert_eq!(sweep_expired_asks(&shared), 1);
-        assert!(matches!(
-            ask_rx.await,
-            Ok(hotl_engine::AskReply::Deny { .. })
+        assert!(!initialize_carries(
+            &init(json!({META_SOCKET_TOKEN: "nope"})),
+            "tok"
         ));
-        assert_eq!(
-            shared.pending_question.lock().unwrap().len(),
-            1,
-            "a question outlives the ask expiry — its deadline is the recipe's"
-        );
-        // Still answerable, which is the whole point.
-        handle_frame(
-            &json!({"t": "question_reply", "id": 2, "option": "ship"}).to_string(),
-            &shared,
-        )
-        .await;
-        assert_eq!(
-            q_rx.await.unwrap(),
-            hotl_types::QuestionAnswer::Selected(vec!["ship".into()])
-        );
-    }
-
-    /// The sweep's own contract, without a socket behind it: only asks past
-    /// the deadline are denied, and the denial says why.
-    #[tokio::test]
-    async fn the_sweep_denies_only_what_is_past_the_deadline() {
-        let shared = Arc::new(Shared {
-            handle: scripted_session(),
-            client: AsyncMutex::new(None),
-            pending: Mutex::new(HashMap::new()),
-            pending_question: Mutex::new(HashMap::new()),
-            pending_egress: Mutex::new(HashMap::new()),
-            next_ask: AtomicU64::new(1),
-            session_id: "test".into(),
-            token: "tok".into(),
-            model: "m".into(),
-            ask_expiry: std::time::Duration::from_secs(3600),
-        });
-        let (old_tx, old_rx) = tokio::sync::oneshot::channel();
-        let (fresh_tx, fresh_rx) = tokio::sync::oneshot::channel();
-        {
-            let mut pending = shared.pending.lock().unwrap();
-            let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(7200);
-            pending.insert(1, (old_tx, json!({}), long_ago));
-            pending.insert(2, (fresh_tx, json!({}), std::time::Instant::now()));
-        }
-        assert_eq!(sweep_expired_asks(&shared), 1);
-        match old_rx.await.expect("the expired ask was answered") {
-            hotl_engine::AskReply::Deny { message } => assert_eq!(
-                message.as_deref(),
-                Some("expired after 3600 s with no human")
-            ),
-            other => panic!("{other:?}"),
-        }
-        assert_eq!(
-            shared.pending.lock().unwrap().len(),
-            1,
-            "the fresh ask stays"
-        );
-        drop(fresh_rx);
-    }
-
-    #[tokio::test]
-    async fn detach_while_asking_then_reattach_reissues_the_ask() {
-        let id = endpoint_id("serve");
-        let listener = hotl_platform::IPC.bind_private(&id).unwrap();
-        tokio::spawn(serve_on(
-            listener,
-            "test".into(),
-            "m".into(),
-            scripted_session(),
-            None,
-            "tok".into(),
-            std::time::Duration::ZERO,
+        assert!(!initialize_carries(&init(json!({})), "tok"));
+        assert!(!initialize_carries(
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "session/prompt", "params": {"_meta": {META_SOCKET_TOKEN: "tok"}}}),
+            "tok"
         ));
-
-        // Attach (authenticate first), prompt; the scripted bash call is gated.
-        let (r, mut w) = tokio::io::split(hotl_platform::IPC.connect(&id).await.unwrap());
-        let mut lines = tokio::io::BufReader::new(r).lines();
-        send(&mut w, json!({"t":"auth","token":"tok"})).await;
-        send(&mut w, json!({"t":"prompt","text":"go"})).await;
-        let ask_id = loop {
-            let f = next(&mut lines).await;
-            if f["t"] == "ask" {
-                break f["id"].as_u64().unwrap();
-            }
-        };
-
-        // Detach WITHOUT answering — the session (and the parked ask) live on.
-        send(&mut w, json!({"t":"detach"})).await;
-        drop((lines, w));
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Reattach: the parked ask is re-issued (the whole point).
-        let (r2, mut w2) = tokio::io::split(hotl_platform::IPC.connect(&id).await.unwrap());
-        let mut lines2 = tokio::io::BufReader::new(r2).lines();
-        send(&mut w2, json!({"t":"auth","token":"tok"})).await;
-        let reissued = loop {
-            let f = next(&mut lines2).await;
-            if f["t"] == "ask" {
-                break f["id"].as_u64().unwrap();
-            }
-        };
-        assert_eq!(
-            reissued, ask_id,
-            "the same parked ask must re-issue on reattach"
-        );
-
-        // Answer it → the turn completes.
-        send(&mut w2, json!({"t":"ask_reply","id":reissued,"allow":true})).await;
-        let done = loop {
-            let f = next(&mut lines2).await;
-            if f["t"] == "turn_done" {
-                break f;
-            }
-        };
-        assert_eq!(done["outcome"]["kind"], "done");
-        assert_eq!(done["outcome"]["text"], "done in the background");
-    }
-
-    #[tokio::test]
-    async fn unauthenticated_connect_is_rejected_and_keeps_the_incumbent() {
-        // Vuln 1: a connect that fails auth is refused and must not evict the
-        // attached human or drive the session.
-        let id = endpoint_id("serve");
-        let listener = hotl_platform::IPC.bind_private(&id).unwrap();
-        tokio::spawn(serve_on(
-            listener,
-            "test".into(),
-            "m".into(),
-            scripted_session(),
-            None,
-            "tok".into(),
-            std::time::Duration::ZERO,
-        ));
-
-        // Authenticated client A drives to a parked ask.
-        let (r, mut w) = tokio::io::split(hotl_platform::IPC.connect(&id).await.unwrap());
-        let mut a = tokio::io::BufReader::new(r).lines();
-        send(&mut w, json!({"t":"auth","token":"tok"})).await;
-        send(&mut w, json!({"t":"prompt","text":"go"})).await;
-        let ask_id = loop {
-            let f = next(&mut a).await;
-            if f["t"] == "ask" {
-                break f["id"].as_u64().unwrap();
-            }
-        };
-
-        // Client B connects with the WRONG token: rejected outright.
-        let (rb, mut wb) = tokio::io::split(hotl_platform::IPC.connect(&id).await.unwrap());
-        let mut b = tokio::io::BufReader::new(rb).lines();
-        send(&mut wb, json!({"t":"auth","token":"WRONG"})).await;
-        assert_eq!(
-            next(&mut b).await["t"],
-            "error",
-            "an unauthenticated connect must be rejected"
-        );
-
-        // A was never evicted — it answers its ask and the turn completes.
-        send(&mut w, json!({"t":"ask_reply","id":ask_id,"allow":true})).await;
-        let done = loop {
-            let f = next(&mut a).await;
-            assert_ne!(
-                f["t"], "detached",
-                "A must not be evicted by an unauthed connect"
-            );
-            if f["t"] == "turn_done" {
-                break f;
-            }
-        };
-        assert_eq!(done["outcome"]["kind"], "done");
     }
 }

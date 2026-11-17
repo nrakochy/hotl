@@ -46,12 +46,16 @@ Once attached, it behaves like a line console: type to prompt, type mid-turn to 
 - **Reattach:** `hotl attach <id>` — any parked permission ask is re-presented immediately.
 - **Stop the session:** type `/stop` while attached — ends the background process and removes its socket.
 
+## Attaching from another ACP client
+
+The socket speaks ACP v1, the same JSON-RPC lines `hotl acp` speaks on stdio, so any ACP client can attach. Open with `initialize` and put the session token (the `<id>.token` file next to the socket) in `params._meta["hotl.dev/socketToken"]`; a missing or wrong token closes the connection with no reply. Then send `session/resume` with the session id: there is no history replay, and any parked ask arrives as a `session/request_permission` right after the reply. `session/new` and `session/load` are refused because the session already exists. `session/close`, or just hanging up, detaches and leaves the session running; `_hotl/session/stop` ends it.
+
 ## Answering asks without staying attached
 
 A backgrounded session parks asks indefinitely, so you can `hotl bg` a task, walk away, and approve its steps when you next attach. (The console's ask modal also waits until you answer; only headless `-p` default-denies.)
 
 ## Limits
 
-- **One attacher at a time.** A second `hotl attach` waits until the first detaches.
+- **One attacher at a time.** A second `hotl attach` takes over: the first client is disconnected and the session carries on with the new one.
 - **Not restart-durable.** A backgrounded session lives in a running process — it does **not** survive a machine reboot or the process being killed. Its full history is in the session log, so `hotl resume <id>` reconstructs the conversation into a fresh session, but a mid-turn ask that was parked in memory is lost across a reboot. (Log-backed asks that survive a restart are planned.)
 - **Fire-and-forget without attaching** is also possible for pre-authorized tasks: `hotl -p "…" &` with allow-rules covering what it needs (headless denies anything not pre-approved).

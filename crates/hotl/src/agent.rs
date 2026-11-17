@@ -744,43 +744,7 @@ pub(crate) async fn build_acp_with(
     scaffold.config.cache_ttl = CacheTtl::OneHour;
     // Taken before the closure below moves `scaffold` out of reach.
     let mut warnings = std::mem::take(&mut scaffold.warnings);
-    // Saved workflow recipes (0044): an unparsable file is a warning on the
-    // same channel as every other discovery failure, never printed here.
-    let mut workflows = Vec::new();
-    for found in hotl_workflow::discover(&scaffold.config_dir) {
-        match found.plan {
-            Ok(plan) => workflows.push(crate::acp::WorkflowInfo {
-                name: found.name,
-                description: plan.description.unwrap_or_default(),
-            }),
-            Err(e) => warnings.push(format!("workflow recipe skipped — {e}")),
-        }
-    }
-    let skills: Vec<crate::acp::SkillInfo> = scaffold
-        .skills
-        .iter()
-        .map(|(name, description)| crate::acp::SkillInfo {
-            name: name.clone(),
-            description: description.clone(),
-        })
-        .collect();
-    // What a new session starts in, already coerced by `load_rules`
-    // (`with_mode` runs `enforced_mode`), plus the window a context gauge
-    // divides by. Advertised at `initialize` so no client has to guess either.
-    let info = crate::acp::ServerInfo {
-        skills,
-        workflows,
-        workflows_report: crate::workflow::report,
-        default_mode: scaffold.rules.mode().as_str().to_string(),
-        default_plan: scaffold.rules.plan(),
-        context_window: scaffold.config.context_window,
-        stream_idle_secs: scaffold.stream_idle_secs,
-        model: scaffold.model.clone(),
-        model_resolver: Some(model_resolver()),
-        key_available,
-        sessions_dir: Some(sessions_dir()),
-        fallback_models: scaffold.config.fallback_models.clone(),
-    };
+    let info = acp_server_info(&scaffold, key_available, &mut warnings);
     let factory: crate::acp::SessionFactory = Box::new(move |spec| {
         // §S3.2 (TUI/ACP handshake trigger): the provider is process-wide
         // and shared for the ACP connection's lifetime, so every
@@ -1200,6 +1164,50 @@ pub(crate) async fn acp_factory(
     }
 }
 
+fn acp_server_info(
+    scaffold: &Scaffold,
+    key_available: bool,
+    warnings: &mut Vec<String>,
+) -> crate::acp::ServerInfo {
+    // Saved workflow recipes (0044): an unparsable file is a warning on the
+    // same channel as every other discovery failure, never printed here.
+    let mut workflows = Vec::new();
+    for found in hotl_workflow::discover(&scaffold.config_dir) {
+        match found.plan {
+            Ok(plan) => workflows.push(crate::acp::WorkflowInfo {
+                name: found.name,
+                description: plan.description.unwrap_or_default(),
+            }),
+            Err(e) => warnings.push(format!("workflow recipe skipped — {e}")),
+        }
+    }
+    let skills: Vec<crate::acp::SkillInfo> = scaffold
+        .skills
+        .iter()
+        .map(|(name, description)| crate::acp::SkillInfo {
+            name: name.clone(),
+            description: description.clone(),
+        })
+        .collect();
+    // What a new session starts in, already coerced by `load_rules`
+    // (`with_mode` runs `enforced_mode`), plus the window a context gauge
+    // divides by. Advertised at `initialize` so no client has to guess either.
+    crate::acp::ServerInfo {
+        skills,
+        workflows,
+        workflows_report: crate::workflow::report,
+        default_mode: scaffold.rules.mode().as_str().to_string(),
+        default_plan: scaffold.rules.plan(),
+        context_window: scaffold.config.context_window,
+        stream_idle_secs: scaffold.stream_idle_secs,
+        model: scaffold.model.clone(),
+        model_resolver: Some(model_resolver()),
+        key_available,
+        sessions_dir: Some(sessions_dir()),
+        fallback_models: scaffold.config.fallback_models.clone(),
+    }
+}
+
 /// The hook `serve` calls on `_hotl/session/reload_config`: rebuild the factory from
 /// whatever `config.toml` says *now*. Boxed because the protocol layer must not
 /// know how a scaffold is built — only that one can be rebuilt.
@@ -1313,7 +1321,19 @@ pub async fn serve_main(
             deps
         },
     );
-    crate::session_server::serve(id, scaffold.model.clone(), handle, prompt, ask_expiry).await
+    let mut warnings = Vec::new();
+    let info = acp_server_info(&scaffold, true, &mut warnings);
+    print_warnings(&warnings);
+    crate::session_server::serve(crate::session_server::Served {
+        session_id: id,
+        info,
+        cwd: root.unwrap_or_else(|| scaffold.cwd.clone()),
+        effort: scaffold.config.effort.map(|e| e.as_str().to_string()),
+        handle,
+        prompt,
+        ask_expiry,
+    })
+    .await
 }
 
 /// The deps every session shares (provider, registry-with-spawn, rules, hooks,
@@ -3986,7 +4006,7 @@ struct Surface {
     max_turns: i64,
     /// The session's primary model — prices `turn_done.usage.cost_usd` in the
     /// `--json` stream (Task 5). A fallback model used mid-turn is priced as
-    /// this one anyway; see `wire::usage_frame`.
+    /// this one anyway; see `wire::UsageFrame::of`.
     model: String,
     /// One interrupt stream for the surface's lifetime — registered once,
     /// not per select iteration.

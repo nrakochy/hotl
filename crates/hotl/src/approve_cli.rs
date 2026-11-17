@@ -8,8 +8,9 @@
 //! for a person is only useful if the person can answer from where they are.
 
 use hotl_platform::Ipc as _;
+use hotl_tui::client::{AcpClient, ServerMsg};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 const USAGE: &str = "usage:\n  \
      hotl approve <session>                       list what it is waiting on\n  \
@@ -26,18 +27,42 @@ pub async fn approve_main(args: &[String]) -> i32 {
         eprintln!("hotl approve: no live session `{id}` (`hotl attach` lists them)");
         return 1;
     };
-    let reply = match parse(&args[1..]) {
+    let answer = match parse(&args[1..]) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("hotl approve: {e}\n{USAGE}");
             return 2;
         }
     };
-    connect(&id, reply).await
+    connect(&id, answer).await
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    Ask { id: u64, allow: bool },
+    Question { id: u64, option: String },
+}
+
+impl Answer {
+    fn id(&self) -> u64 {
+        match self {
+            Answer::Ask { id, .. } | Answer::Question { id, .. } => *id,
+        }
+    }
+
+    fn answers(&self, parked: &ServerMsg) -> bool {
+        match (self, parked) {
+            (Answer::Ask { id, .. }, ServerMsg::PermissionRequest { req_id, .. })
+            | (Answer::Question { id, .. }, ServerMsg::QuestionRequest { req_id, .. }) => {
+                id == req_id
+            }
+            _ => false,
+        }
+    }
 }
 
 /// What the caller asked us to send, or `None` to just list.
-fn parse(args: &[String]) -> Result<Option<Value>, String> {
+fn parse(args: &[String]) -> Result<Option<Answer>, String> {
     match args.first().map(String::as_str) {
         None => Ok(None),
         Some("--ask") => {
@@ -53,16 +78,17 @@ fn parse(args: &[String]) -> Result<Option<Value>, String> {
                     return Err(format!("`{other}` is not `allow` or `deny`"));
                 }
             };
-            Ok(Some(json!({"t": "ask_reply", "id": id, "allow": allow})))
+            Ok(Some(Answer::Ask { id, allow }))
         }
         Some("--question") => {
             let id = num(args.get(1), "--question")?;
             let option = args
                 .get(2)
                 .ok_or("`--question <id>` needs the option label to choose")?;
-            Ok(Some(
-                json!({"t": "question_reply", "id": id, "option": option}),
-            ))
+            Ok(Some(Answer::Question {
+                id,
+                option: option.clone(),
+            }))
         }
         Some(other) => Err(format!("`{other}` is not an option")),
     }
@@ -84,7 +110,7 @@ fn resolve(id: &str) -> Option<String> {
         .find(|s| s.starts_with(id))
 }
 
-async fn connect(id: &str, reply: Option<Value>) -> i32 {
+async fn connect(id: &str, answer: Option<Answer>) -> i32 {
     let stream = match hotl_platform::IPC.connect(id).await {
         Ok(s) => s,
         Err(e) => {
@@ -92,7 +118,7 @@ async fn connect(id: &str, reply: Option<Value>) -> i32 {
             return 1;
         }
     };
-    let (read, mut write) = tokio::io::split(stream);
+    let (read, write) = tokio::io::split(stream);
     let token = match std::fs::read_to_string(crate::session_server::token_path(id)) {
         Ok(t) => t,
         Err(e) => {
@@ -100,36 +126,39 @@ async fn connect(id: &str, reply: Option<Value>) -> i32 {
             return 1;
         }
     };
-    let send = |v: &Value| -> String {
-        let mut line = v.to_string();
-        line.push('\n');
-        line
-    };
-    if write
-        .write_all(send(&json!({"t": "auth", "token": token.trim()})).as_bytes())
-        .await
-        .is_err()
-    {
-        eprintln!("hotl approve: could not authenticate to `{id}`");
-        return 1;
+    let mut client = AcpClient::new(write);
+    let mut lines = BufReader::new(read).lines();
+    match crate::attach::open(&mut client, &mut lines, id, token.trim()).await {
+        crate::attach::Opened::Attached => {}
+        crate::attach::Opened::Refused(e) => {
+            eprintln!("hotl approve: `{id}` refused the connection: {e}");
+            return 1;
+        }
+        crate::attach::Opened::Closed => {
+            eprintln!("hotl approve: could not authenticate to `{id}`");
+            return 1;
+        }
     }
 
     // Attaching re-issues everything parked, which is both the listing and
     // the proof the id we are about to answer still exists.
-    let mut lines = BufReader::new(read).lines();
-    let mut parked: Vec<Value> = Vec::new();
+    let mut parked: Vec<ServerMsg> = Vec::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
     loop {
         let next = tokio::time::timeout_at(deadline, lines.next_line()).await;
         match next {
             Ok(Ok(Some(line))) => {
-                if let Ok(msg) = serde_json::from_str::<Value>(&line) {
-                    if matches!(
-                        msg.get("t").and_then(Value::as_str),
-                        Some("ask" | "question" | "egress")
-                    ) {
-                        parked.push(msg);
-                    }
+                let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if let Some(
+                    msg @ (ServerMsg::PermissionRequest { .. }
+                    | ServerMsg::QuestionRequest { .. }
+                    | ServerMsg::EgressRequest { .. }),
+                ) = hotl_tui::client::decode(&msg)
+                {
+                    client.note_server_msg(&msg);
+                    parked.push(msg);
                 }
             }
             // Closed, or nothing more to read: the re-issue is done.
@@ -137,7 +166,7 @@ async fn connect(id: &str, reply: Option<Value>) -> i32 {
         }
     }
 
-    let Some(reply) = reply else {
+    let Some(answer) = answer else {
         if parked.is_empty() {
             println!("{id} is not waiting on anything.");
         } else {
@@ -148,64 +177,54 @@ async fn connect(id: &str, reply: Option<Value>) -> i32 {
         }
         // Detaching rather than dropping: the session must not think a human
         // is still here.
-        let _ = write
-            .write_all(send(&json!({"t": "detach"})).as_bytes())
-            .await;
+        let _ = client.request("session/close", json!({})).await;
         return 0;
     };
 
-    let want = reply["id"].as_u64();
-    if !parked
-        .iter()
-        .any(|p| p.get("id").and_then(Value::as_u64) == want)
-    {
+    let want = answer.id();
+    if !parked.iter().any(|p| answer.answers(p)) {
         eprintln!(
-            "hotl approve: {id} has nothing parked with id {}. Run `hotl approve {id}` to see \
-             what it is waiting on.",
-            want.unwrap_or(0)
+            "hotl approve: {id} has nothing parked with id {want} of that kind. Run `hotl approve \
+             {id}` to see what it is waiting on."
         );
-        let _ = write
-            .write_all(send(&json!({"t": "detach"})).as_bytes())
-            .await;
+        let _ = client.request("session/close", json!({})).await;
         return 1;
     }
-    if write.write_all(send(&reply).as_bytes()).await.is_err() {
+    let sent = match answer {
+        Answer::Ask { id, allow } => client.reply_permission(id, allow, false, None).await,
+        Answer::Question { id, option } => client.reply_question(id, vec![option], None).await,
+    };
+    if sent.is_err() {
         eprintln!("hotl approve: could not send the answer to `{id}`");
         return 1;
     }
-    println!("answered {id} #{}", want.unwrap_or(0));
-    let _ = write
-        .write_all(send(&json!({"t": "detach"})).as_bytes())
-        .await;
+    println!("answered {id} #{want}");
+    let _ = client.request("session/close", json!({})).await;
     0
 }
 
 /// One parked item as the listing shows it.
-fn describe(msg: &Value) -> String {
-    let id = msg.get("id").and_then(Value::as_u64).unwrap_or(0);
-    let text = |k: &str| msg.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-    match msg.get("t").and_then(Value::as_str) {
-        Some("ask") => format!("#{id} ask — {} (--ask {id} allow|deny)", text("summary")),
-        Some("question") => {
-            let options: Vec<String> = msg
-                .get("options")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|o| o.get("label").and_then(Value::as_str))
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
+fn describe(msg: &ServerMsg) -> String {
+    match msg {
+        ServerMsg::PermissionRequest {
+            req_id, summary, ..
+        } => format!("#{req_id} ask — {summary} (--ask {req_id} allow|deny)"),
+        ServerMsg::QuestionRequest { req_id, question } => {
+            let options: Vec<&str> = question.options.iter().map(|o| o.label.as_str()).collect();
+            let what = if question.header.is_empty() {
+                question.prompt.clone()
+            } else {
+                format!("{}: {}", question.header, question.prompt)
+            };
             format!(
-                "#{id} question — {}: {} (--question {id} <{}>)",
-                text("header"),
-                text("prompt"),
+                "#{req_id} question — {what} (--question {req_id} <{}>)",
                 options.join("|")
             )
         }
-        Some("egress") => format!("#{id} egress — {} (attach to answer)", text("host")),
-        _ => format!("#{id}"),
+        ServerMsg::EgressRequest { req_id, host } => {
+            format!("#{req_id} egress — {host} (attach to answer)")
+        }
+        ServerMsg::Update(_) | ServerMsg::Response { .. } => String::new(),
     }
 }
 
@@ -214,22 +233,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_builds_the_wire_frames_and_refuses_anything_else() {
+    fn parse_reads_the_answer_and_refuses_anything_else() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         assert_eq!(parse(&s(&[])).unwrap(), None);
         assert_eq!(
             parse(&s(&["--ask", "3", "allow"])).unwrap(),
-            Some(json!({"t": "ask_reply", "id": 3, "allow": true}))
+            Some(Answer::Ask { id: 3, allow: true })
         );
         assert_eq!(
             parse(&s(&["--ask", "3", "deny"])).unwrap(),
-            Some(json!({"t": "ask_reply", "id": 3, "allow": false}))
+            Some(Answer::Ask {
+                id: 3,
+                allow: false
+            })
         );
         assert_eq!(
             parse(&s(&["--question", "7", "ship"])).unwrap(),
-            Some(json!({"t": "question_reply", "id": 7, "option": "ship"}))
+            Some(Answer::Question {
+                id: 7,
+                option: "ship".into()
+            })
         );
-        // A verdict that is neither is refused, never read as a grant.
         assert!(parse(&s(&["--ask", "3", "maybe"]))
             .unwrap_err()
             .contains("not `allow` or `deny`"));
@@ -245,20 +269,62 @@ mod tests {
             .contains("not an option"));
     }
 
+    fn decoded(msg: Value) -> ServerMsg {
+        hotl_tui::client::decode(&msg).expect("a parked request")
+    }
+
     #[test]
     fn the_listing_names_the_flag_that_answers_each_item() {
-        let ask = describe(&json!({"t": "ask", "id": 2, "summary": "write Makefile"}));
-        assert!(ask.contains("#2 ask — write Makefile"), "{ask}");
-        assert!(ask.contains("--ask 2 allow|deny"), "{ask}");
+        let ask = decoded(
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/request_permission",
+            "params": {"sessionId": "s", "toolCall": {"toolCallId": "t", "title": "write Makefile"}, "options": []}}),
+        );
+        let line = describe(&ask);
+        assert!(line.contains("#2 ask — write Makefile"), "{line}");
+        assert!(line.contains("--ask 2 allow|deny"), "{line}");
 
-        let q = describe(&json!({
-            "t": "question", "id": 5, "header": "Ship?", "prompt": "the release",
-            "options": [{"label": "ship"}, {"label": "redo"}]
-        }));
-        assert!(q.contains("#5 question — Ship?: the release"), "{q}");
-        assert!(q.contains("--question 5 <ship|redo>"), "{q}");
+        let q = decoded(
+            json!({"jsonrpc": "2.0", "id": 5, "method": "elicitation/create",
+            "params": {"message": "Ship?: the release", "requestedSchema": {"type": "object",
+                "properties": {"answer": {"type": "string", "enum": ["ship", "redo"]}}}}}),
+        );
+        let line = describe(&q);
+        assert!(line.contains("#5 question — Ship?: the release"), "{line}");
+        assert!(line.contains("--question 5 <ship|redo>"), "{line}");
 
-        let e = describe(&json!({"t": "egress", "id": 9, "host": "example.com"}));
-        assert!(e.contains("example.com") && e.contains("attach"), "{e}");
+        let e = decoded(
+            json!({"jsonrpc": "2.0", "id": 9, "method": "session/request_permission",
+            "params": {"sessionId": "s", "toolCall": {"toolCallId": "e", "_meta": {"hotl.dev/egress": {"host": "example.com"}}}, "options": []}}),
+        );
+        let line = describe(&e);
+        assert!(
+            line.contains("example.com") && line.contains("attach"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn an_ask_answer_never_answers_an_egress_prompt_or_a_question() {
+        let egress = ServerMsg::EgressRequest {
+            req_id: 4,
+            host: "example.com".into(),
+        };
+        let ask = Answer::Ask { id: 4, allow: true };
+        assert!(!ask.answers(&egress));
+        let question = ServerMsg::QuestionRequest {
+            req_id: 4,
+            question: hotl_tools::ask::Question {
+                header: String::new(),
+                prompt: "p".into(),
+                options: Vec::new(),
+                multi: false,
+            },
+        };
+        assert!(!ask.answers(&question));
+        assert!(Answer::Question {
+            id: 4,
+            option: "x".into()
+        }
+        .answers(&question));
     }
 }

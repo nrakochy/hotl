@@ -688,23 +688,19 @@ impl OutcomeFrame {
     }
 }
 
-/// A turn's usage as JSON, `hit_ratio` and `cost_usd` added on top when there
-/// is something to report (§S1 cache telemetry; Task 5 cost telemetry).
-/// Single derivation site so headless `--json` and the ACP wire (`acp.rs`'s
-/// `TurnDone` handling) can't drift on either formula. Both are omitted, not
-/// `null`, when absent — a plain, uncached turn's usage bytes on an
-/// uncatalogued model are unchanged from before these fields existed.
-///
-/// `model` prices the whole turn at the session's PRIMARY model. A turn can
-/// aggregate samples served by a fallback model mid-turn (`FallbackModel`
-/// events) at a different rate — this is accepted imprecision, not a bug:
-/// the alternative (pricing per-sample) would need usage attribution this
-/// wire shape doesn't carry.
-pub fn usage_frame(model: &str, usage: &TokenUsage) -> Value {
-    serde_json::to_value(UsageFrame::of(model, usage)).expect("usage always serializes")
-}
-
 impl UsageFrame {
+    /// A turn's usage as JSON, `hit_ratio` and `cost_usd` added on top when there
+    /// is something to report (§S1 cache telemetry; Task 5 cost telemetry).
+    /// Single derivation site so headless `--json` and the ACP wire (`acp.rs`'s
+    /// `TurnDone` handling) can't drift on either formula. Both are omitted, not
+    /// `null`, when absent — a plain, uncached turn's usage bytes on an
+    /// uncatalogued model are unchanged from before these fields existed.
+    ///
+    /// `model` prices the whole turn at the session's PRIMARY model. A turn can
+    /// aggregate samples served by a fallback model mid-turn (`FallbackModel`
+    /// events) at a different rate — this is accepted imprecision, not a bug:
+    /// the alternative (pricing per-sample) would need usage attribution this
+    /// wire shape doesn't carry.
     pub fn of(model: &str, usage: &TokenUsage) -> UsageFrame {
         UsageFrame {
             usage: *usage,
@@ -723,7 +719,7 @@ impl UsageFrame {
 /// shape lives here, which is what makes the whole stream pin-testable.
 ///
 /// `model` is the session's primary model, needed only for the `TurnDone`
-/// arm's `cost_usd` — see `usage_frame`.
+/// arm's `cost_usd` — see `UsageFrame::of`.
 pub fn json_frame(event: &EngineEvent, model: &str) -> Value {
     let frame = Frame::stream(event).unwrap_or_else(|| match event {
         EngineEvent::TurnDone {

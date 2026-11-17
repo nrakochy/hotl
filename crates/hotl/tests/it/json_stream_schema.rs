@@ -884,7 +884,7 @@ fn cache_warm_frames_are_streamable_and_versioned() {
     assert_eq!(u["cost_usd"], json!(0.06));
     let f = wire::json_frame(&ev, "test-model");
     assert_eq!(f["schema_version"], json!(wire::JSON_STREAM_SCHEMA_VERSION));
-    // No price, no key — the additive rule `usage_frame` follows.
+    // No price, no key — the additive rule `UsageFrame::of` follows.
     let unpriced = wire::update_frame(&EngineEvent::CacheWarmed {
         usage: Default::default(),
         cost_usd: None,
@@ -946,7 +946,7 @@ fn turn_done_usage_omits_hit_ratio_without_cache_activity() {
 
 /// 0050 T5: the misprediction count is additive on `turn_done`, and omitted
 /// at zero rather than written as `0` — the same omitted-not-null rule
-/// `usage_frame` follows, so an existing client's bytes do not move.
+/// `UsageFrame::of` follows, so an existing client's bytes do not move.
 #[test]
 fn turn_done_carries_mispredictions_only_when_there_were_any() {
     let with = wire::json_frame(

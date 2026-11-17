@@ -381,7 +381,7 @@ fn decode_question(params: &Value) -> Option<Question> {
     })
 }
 
-fn decode(msg: &Value) -> Option<ServerMsg> {
+pub fn decode(msg: &Value) -> Option<ServerMsg> {
     match msg.get("method").and_then(Value::as_str) {
         Some("session/update") => {
             let update = msg.pointer("/params/update")?;

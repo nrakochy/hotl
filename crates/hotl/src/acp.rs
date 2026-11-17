@@ -31,9 +31,6 @@ use crate::acp_types::{
     SetSessionConfigOptionResponse, SetSessionModeRequest, UsageUpdate,
 };
 
-/// Stable schema version of `session/update` / prompt-result payloads (an MD
-/// Tier-1 contract — bump only on a breaking change).
-pub const UPDATE_SCHEMA_VERSION: u32 = 1;
 pub const ACP_PROTOCOL_VERSION: u16 = 1;
 
 pub const ACP_SCHEMA_CHECKED: &str = "agent-client-protocol-schema 1.18.0";
@@ -54,17 +51,34 @@ pub const EXTENSION_METHODS: &[&str] = &[
     "_hotl/session/jobs/stop",
     "_hotl/session/children",
     "_hotl/session/children/stop",
+    "_hotl/session/stop",
     "_hotl/session/update",
     "_hotl/session/request_question",
 ];
 
 pub const META_METHODS: &str = "hotl.dev/methods";
 
-type Writer = Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
-struct AskSlot {
-    reply: oneshot::Sender<AskReply>,
+pub(crate) type Writer = Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
+
+pub(crate) struct Sent {
+    pub(crate) request: Value,
+    pub(crate) at: std::time::Instant,
+}
+
+impl Sent {
+    pub(crate) fn new(request: Value) -> Self {
+        Sent {
+            request,
+            at: std::time::Instant::now(),
+        }
+    }
+}
+
+pub(crate) struct AskSlot {
+    pub(crate) reply: oneshot::Sender<AskReply>,
     offered: Vec<crate::acp_types::PermissionOption>,
     ext: bool,
+    pub(crate) sent: Sent,
 }
 
 type Pending = Arc<std::sync::Mutex<HashMap<u64, AskSlot>>>;
@@ -73,9 +87,10 @@ type Pending = Arc<std::sync::Mutex<HashMap<u64, AskSlot>>>;
 /// counter in `drain_events`, so an id never means two different things.
 type PendingQuestions = Arc<std::sync::Mutex<HashMap<u64, QuestionSlot>>>;
 
-struct QuestionSlot {
-    reply: oneshot::Sender<hotl_types::QuestionAnswer>,
+pub(crate) struct QuestionSlot {
+    pub(crate) reply: oneshot::Sender<hotl_types::QuestionAnswer>,
     form: Option<FormAsk>,
+    pub(crate) sent: Sent,
 }
 
 struct FormAsk {
@@ -101,8 +116,12 @@ fn question_reply_of(msg: &Value, slot: &QuestionSlot) -> hotl_types::QuestionAn
 /// `Pending` and disjoint from it for the same reason: one `req_id` counter,
 /// one meaning per id, but different reply types, so answering an egress
 /// prompt through the tool-ask path could only mis-route.
-type PendingEgress =
-    Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<hotl_tools::net::EgressDecision>>>>;
+type PendingEgress = Arc<std::sync::Mutex<HashMap<u64, EgressSlot>>>;
+
+pub(crate) struct EgressSlot {
+    pub(crate) reply: oneshot::Sender<hotl_tools::net::EgressDecision>,
+    pub(crate) sent: Sent,
+}
 
 fn permission_response(msg: &Value) -> Option<crate::acp_types::RequestPermissionResponse> {
     serde_json::from_value(msg.get("result")?.clone()).ok()
@@ -401,7 +420,7 @@ pub struct ServerInfo {
     /// lifetime (process-per-session), so this is fixed for every
     /// `session/new` and `session/load` this connection sees; a fallback
     /// model used mid-turn is still priced as this one (see
-    /// `wire::usage_frame`).
+    /// `wire::UsageFrame::of`).
     pub model: String,
 }
 
@@ -452,75 +471,296 @@ fn workflow_roster(info: &ServerInfo) -> Vec<RosterEntry> {
 pub async fn serve(
     read: impl AsyncRead + Send + Unpin + 'static,
     write: impl AsyncWrite + Send + Unpin + 'static,
-    mut factory: SessionFactory,
-    mut info: ServerInfo,
-    mut reload: Option<Reload>,
+    factory: SessionFactory,
+    info: ServerInfo,
+    reload: Option<Reload>,
 ) {
-    let mut client_caps = ClientCaps::default();
     let writer: Writer = Arc::new(Mutex::new(Box::new(write)));
-    let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let pending_questions: PendingQuestions = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let pending_egress: PendingEgress = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let mut next_id: u64 = 1;
-    let mut session: Option<SessionState> = None;
-
+    let mut connection = Connection::new(writer, factory, info, reload);
     let mut lines = BufReader::new(read).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
             continue; // unparseable frame, no id to reply to
         };
-        // A client response to one of our permission requests, or one of our
-        // questions (disjoint id spaces — a hit in one map means a miss in
-        // the other, so trying both is safe and order-independent)?
+        connection.on_message(&msg).await;
+    }
+}
+
+pub(crate) struct Connection {
+    writer: Writer,
+    factory: SessionFactory,
+    info: ServerInfo,
+    reload: Option<Reload>,
+    client_caps: ClientCaps,
+    pending: Pending,
+    pending_questions: PendingQuestions,
+    pending_egress: PendingEgress,
+    next_id: u64,
+    session: Option<SessionState>,
+}
+
+pub(crate) struct Hosted {
+    pub(crate) handle: SessionHandle,
+    pub(crate) session_id: String,
+    pub(crate) cwd: std::path::PathBuf,
+    pub(crate) effort: Option<String>,
+    pub(crate) caps: ClientCaps,
+}
+
+impl Connection {
+    pub(crate) fn new(
+        writer: Writer,
+        factory: SessionFactory,
+        info: ServerInfo,
+        reload: Option<Reload>,
+    ) -> Self {
+        Connection {
+            writer,
+            factory,
+            info,
+            reload,
+            client_caps: ClientCaps::default(),
+            pending: Pending::default(),
+            pending_questions: PendingQuestions::default(),
+            pending_egress: PendingEgress::default(),
+            next_id: 1,
+            session: None,
+        }
+    }
+
+    pub(crate) fn hosting(writer: Writer, info: ServerInfo, hosted: Hosted) -> Self {
+        let factory: SessionFactory =
+            Box::new(|_| Err("this connection hosts one session that is already open".into()));
+        let mut connection = Connection::new(writer, factory, info, None);
+        connection.client_caps = hosted.caps;
+        let config = Arc::new(std::sync::Mutex::new(crate::acp_map::ConfigState {
+            model: connection.info.model.clone(),
+            plan: connection.info.default_plan,
+            effort: hosted.effort.unwrap_or_else(|| "default".into()),
+            models: std::iter::once(connection.info.model.clone())
+                .chain(connection.info.fallback_models.iter().cloned())
+                .collect(),
+            ext: hosted.caps.ext,
+            context_window: connection.info.context_window,
+        }));
+        let mut state = start_session(
+            hosted.handle,
+            config,
+            hosted.caps,
+            crate::acp_map::ToolCalls::rooted(&hosted.cwd),
+            hosted.session_id.clone(),
+            hosted.session_id,
+            connection.writer.clone(),
+            connection.pending.clone(),
+            connection.pending_questions.clone(),
+            connection.pending_egress.clone(),
+            &mut connection.next_id,
+            connection.info.model.clone(),
+        );
+        state.mode = connection.info.default_mode.clone();
+        state.cwd = hosted.cwd;
+        state.release_drain();
+        connection.session = Some(state);
+        connection
+    }
+
+    pub(crate) fn writer(&self) -> &Writer {
+        &self.writer
+    }
+
+    pub(crate) fn handle(&self) -> Option<&SessionHandle> {
+        self.session.as_ref().map(|s| &s.handle)
+    }
+
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        self.session.as_ref().map(|s| s.id.as_str())
+    }
+
+    pub(crate) fn adopt_client_caps(&self) {
+        let Some(state) = self.session.as_ref() else {
+            return;
+        };
+        *lock_caps(&state.caps) = self.client_caps;
+        lock_config(&state.config).ext = self.client_caps.ext;
+    }
+
+    pub(crate) fn resume_result(&self) -> Value {
+        let Some(state) = self.session.as_ref() else {
+            return json!({});
+        };
+        to_json(&ResumeSessionResponse {
+            modes: Some(crate::acp_map::session_modes(&state.mode)),
+            config_options: Some(crate::acp_map::config_options(&lock_config(&state.config))),
+            meta: None,
+        })
+    }
+
+    pub(crate) fn parked_requests(&self) -> Vec<Value> {
+        let mut parked: Vec<(u64, Value)> = Vec::new();
+        {
+            let mut asks = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            asks.retain(|_, slot| !slot.reply.is_closed());
+            parked.extend(asks.iter().map(|(id, s)| (*id, s.sent.request.clone())));
+        }
+        {
+            let mut questions = self
+                .pending_questions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            questions.retain(|_, slot| !slot.reply.is_closed());
+            parked.extend(
+                questions
+                    .iter()
+                    .map(|(id, s)| (*id, s.sent.request.clone())),
+            );
+        }
+        {
+            let mut egress = self
+                .pending_egress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            egress.retain(|_, slot| !slot.reply.is_closed());
+            parked.extend(egress.iter().map(|(id, s)| (*id, s.sent.request.clone())));
+        }
+        parked.sort_by_key(|(id, _)| *id);
+        parked.into_iter().map(|(_, request)| request).collect()
+    }
+
+    pub(crate) fn forget_prompts(&self) {
+        let Some(state) = self.session.as_ref() else {
+            return;
+        };
+        let mut book = lock_prompts(&state.book);
+        book.ids.clear();
+        book.cancelled.clear();
+    }
+
+    pub(crate) fn expire_parked(&self, after: std::time::Duration) -> usize {
+        if after.is_zero() {
+            return 0;
+        }
+        let message = format!("expired after {} s with no human", after.as_secs());
+        let now = std::time::Instant::now();
+        let expired = |sent: &Sent| now.duration_since(sent.at) >= after;
+        let mut n = 0;
+        {
+            let mut asks = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ids: Vec<u64> = asks
+                .iter()
+                .filter(|(_, slot)| expired(&slot.sent))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in ids {
+                if let Some(slot) = asks.remove(&id) {
+                    let _ = slot.reply.send(AskReply::Deny {
+                        message: Some(message.clone()),
+                    });
+                    n += 1;
+                }
+            }
+        }
+        let mut egress = self
+            .pending_egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ids: Vec<u64> = egress
+            .iter()
+            .filter(|(_, slot)| expired(&slot.sent))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            if let Some(slot) = egress.remove(&id) {
+                let _ = slot.reply.send(hotl_tools::net::EgressDecision::Deny);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    pub(crate) async fn notice(&mut self, text: String) {
+        let Some(session_id) = self.session_id() else {
+            return;
+        };
+        if self.client_caps.notices {
+            send_update(
+                &self.writer,
+                session_id,
+                SessionUpdate::Notice(Notice {
+                    severity: NoticeSeverity::Warning,
+                    title: text,
+                    description: None,
+                    meta: None,
+                }),
+            )
+            .await;
+        }
+    }
+
+    pub(crate) async fn on_message(&mut self, msg: &Value) {
         if msg.get("method").is_none() {
             if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                if let Some(slot) = pending_questions
+                if let Some(slot) = self
+                    .pending_questions
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&id)
                 {
-                    let answer = question_reply_of(&msg, &slot);
+                    let answer = question_reply_of(msg, &slot);
                     let _ = slot.reply.send(answer);
-                } else if let Some(reply) = pending_egress
+                } else if let Some(slot) = self
+                    .pending_egress
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&id)
                 {
-                    let _ = reply.send(egress_decision_of(&msg));
-                } else if let Some(slot) = pending
+                    let _ = slot.reply.send(egress_decision_of(msg));
+                } else if let Some(slot) = self
+                    .pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&id)
                 {
-                    let reply = ask_reply_of(&msg, &slot);
+                    let reply = ask_reply_of(msg, &slot);
                     let _ = slot.reply.send(reply);
                 }
             }
-            continue;
+            return;
         }
         if msg.get("id").is_none()
             && msg.get("method").and_then(Value::as_str) != Some("session/cancel")
         {
-            continue;
+            return;
         }
         handle_request(
-            &msg,
-            &writer,
-            &mut factory,
-            &mut session,
-            &pending,
-            &pending_questions,
-            &pending_egress,
-            &mut next_id,
-            &mut info,
-            &mut reload,
-            &mut client_caps,
+            msg,
+            &self.writer,
+            &mut self.factory,
+            &mut self.session,
+            &self.pending,
+            &self.pending_questions,
+            &self.pending_egress,
+            &mut self.next_id,
+            &mut self.info,
+            &mut self.reload,
+            &mut self.client_caps,
         )
         .await;
     }
 }
 
 type SharedConfig = Arc<std::sync::Mutex<crate::acp_map::ConfigState>>;
+type SharedCaps = Arc<std::sync::Mutex<ClientCaps>>;
+
+fn lock_caps(caps: &SharedCaps) -> std::sync::MutexGuard<'_, ClientCaps> {
+    caps.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 struct SessionState {
     id: String,
@@ -531,6 +771,8 @@ struct SessionState {
     mcp: Vec<hotl_mcp::config::ServerConfig>,
     handle: SessionHandle,
     config: SharedConfig,
+    caps: SharedCaps,
+    mode: String,
     drain: tokio::task::JoinHandle<()>,
     go: Option<oneshot::Sender<()>>,
     book: PendingPrompt,
@@ -868,6 +1110,10 @@ async fn handle_request(
             }
             reply_ok(writer, id, json!({})).await;
         }
+        "_hotl/session/stop" => {
+            retire_session(writer, session, pending, pending_questions, pending_egress).await;
+            reply_ok(writer, id, to_json(&Ack { ok: true })).await;
+        }
         "session/prompt" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(
@@ -1000,7 +1246,7 @@ async fn handle_request(
             reply_ok(writer, id, to_json(&Ack { ok: true })).await;
         }
         "session/set_mode" => {
-            let Some(state) = session.as_ref() else {
+            let Some(state) = session.as_mut() else {
                 return reply_err(
                     writer,
                     id,
@@ -1032,6 +1278,7 @@ async fn handle_request(
             };
             let effective = hotl_tools::rules::enforced_mode(mode);
             state.handle.set_mode(mode).await;
+            state.mode = effective.as_str().into();
             let session_id = state.id.clone();
             reply_ok(writer, id, json!({})).await;
             send_update(
@@ -1445,12 +1692,12 @@ async fn handle_request(
             {
                 let _ = slot.reply.send(hotl_types::QuestionAnswer::NoHuman);
             }
-            for (_, reply) in pending_egress
+            for (_, slot) in pending_egress
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .drain()
             {
-                let _ = reply.send(hotl_tools::net::EgressDecision::NoAnswer);
+                let _ = slot.reply.send(hotl_tools::net::EgressDecision::NoAnswer);
             }
             let book = state.book.clone();
             let writer = writer.clone();
@@ -2192,6 +2439,7 @@ async fn install_session(
         context_window,
     }));
     let lease = open.lease;
+    let mode = open.mode;
     let mut state = start_session(
         open.handle,
         config,
@@ -2207,6 +2455,7 @@ async fn install_session(
         model.to_string(),
     );
     state._lease = lease;
+    state.mode = mode;
     state.cwd = cwd;
     if !hold_drain {
         state.release_drain();
@@ -2241,6 +2490,8 @@ fn start_session(
     };
     let book = PendingPrompt::default();
     let pending_prompt = book.clone();
+    let caps: SharedCaps = Arc::new(std::sync::Mutex::new(caps));
+    let drain_caps = Arc::clone(&caps);
     let (go, held) = oneshot::channel::<()>();
     let drain = tokio::spawn(async move {
         if held.await.is_ok() {
@@ -2256,7 +2507,7 @@ fn start_session(
                 model,
                 drain_config,
                 link,
-                caps,
+                drain_caps,
                 calls,
             )
             .await;
@@ -2269,6 +2520,8 @@ fn start_session(
         mcp: Vec::new(),
         handle,
         config,
+        caps,
+        mode: String::new(),
         drain,
         go: Some(go),
         book,
@@ -2301,7 +2554,7 @@ async fn drain_events(
     model: String,
     config: SharedConfig,
     link: EngineLink,
-    caps: ClientCaps,
+    shared_caps: SharedCaps,
     mut calls: crate::acp_map::ToolCalls,
 ) {
     let mut held: Option<EngineEvent> = None;
@@ -2313,6 +2566,7 @@ async fn drain_events(
                 None => break,
             },
         };
+        let caps = *lock_caps(&shared_caps);
         // Fold a burst that is already sitting in the queue into one frame —
         // one JSON line, one flush, one client parse. Cross-kind or control
         // events end the fold and are handled next iteration, in order.
@@ -2423,6 +2677,15 @@ async fn drain_events(
                     &caps,
                 );
                 let options = crate::acp_map::ask_options(&summary);
+                let request = json!({
+                    "jsonrpc": "2.0", "id": req_id, "method": "session/request_permission",
+                    "params": to_json(&RequestPermissionRequest {
+                        session_id: session_id.clone(),
+                        tool_call,
+                        options: options.clone(),
+                        meta: None,
+                    }),
+                });
                 pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2430,30 +2693,23 @@ async fn drain_events(
                         req_id,
                         AskSlot {
                             reply,
-                            offered: options.clone(),
+                            offered: options,
                             ext: caps.ext,
+                            sent: Sent::new(request.clone()),
                         },
                     );
-                send(
-                    &writer,
-                    &json!({
-                        "jsonrpc": "2.0", "id": req_id, "method": "session/request_permission",
-                        "params": to_json(&RequestPermissionRequest {
-                            session_id: session_id.clone(),
-                            tool_call,
-                            options,
-                            meta: None,
-                        }),
-                    }),
-                )
-                .await;
+                send(&writer, &request).await;
             }
             EngineEvent::Question {
                 question, reply, ..
             } => {
                 if caps.elicitation_form {
                     req_id += 1;
-                    let request = crate::acp_map::question_form(&session_id, &question, caps.ext);
+                    let form = crate::acp_map::question_form(&session_id, &question, caps.ext);
+                    let request = json!({
+                        "jsonrpc": "2.0", "id": req_id, "method": "elicitation/create",
+                        "params": to_json(&form),
+                    });
                     pending_questions
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2469,36 +2725,34 @@ async fn drain_events(
                                         .collect(),
                                     multi: question.multi,
                                 }),
+                                sent: Sent::new(request.clone()),
                             },
                         );
-                    send(
-                        &writer,
-                        &json!({
-                            "jsonrpc": "2.0", "id": req_id, "method": "elicitation/create",
-                            "params": to_json(&request),
-                        }),
-                    )
-                    .await;
+                    send(&writer, &request).await;
                 } else if caps.ext {
                     req_id += 1;
+                    let request = json!({
+                        "jsonrpc": "2.0", "id": req_id, "method": "_hotl/session/request_question",
+                        "params": to_json(&RequestQuestionParams {
+                            session_id: session_id.clone(),
+                            header: question.header,
+                            prompt: question.prompt,
+                            options: question.options,
+                            multi: question.multi,
+                        }),
+                    });
                     pending_questions
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(req_id, QuestionSlot { reply, form: None });
-                    send(
-                        &writer,
-                        &json!({
-                            "jsonrpc": "2.0", "id": req_id, "method": "_hotl/session/request_question",
-                            "params": to_json(&RequestQuestionParams {
-                                session_id: session_id.clone(),
-                                header: question.header,
-                                prompt: question.prompt,
-                                options: question.options,
-                                multi: question.multi,
-                            }),
-                        }),
-                    )
-                    .await;
+                        .insert(
+                            req_id,
+                            QuestionSlot {
+                                reply,
+                                form: None,
+                                sent: Sent::new(request.clone()),
+                            },
+                        );
+                    send(&writer, &request).await;
                 } else {
                     let _ = reply.send(hotl_types::QuestionAnswer::NoHuman);
                 }
@@ -2509,23 +2763,26 @@ async fn drain_events(
             // editor integration with no in-protocol recourse.
             EngineEvent::EgressAsk { host, reply } => {
                 req_id += 1;
+                let request = json!({
+                    "jsonrpc": "2.0", "id": req_id, "method": "session/request_permission",
+                    "params": to_json(&RequestPermissionRequest {
+                        session_id: session_id.clone(),
+                        tool_call: crate::acp_map::egress_tool_call(req_id, &host, &caps),
+                        options: crate::acp_map::egress_options(),
+                        meta: None,
+                    }),
+                });
                 pending_egress
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(req_id, reply);
-                send(
-                    &writer,
-                    &json!({
-                        "jsonrpc": "2.0", "id": req_id, "method": "session/request_permission",
-                        "params": to_json(&RequestPermissionRequest {
-                            session_id: session_id.clone(),
-                            tool_call: crate::acp_map::egress_tool_call(req_id, &host, &caps),
-                            options: crate::acp_map::egress_options(),
-                            meta: None,
-                        }),
-                    }),
-                )
-                .await;
+                    .insert(
+                        req_id,
+                        EgressSlot {
+                            reply,
+                            sent: Sent::new(request.clone()),
+                        },
+                    );
+                send(&writer, &request).await;
             }
             EngineEvent::TurnDone {
                 outcome,
@@ -2546,7 +2803,7 @@ async fn drain_events(
                 pending_egress
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .retain(|_, tx| !tx.is_closed());
+                    .retain(|_, slot| !slot.reply.is_closed());
                 calls.end_turn();
                 let misses = (mispredictions > 0).then_some(mispredictions);
                 let frame = crate::wire::UsageFrame::of(&model, &usage);
@@ -2649,19 +2906,6 @@ async fn reply_turn_end(
     }
 }
 
-/// The `session/update` payload for an event, or `None` when the event is not
-/// a stream frame. Thin alias over [`crate::wire::update_frame`] — there used
-/// to be three copies of this mapping and they had already drifted (§7); one
-/// renderer means a new `EngineEvent` variant cannot reach one surface and
-/// silently miss another.
-pub(crate) fn update_payload(event: &EngineEvent) -> Option<Value> {
-    crate::wire::update_frame(event)
-}
-
-pub(crate) fn outcome_tag(outcome: &Outcome) -> Value {
-    crate::wire::outcome_frame(outcome)
-}
-
 async fn notify_ext(writer: &Writer, session_id: &str, update: Value) {
     send(
         writer,
@@ -2674,7 +2918,7 @@ async fn notify_ext(writer: &Writer, session_id: &str, update: Value) {
     .await;
 }
 
-async fn send_update(writer: &Writer, session_id: &str, update: SessionUpdate) {
+pub(crate) async fn send_update(writer: &Writer, session_id: &str, update: SessionUpdate) {
     let params = SessionNotification {
         session_id: session_id.to_string(),
         update,
@@ -2686,7 +2930,7 @@ async fn send_update(writer: &Writer, session_id: &str, update: SessionUpdate) {
     .await;
 }
 
-async fn reply_ok(writer: &Writer, id: Value, result: Value) {
+pub(crate) async fn reply_ok(writer: &Writer, id: Value, result: Value) {
     send(
         writer,
         &json!({"jsonrpc": "2.0", "id": id, "result": result}),
@@ -2694,7 +2938,7 @@ async fn reply_ok(writer: &Writer, id: Value, result: Value) {
     .await;
 }
 
-async fn reply_err(writer: &Writer, id: Value, code: i64, message: &str) {
+pub(crate) async fn reply_err(writer: &Writer, id: Value, code: i64, message: &str) {
     send(
         writer,
         &json!({"jsonrpc": "2.0", "id": id, "error": ErrorObject::new(code, message)}),
@@ -2702,7 +2946,7 @@ async fn reply_err(writer: &Writer, id: Value, code: i64, message: &str) {
     .await;
 }
 
-async fn send(writer: &Writer, msg: &Value) {
+pub(crate) async fn send(writer: &Writer, msg: &Value) {
     let mut line = msg.to_string();
     line.push('\n');
     let mut w = writer.lock().await;
@@ -2761,10 +3005,10 @@ mod drain_tests {
             EngineLink {
                 meter: hotl_engine::Meter::default(),
             },
-            ClientCaps {
+            Arc::new(std::sync::Mutex::new(ClientCaps {
                 ext: true,
                 ..ClientCaps::default()
-            },
+            })),
             crate::acp_map::ToolCalls::default(),
         )
         .await;
@@ -2958,6 +3202,106 @@ mod drain_tests {
 }
 
 #[cfg(test)]
+mod parked_tests {
+    use super::*;
+
+    fn connection() -> Connection {
+        let writer: Writer = Arc::new(Mutex::new(Box::new(tokio::io::sink())));
+        let info = ServerInfo {
+            skills: Vec::new(),
+            workflows: Vec::new(),
+            workflows_report: || json!({"runs": []}),
+            default_mode: "ask".into(),
+            default_plan: false,
+            context_window: 200_000,
+            stream_idle_secs: 90,
+            model_resolver: None,
+            key_available: true,
+            sessions_dir: None,
+            fallback_models: Vec::new(),
+            model: "m".into(),
+        };
+        Connection::new(writer, Box::new(|_| Err("no".into())), info, None)
+    }
+
+    fn sent_at(request: Value, at: std::time::Instant) -> Sent {
+        Sent { request, at }
+    }
+
+    fn ask(at: std::time::Instant) -> (AskSlot, oneshot::Receiver<AskReply>) {
+        let (reply, rx) = oneshot::channel();
+        (
+            AskSlot {
+                reply,
+                offered: crate::acp_map::ask_options("bash: ls"),
+                ext: true,
+                sent: sent_at(json!({"id": "ask"}), at),
+            },
+            rx,
+        )
+    }
+
+    fn two_hours_ago() -> std::time::Instant {
+        std::time::Instant::now() - std::time::Duration::from_secs(7200)
+    }
+
+    #[tokio::test]
+    async fn only_asks_past_the_deadline_are_denied_and_the_denial_says_why() {
+        let connection = connection();
+        let (old, old_rx) = ask(two_hours_ago());
+        let (fresh, fresh_rx) = ask(std::time::Instant::now());
+        connection.pending.lock().unwrap().insert(1, old);
+        connection.pending.lock().unwrap().insert(2, fresh);
+        assert_eq!(
+            connection.expire_parked(std::time::Duration::from_secs(3600)),
+            1
+        );
+        match old_rx.await.expect("the expired ask was answered") {
+            AskReply::Deny { message } => assert_eq!(
+                message.as_deref(),
+                Some("expired after 3600 s with no human")
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(connection.pending.lock().unwrap().len(), 1);
+        assert_eq!(connection.parked_requests(), vec![json!({"id": "ask"})]);
+        drop(fresh_rx);
+        assert!(connection.parked_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_ask_expiry_never_touches_a_parked_question() {
+        let connection = connection();
+        let (ask_slot, ask_rx) = ask(two_hours_ago());
+        let (q_tx, q_rx) = oneshot::channel();
+        connection.pending.lock().unwrap().insert(1, ask_slot);
+        connection.pending_questions.lock().unwrap().insert(
+            2,
+            QuestionSlot {
+                reply: q_tx,
+                form: None,
+                sent: sent_at(json!({"id": "question"}), two_hours_ago()),
+            },
+        );
+        assert_eq!(
+            connection.expire_parked(std::time::Duration::from_secs(3600)),
+            1
+        );
+        assert!(matches!(ask_rx.await, Ok(AskReply::Deny { .. })));
+        assert_eq!(
+            connection.parked_requests(),
+            vec![json!({"id": "question"})]
+        );
+        assert_eq!(
+            connection.expire_parked(std::time::Duration::ZERO),
+            0,
+            "a zero expiry never denies"
+        );
+        drop(q_rx);
+    }
+}
+
+#[cfg(test)]
 mod question_reply_tests {
     use super::*;
 
@@ -2970,6 +3314,7 @@ mod question_reply_tests {
                 offered: vec!["MVP".into()],
                 multi: false,
             }),
+            sent: Sent::new(Value::Null),
         };
         let msg =
             json!({"id": 1, "result": {"outcome": {"outcome": "selected", "optionId": "allow"}}});
@@ -2991,6 +3336,7 @@ mod ask_reply_tests {
                 reply,
                 offered: crate::acp_map::ask_options(summary),
                 ext,
+                sent: Sent::new(Value::Null),
             },
             rx,
         )

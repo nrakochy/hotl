@@ -226,7 +226,7 @@ fn every_acp_payload_validates_against_the_published_schema() {
     acp_valid("PromptResponse", &json!({"stopReason": "end_turn"}));
     acp_valid(
         "TurnMeta",
-        &json!({"outcome": {"kind": "done", "text": "x"}, "usage": wire::usage_frame("claude-opus-5", &TokenUsage { input_tokens: 3, ..Default::default() })}),
+        &json!({"outcome": {"kind": "done", "text": "x"}, "usage": wire::UsageFrame::of("claude-opus-5", &TokenUsage { input_tokens: 3, ..Default::default() })}),
     );
     acp_valid(
         "ExtSessionUpdateParams",
