@@ -53,6 +53,7 @@ pub struct Harness {
     /// groups are written+synced but their acks are withheld. Detached
     /// before the log moves into the session, like `fsyncs`.
     pub pause_acks: Arc<std::sync::atomic::AtomicBool>,
+    sync_delay_us: Arc<std::sync::atomic::AtomicU64>,
     /// Detached fault injector — seals the log on the next write.
     fault: Box<dyn Fn(hotl_store::WriteFault) + Send + Sync>,
 }
@@ -375,6 +376,7 @@ impl Harness {
         }
         let fsyncs = log.fsync_counter();
         let pause_acks = log.pause_ack_handle();
+        let sync_delay_us = log.sync_delay_handle();
         let fault = Box::new(log.fault_injector());
         let log_path = log.path().to_path_buf();
         // Mirror the binary's `record_fresh_seed`: a session's seed is part of
@@ -423,6 +425,7 @@ impl Harness {
             ledger_reports: Vec::new(),
             fsyncs,
             pause_acks,
+            sync_delay_us,
             fault,
         }
     }
@@ -437,6 +440,13 @@ impl Harness {
     pub fn pause_writer(&self, paused: bool) {
         self.pause_acks
             .store(paused, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn delay_syncs(&self, delay: std::time::Duration) {
+        self.sync_delay_us.store(
+            delay.as_micros() as u64,
+            std::sync::atomic::Ordering::SeqCst,
+        );
     }
 
     /// Inject a one-shot write fault at the session's writer.

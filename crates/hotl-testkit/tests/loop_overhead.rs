@@ -53,12 +53,14 @@ const TOOL_ROUND_TRIPS: usize = 20;
 const TRIAL_COUNT: usize = 15;
 
 /// Trials for `gate_would_catch_a_real_regression`. Fewer than `TRIAL_COUNT`
-/// because that check's regression (no sync-noop seam: real `sync_data()`
-/// on every sample) is a huge, systematic shift — tens of milliseconds
-/// against a sub-millisecond baseline — not a noise-sensitive measurement,
+/// because that check's regression (a fixed `TEETH_SYNC_DELAY` at every
+/// sync point) is a large, systematic shift against a sub-millisecond
+/// baseline — not a noise-sensitive measurement,
 /// so it doesn't need the same statistical care. Odd for the same reason as
 /// `TRIAL_COUNT`.
 const TEETH_CHECK_TRIALS: usize = 5;
+
+const TEETH_SYNC_DELAY: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Shared-runner-variance tolerance, NOT a perf target: how many multiples
 /// of the committed baseline a measured p50/p99 may reach before the gate
@@ -197,10 +199,11 @@ fn registry() -> Registry {
 /// Drive one independent trial of the scripted scenario —
 /// `TOOL_ROUND_TRIPS` no-op tool round-trips plus a closing text reply — and
 /// return `(overhead_p50_ns, overhead_p99_ns)` off the turn's single
-/// flushed `LedgerReport`. `use_seam` selects the sync-no-op seam (the
-/// gate's own scenario) or real `sync_data()` (the teeth check's deliberate,
+/// flushed `LedgerReport`. The sync-no-op seam is always on; `sync_delay`
+/// adds a fixed sleep at every sync point (zero for the gate's own scenario,
+/// `TEETH_SYNC_DELAY` for the teeth check's deliberate,
 /// large regression).
-async fn run_scenario(use_seam: bool) -> (u64, u64) {
+async fn run_scenario(sync_delay: std::time::Duration) -> (u64, u64) {
     let mut scripts: Vec<_> = (0..TOOL_ROUND_TRIPS)
         .map(|i| ScriptedProvider::tool_call(&format!("t{i}"), "noop", json!({})))
         .collect();
@@ -210,11 +213,8 @@ async fn run_scenario(use_seam: bool) -> (u64, u64) {
         max_turns: TOOL_ROUND_TRIPS as i64 + 5,
         ..Default::default()
     };
-    let mut h = if use_seam {
-        Harness::with_registry_sync_noop(scripts, config, registry())
-    } else {
-        Harness::with_registry(scripts, config, registry())
-    };
+    let mut h = Harness::with_registry_sync_noop(scripts, config, registry());
+    h.delay_syncs(sync_delay);
     let outcome = h.prompt_and_wait("drive several no-op rounds").await;
     assert!(
         matches!(outcome, Outcome::Done { .. }),
@@ -241,7 +241,7 @@ async fn loop_overhead_stays_within_the_regression_band() {
     let mut p50s = Vec::with_capacity(TRIAL_COUNT);
     let mut p99s = Vec::with_capacity(TRIAL_COUNT);
     for _ in 0..TRIAL_COUNT {
-        let (p50, p99) = run_scenario(true).await;
+        let (p50, p99) = run_scenario(std::time::Duration::ZERO).await;
         p50s.push(p50);
         p99s.push(p99);
     }
@@ -292,8 +292,8 @@ async fn loop_overhead_stays_within_the_regression_band() {
     );
 }
 
-/// Automated teeth check: a real regression — the sync-no-op seam disabled,
-/// so every sample pays a real `sync_data()` — must still trip the gate's
+/// Automated teeth check: a real regression — a fixed `TEETH_SYNC_DELAY` at
+/// every sync point, independent of how fast the runner's disk is — must still trip the gate's
 /// own regression check against the committed baseline. Guards against the
 /// median-of-trials fix (above) smoothing away a genuine regression along
 /// with the noise it was built to absorb.
@@ -303,7 +303,7 @@ async fn gate_would_catch_a_real_regression() {
     let mut p50s = Vec::with_capacity(TEETH_CHECK_TRIALS);
     let mut p99s = Vec::with_capacity(TEETH_CHECK_TRIALS);
     for _ in 0..TEETH_CHECK_TRIALS {
-        let (p50, p99) = run_scenario(false).await;
+        let (p50, p99) = run_scenario(TEETH_SYNC_DELAY).await;
         p50s.push(p50);
         p99s.push(p99);
     }
@@ -318,13 +318,17 @@ async fn gate_would_catch_a_real_regression() {
             REGRESSION_BAND_MULTIPLIER,
             NOISE_FLOOR_P50_NS
         ),
-        "a real regression (sync-noop seam disabled) must trip the p50 gate: \
+        "a real regression ({TEETH_SYNC_DELAY:?} per sync) must trip the p50 gate: \
          median-of-{TEETH_CHECK_TRIALS}-trials={median_p50}ns baseline={baseline_p50}ns"
     );
-    // Not asserted: the gate fails on either percentile, and on a fast-disk
-    // runner a real `sync_data()` can add less than the 1ms p99 floor.
-    eprintln!(
-        "teeth check p99: median-of-{TEETH_CHECK_TRIALS}-trials={median_p99}ns \
-         baseline={baseline_p99}ns"
+    assert!(
+        exceeds_band(
+            median_p99,
+            baseline_p99,
+            REGRESSION_BAND_MULTIPLIER,
+            NOISE_FLOOR_P99_NS
+        ),
+        "a real regression ({TEETH_SYNC_DELAY:?} per sync) must trip the p99 gate: \
+         median-of-{TEETH_CHECK_TRIALS}-trials={median_p99}ns baseline={baseline_p99}ns"
     );
 }

@@ -623,6 +623,7 @@ pub struct SessionLog {
     sync_noop: Arc<AtomicBool>,
     /// Test-only ack gate — see [`SessionLog::pause_ack_handle`].
     pause_acks: Arc<AtomicBool>,
+    sync_delay_us: Arc<AtomicU64>,
     pub session_id: String,
     /// Set by `create_ephemeral`: the log's own temp dir, removed after the
     /// writer joins (`Drop` joins first; this field drops last).
@@ -723,19 +724,29 @@ impl SessionLog {
         let fault = Arc::new(AtomicU8::new(0));
         let sync_noop = Arc::new(AtomicBool::new(false));
         let pause_acks = Arc::new(AtomicBool::new(false));
+        let sync_delay_us = Arc::new(AtomicU64::new(0));
         let writer = std::thread::Builder::new()
             .name(format!("hotl-log-{session_id}"))
             .spawn({
-                let (sealed, fsyncs, fault, sync_noop, pause_acks) = (
+                let (sealed, fsyncs, fault, sync_noop, pause_acks, sync_delay_us) = (
                     Arc::clone(&sealed),
                     Arc::clone(&fsyncs),
                     Arc::clone(&fault),
                     Arc::clone(&sync_noop),
                     Arc::clone(&pause_acks),
+                    Arc::clone(&sync_delay_us),
                 );
                 move || {
                     writer_loop(
-                        file, offset, rx, sealed, fsyncs, fault, sync_noop, pause_acks,
+                        file,
+                        offset,
+                        rx,
+                        sealed,
+                        fsyncs,
+                        fault,
+                        sync_noop,
+                        pause_acks,
+                        sync_delay_us,
                     )
                 }
             })?;
@@ -750,6 +761,7 @@ impl SessionLog {
             fault,
             sync_noop,
             pause_acks,
+            sync_delay_us,
             session_id: session_id.clone(),
             _dir: None,
         };
@@ -1179,6 +1191,11 @@ impl SessionLog {
     pub fn pause_ack_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.pause_acks)
     }
+
+    #[doc(hidden)]
+    pub fn sync_delay_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.sync_delay_us)
+    }
 }
 
 /// Mint one entry id and splice already-serialized-and-masked payload bytes
@@ -1278,6 +1295,7 @@ struct WriterCtx {
     fault: Arc<AtomicU8>,
     sync_noop: Arc<AtomicBool>,
     pause_acks: Arc<AtomicBool>,
+    sync_delay_us: Arc<AtomicU64>,
 }
 
 impl WriterCtx {
@@ -1339,6 +1357,7 @@ fn writer_loop(
     fault: Arc<AtomicU8>,
     sync_noop: Arc<AtomicBool>,
     pause_acks: Arc<AtomicBool>,
+    sync_delay_us: Arc<AtomicU64>,
 ) {
     let ctx = WriterCtx {
         sealed,
@@ -1346,6 +1365,7 @@ fn writer_loop(
         fault,
         sync_noop,
         pause_acks,
+        sync_delay_us,
     };
     let mut batch: Vec<QueuedAppend> = Vec::new();
     while let Ok(cmd) = rx.recv() {
@@ -1485,6 +1505,10 @@ fn commit_batch(
         // not syscalls, so counter-based assertions stay meaningful under the
         // seam (see `set_sync_noop`).
         ctx.fsyncs.fetch_add(1, Ordering::SeqCst);
+        let delay_us = ctx.sync_delay_us.load(Ordering::SeqCst);
+        if delay_us > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(delay_us));
+        }
         // Test-only gate (0033 Task 10): the group is durable on disk, but
         // the acks are withheld until the gate opens. Never reached by the
         // `Buffered` arm — its acks went out before the write, by design.
@@ -4461,6 +4485,7 @@ mod tests {
                 fault: Arc::new(AtomicU8::new(0)),
                 sync_noop: Arc::new(AtomicBool::new(false)),
                 pause_acks: Arc::new(AtomicBool::new(false)),
+                sync_delay_us: Arc::new(AtomicU64::new(0)),
             },
         )
     }
