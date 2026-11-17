@@ -32,11 +32,6 @@ mod bg;
 mod children_tools;
 mod clipboard;
 mod config;
-// Built and tested, not yet reachable from the ask path: `EngineEvent::Ask`
-// carries no `tool`/`input` for `acp.rs` to diff (RQ-2 to R2 — see
-// specs/exec-plans/active/0020-remediation-surface.md). Compiled rather than
-// shelved so it cannot rot before that field lands.
-#[allow(dead_code)]
 mod diffgen;
 mod doctor;
 mod export;

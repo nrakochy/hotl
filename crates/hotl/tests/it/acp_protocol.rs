@@ -1219,10 +1219,12 @@ async fn initialize_new_prompt_permission_and_result() {
             Some("session/request_permission") => {
                 // The bash call is gated → the server asks us. Approve it.
                 assert_eq!(msg["params"]["sessionId"], session_id);
+                assert_eq!(msg["params"]["toolCall"]["status"], "pending");
+                tool_updates.push(("request_permission".into(), "pending".into()));
                 let rid = msg["id"].clone();
                 send(
                     &mut cwrite,
-                    json!({"jsonrpc":"2.0","id":rid,"result":{"allow":true}}),
+                    json!({"jsonrpc":"2.0","id":rid,"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}),
                 )
                 .await;
             }
@@ -1254,10 +1256,11 @@ async fn initialize_new_prompt_permission_and_result() {
     assert_eq!(
         kinds,
         [
-            ("tool_call", "in_progress"),
+            ("request_permission", "pending"),
+            ("tool_call_update", "in_progress"),
             ("tool_call_update", "completed")
         ],
-        "tool status streamed as one tool call, then its update"
+        "the ask announces the call, then updates follow"
     );
 
     // 4. unknown method → JSON-RPC error, no crash.
@@ -1441,7 +1444,7 @@ async fn replacing_a_session_clears_parked_state() {
             let rid = msg["id"].clone();
             send(
                 &mut cwrite,
-                json!({"jsonrpc":"2.0","id":rid,"result":{"allow":true}}),
+                json!({"jsonrpc":"2.0","id":rid,"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}),
             )
             .await;
         } else if msg.get("id") == Some(&json!(4)) {
@@ -2345,7 +2348,7 @@ async fn set_model_during_a_turn_acks_queued_then_broadcasts_at_the_boundary() {
     );
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id": ask["id"],"result":{"allow": true}}),
+        json!({"jsonrpc":"2.0","id": ask["id"],"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}),
     )
     .await;
     let changed = next_standard(&mut lines, "config_option_update").await;
@@ -3268,7 +3271,7 @@ async fn remember_asks_via_request_permission_then_acks_and_broadcasts_memory_ch
         let m = next(&mut lines).await;
         match m.get("method").and_then(Value::as_str) {
             Some("session/request_permission") => {
-                let summary = m["params"]["summary"]
+                let summary = m["params"]["toolCall"]["title"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
@@ -3280,7 +3283,7 @@ async fn remember_asks_via_request_permission_then_acks_and_broadcasts_memory_ch
                 let rid = m["id"].clone();
                 send(
                     &mut cwrite,
-                    json!({"jsonrpc":"2.0","id":rid,"result":{"allow":true}}),
+                    json!({"jsonrpc":"2.0","id":rid,"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}),
                 )
                 .await;
             }
@@ -3491,7 +3494,7 @@ async fn prompt_and_collect_job(
                 let rid = m["id"].clone();
                 send(
                     cwrite,
-                    json!({"jsonrpc":"2.0","id":rid,"result":{"allow":true}}),
+                    json!({"jsonrpc":"2.0","id":rid,"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}),
                 )
                 .await;
             }
@@ -3959,11 +3962,7 @@ async fn every_handled_method_is_advertised_as_an_extension() {
             rest = &tail[end..];
         }
     }
-    for m in [
-        "session/request_permission",
-        "session/request_question",
-        "session/request_egress",
-    ] {
+    for m in ["session/request_permission", "session/request_question"] {
         assert!(src.contains(&format!("\"method\": \"{m}\"")), "{m} is sent");
         handled.push(m.to_string());
     }
@@ -5444,7 +5443,7 @@ async fn cancel_denies_an_open_permission_request() {
     );
     send(
         &mut w,
-        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"allow":true}}),
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}),
     )
     .await;
     send(
@@ -5458,6 +5457,119 @@ async fn cancel_denies_an_open_permission_request() {
             .iter()
             .all(|m| m["params"]["update"]["type"] != "tool_start"),
         "a late allow after cancel ran the tool: {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_plain_client_gets_a_standard_permission_request_and_one_tool_call() {
+    let (_provider, sid, mut w, mut lines) = open_with(
+        vec![
+            ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
+            ScriptedProvider::text_reply("done"),
+        ],
+        json!({"protocolVersion": 1}),
+    )
+    .await;
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "go"}])),
+    )
+    .await;
+    let ask = next_matching_raw(&mut lines, |m| m["method"] == "session/request_permission").await;
+    let params = &ask["params"];
+    assert_eq!(params["sessionId"], sid);
+    assert_eq!(params["toolCall"]["toolCallId"], "t1");
+    assert_eq!(params["toolCall"]["kind"], "execute");
+    assert_eq!(params["toolCall"]["status"], "pending");
+    assert_eq!(
+        params["toolCall"]["rawInput"],
+        json!({"command": "echo hi"})
+    );
+    let options: Vec<(&str, &str)> = params["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| (o["optionId"].as_str().unwrap(), o["kind"].as_str().unwrap()))
+        .collect();
+    assert_eq!(options.first(), Some(&("allow", "allow_once")));
+    assert_eq!(options.last(), Some(&("deny", "reject_once")));
+    assert!(!ask.to_string().contains("hotl.dev/"), "{ask}");
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}),
+    )
+    .await;
+    let (before, reply) = frames_through_reply(&mut lines, 3).await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+    let for_t1: Vec<&Value> = before
+        .iter()
+        .map(|m| &m["params"]["update"])
+        .filter(|u| u["toolCallId"] == "t1")
+        .collect();
+    assert!(
+        for_t1
+            .iter()
+            .all(|u| u["sessionUpdate"] == "tool_call_update"),
+        "the ask announced t1, so no second tool_call: {for_t1:?}"
+    );
+    assert!(
+        for_t1.iter().any(|u| u["status"] == "completed"),
+        "{for_t1:?}"
+    );
+}
+
+#[tokio::test]
+async fn ask_left_unanswered_at_turn_end_is_dropped() {
+    let (_provider, sid, mut w, mut lines) = open_with(
+        vec![
+            ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
+            ScriptedProvider::tool_call("t2", "bash", json!({"command": "echo again"})),
+            ScriptedProvider::text_reply("second done"),
+        ],
+        json!({"protocolVersion": 1}),
+    )
+    .await;
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "go"}])),
+    )
+    .await;
+    let first =
+        next_matching_raw(&mut lines, |m| m["method"] == "session/request_permission").await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId": sid}}),
+    )
+    .await;
+    let (_, reply) = frames_through_reply(&mut lines, 3).await;
+    assert_eq!(reply["result"]["stopReason"], "cancelled", "{reply}");
+    send(
+        &mut w,
+        prompt_msg(4, &sid, json!([{"type": "text", "text": "again"}])),
+    )
+    .await;
+    let second =
+        next_matching_raw(&mut lines, |m| m["method"] == "session/request_permission").await;
+    assert_ne!(first["id"], second["id"]);
+    assert_eq!(second["params"]["toolCall"]["toolCallId"], "t2");
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":first["id"].clone(),"result":{"outcome":{"outcome":"selected","optionId":"deny"}}}),
+    )
+    .await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":second["id"].clone(),"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}),
+    )
+    .await;
+    let (before, reply) = frames_through_reply(&mut lines, 4).await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+    assert!(
+        before
+            .iter()
+            .any(|m| m["params"]["update"]["toolCallId"] == "t2"
+                && m["params"]["update"]["status"] == "completed"),
+        "the stale answer to the first ask did not touch the second: {before:?}"
     );
 }
 
@@ -5485,7 +5597,7 @@ async fn second_prompt_mid_turn_queues() {
     .await;
     send(
         &mut w,
-        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"allow":true}}),
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}),
     )
     .await;
     let (before, first) = frames_through_reply(&mut lines, 3).await;
@@ -5622,7 +5734,7 @@ async fn answer_through_reply(
         if m["method"] == "session/request_permission" {
             send(
                 w,
-                json!({"jsonrpc":"2.0","id":m["id"].clone(),"result":{"allow":true}}),
+                json!({"jsonrpc":"2.0","id":m["id"].clone(),"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}),
             )
             .await;
         }
@@ -5803,7 +5915,7 @@ async fn prompts_past_the_engine_queue_cap_fold_and_every_id_is_answered() {
     }
     send(
         &mut w,
-        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"allow":true}}),
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}),
     )
     .await;
     let got = stop_reasons_for(&mut lines, 3..last + 1).await;
@@ -5857,7 +5969,7 @@ async fn a_job_notice_turn_answers_no_prompt() {
     .await;
     send(
         &mut w,
-        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"allow":true}}),
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}),
     )
     .await;
     let (_, four) = answer_through_reply(&mut w, &mut lines, 4).await;
@@ -5907,7 +6019,7 @@ async fn a_queued_prompt_outranks_the_goal_loop() {
     .await;
     send(
         &mut w,
-        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"allow":true}}),
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}),
     )
     .await;
     let (before, first) = answer_through_reply(&mut w, &mut lines, 3).await;
@@ -5959,7 +6071,7 @@ async fn a_prompt_during_the_resume_continuation_gets_its_own_reply() {
     .await;
     send(
         &mut w,
-        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"allow":true}}),
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}),
     )
     .await;
     let (_, reply) = answer_through_reply(&mut w, &mut lines, 3).await;

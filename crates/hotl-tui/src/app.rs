@@ -34,9 +34,6 @@ pub enum Phase {
         protected_why: Option<String>,
         input: String,
         denying: bool,
-        /// The proposed change, when the server sent one. Empty for every ask
-        /// today — see `hotl::diffgen::for_tool`'s unimplemented-invariant
-        /// marker (RQ-2): the engine's ask carries no tool input to diff.
         diff: Vec<DiffLine>,
     },
     /// A structured `ask_user` question (tier-1 gap #4) — NOT a permission
@@ -1044,7 +1041,7 @@ pub enum Cmd {
     /// Answer a `session/request_question`. Exactly one of `selected`
     /// (a single label — v1 is single-select even when `multi` was set) or
     /// `free_text` is populated.
-    /// Answer a `session/request_egress`. Two answers only, both scoped to
+    /// Answer a network `session/request_permission`. Two answers only, both scoped to
     /// this session: hotl does not write `config.toml`, so a permanent grant
     /// stays a deliberate edit (plan 0026 decision 9).
     ReplyEgress {
@@ -3797,7 +3794,7 @@ fn on_ask_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
 /// process globals is deliberate: in attach mode the TUI is a *different
 /// process* from the engine, where those globals are un-inited.
 pub(crate) fn secret_read_grant_applies(summary: &str) -> bool {
-    summary.starts_with("bash [") && !summary.contains("reads:open")
+    hotl_tools::sandbox::secret_read_grant_applies(summary)
 }
 
 /// `ask_user`'s modal (tier-1 gap #4): number keys 1-N pick an option

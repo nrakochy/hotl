@@ -237,8 +237,12 @@ fn every_acp_payload_validates_against_the_published_schema() {
         &json!({"sessionId": "s", "update": {"sessionUpdate": "usage_update", "used": 10, "size": 200000, "cost": {"amount": 0.5, "currency": "USD"}}}),
     );
     acp_valid(
-        "RequestPermissionParams",
-        &json!({"sessionId": "s", "summary": "bash: ls", "protectedWhy": null}),
+        "RequestPermissionRequest",
+        &json!({"sessionId": "s", "toolCall": {"toolCallId": "t1", "kind": "execute", "status": "pending", "title": "bash: ls", "rawInput": {"command": "ls"}}, "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}, {"optionId": "deny", "name": "Deny", "kind": "reject_once"}]}),
+    );
+    acp_valid(
+        "RequestPermissionResponse",
+        &json!({"outcome": {"outcome": "selected", "optionId": "allow"}}),
     );
     acp_valid("Ack", &json!({"ok": true}));
     acp_valid(

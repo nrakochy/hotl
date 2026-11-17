@@ -736,11 +736,7 @@ async fn write_in_with(
         return Err(ToolOutcome::err(why));
     }
     let target = write_target(root, extras, path);
-    let before = match &target {
-        WriteTarget::Workspace(rel) => before_beneath(root, rel, deny),
-        WriteTarget::Extra(eroot, rel) => before_beneath(eroot, rel, deny),
-        WriteTarget::OutsideApproved => before_plain(std::path::Path::new(path), deny),
-    };
+    let before = before_target(root, &target, path, deny);
     match target {
         WriteTarget::Workspace(rel) => guarded_write_bytes(root, &rel, path, content)?,
         WriteTarget::Extra(eroot, rel) => guarded_write_bytes(&eroot, &rel, path, content)?,
@@ -767,6 +763,38 @@ async fn write_in_with(
             },
         ),
     )
+}
+
+pub fn before_write(root: &std::path::Path, input: &Value) -> crate::Before {
+    before_write_with(root, granted_extras(), input, sandbox::read_deny())
+}
+
+fn before_write_with(
+    root: &std::path::Path,
+    extras: &[std::path::PathBuf],
+    input: &Value,
+    deny: &sandbox::ReadDeny,
+) -> crate::Before {
+    let Some(path) = input.get("path").and_then(Value::as_str) else {
+        return crate::Before::Unshown;
+    };
+    if hotl_own_dir_reason(path).is_some() {
+        return crate::Before::Unshown;
+    }
+    before_target(root, &write_target(root, extras, path), path, deny)
+}
+
+fn before_target(
+    root: &std::path::Path,
+    target: &WriteTarget,
+    path: &str,
+    deny: &sandbox::ReadDeny,
+) -> crate::Before {
+    match target {
+        WriteTarget::Workspace(rel) => before_beneath(root, rel, deny),
+        WriteTarget::Extra(eroot, rel) => before_beneath(eroot, rel, deny),
+        WriteTarget::OutsideApproved => before_plain(std::path::Path::new(path), deny),
+    }
 }
 
 fn before_beneath(
@@ -2980,6 +3008,42 @@ mod tests {
             assert_eq!(out.facts.before, Some(crate::Before::Unshown), "{path}");
             assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
         }
+    }
+
+    #[test]
+    fn a_proposed_write_shows_what_a_read_may_and_writes_nothing() {
+        let (_o, root, home) = fsguard::tests::fixture();
+        std::fs::write(root.join("a.txt"), "old\n").unwrap();
+        std::fs::write(root.join(".env"), "TOKEN=secret\n").unwrap();
+        let deny = sandbox::ReadDeny {
+            rules: vec![root.join(".env")],
+            secrets: vec![home.join(".aws")],
+            ..Default::default()
+        };
+        let before = |path: &str| {
+            before_write_with(
+                &root,
+                &[],
+                &json!({"path": path, "content": "new\n"}),
+                &deny,
+            )
+        };
+        assert_eq!(before("a.txt"), crate::Before::Text("old\n".into()));
+        assert_eq!(before("fresh.txt"), crate::Before::Absent);
+        assert_eq!(before(".env"), crate::Before::Unshown);
+        assert_eq!(
+            before(&home.join(".aws/credentials").display().to_string()),
+            crate::Before::Unshown
+        );
+        assert_eq!(
+            before_write_with(&root, &[], &json!({"content": "x"}), &deny),
+            crate::Before::Unshown
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "old\n"
+        );
+        assert!(!root.join("fresh.txt").exists());
     }
 
     #[test]

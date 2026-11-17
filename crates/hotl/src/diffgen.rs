@@ -163,35 +163,9 @@ fn cap(mut d: Vec<DiffLine>) -> Vec<DiffLine> {
     d
 }
 
-/// A diff for the ask card, when the tool is one that changes a file.
-/// `write`'s "before" is the file on disk — the one I/O in this module, kept
-/// here so `hotl-tui` stays pure.
-///
-/// INVARIANT (unimplemented — see
-/// specs/exec-plans/active/0020-remediation-surface.md RQ-2): every
-/// `edit`/`write` ask carries a diff. `EngineEvent::Ask` does not yet carry
-/// `tool`/`input` (`hotl-engine/src/lib.rs`, raised in `turn.rs`), so
-/// `acp.rs` cannot call this on the ask path. The generator and the renderer
-/// are both built and tested; adoption is populating those two fields at that
-/// one engine call site.
-pub fn for_tool(tool: &str, input: &Value) -> Option<Vec<DiffLine>> {
-    let s = |key: &str| input.get(key).and_then(Value::as_str).unwrap_or("");
-    match tool {
-        "edit" => Some(unified(s("old_string"), s("new_string"))),
-        "write" => {
-            // The file may not exist yet — that is a creation, all additions.
-            let path = input.get("path").and_then(Value::as_str)?;
-            let before = std::fs::read_to_string(path).unwrap_or_default();
-            Some(unified(&before, s("content")))
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn unified_marks_only_what_changed() {
@@ -234,31 +208,6 @@ mod tests {
     #[test]
     fn an_unchanged_file_yields_no_rows() {
         assert!(unified("a\nb\n", "a\nb\n").is_empty());
-    }
-
-    #[test]
-    fn for_tool_handles_edit_write_and_ignores_the_rest() {
-        let edit = for_tool(
-            "edit",
-            &json!({"path": "x.rs", "old_string": "a\n", "new_string": "b\n"}),
-        );
-        assert!(edit.is_some());
-        assert!(for_tool("bash", &json!({"command": "ls"})).is_none());
-        assert!(for_tool("read", &json!({"path": "x"})).is_none());
-    }
-
-    #[test]
-    fn write_diffs_against_the_file_on_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("f.txt");
-        std::fs::write(&path, "old\n").unwrap();
-        let d = for_tool(
-            "write",
-            &json!({"path": path.to_str().unwrap(), "content": "new\n"}),
-        )
-        .expect("write produces a diff");
-        assert_eq!(d[0], DiffLine::new(Op::Del, "old"));
-        assert_eq!(d[1], DiffLine::new(Op::Add, "new"));
     }
 
     #[test]

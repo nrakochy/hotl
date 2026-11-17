@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use hotl_engine::{EngineEvent, Outcome};
+use hotl_engine::{AskReply, EngineEvent, Outcome};
 use hotl_types::{Item, SyntheticReason, TodoStatus, UserImage};
 use serde_json::Value;
 
@@ -9,12 +9,13 @@ use crate::acp::{ClientCaps, SessionOpen, SessionOpenExtras, WorktreeInfo};
 use crate::acp_types::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, CompactionStatus,
     CompactionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
-    EmbeddedResourceResource, McpServer, Meta, Notice, NoticeSeverity, Plan, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, SessionConfigBoolean, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelect,
-    SessionConfigSelectOption, SessionInfoUpdate, SessionMode, SessionModeState, SessionUpdate,
-    StopReason, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    EmbeddedResourceResource, McpServer, Meta, Notice, NoticeSeverity, PermissionOption,
+    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    RequestPermissionOutcome, SessionConfigBoolean, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelect, SessionConfigSelectOption, SessionInfoUpdate,
+    SessionMode, SessionModeState, SessionUpdate, StopReason, ToolCall, ToolCallContent,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    UnstructuredCommandInput,
 };
 
 pub const META_FRAME: &str = "hotl.dev/frame";
@@ -22,6 +23,13 @@ pub const META_DENIED: &str = "hotl.dev/denied";
 pub const META_AUTO_ALLOWED: &str = "hotl.dev/autoAllowed";
 pub const META_FLAGGED: &str = "hotl.dev/flagged";
 pub const META_CHILD: &str = "hotl.dev/child";
+pub const META_PROTECTED_WHY: &str = "hotl.dev/protectedWhy";
+pub const META_ASK: &str = "hotl.dev/ask";
+pub const META_EGRESS: &str = "hotl.dev/egress";
+pub const META_REPLY: &str = "hotl.dev/reply";
+pub const OPTION_ALLOW: &str = "allow";
+pub const OPTION_DENY: &str = "deny";
+pub const OPTION_SECRET_READS: &str = "allow-secret-reads";
 
 const CHILD_TEXT_MAX: usize = 8 * 1024;
 
@@ -166,6 +174,180 @@ impl ToolCalls {
     fn fold_id(&mut self) -> String {
         self.folds += 1;
         format!("fold-{}", self.folds)
+    }
+}
+
+pub struct AskView<'a> {
+    pub call_id: &'a str,
+    pub tool: &'a str,
+    pub input: &'a Value,
+    pub summary: &'a str,
+    pub protected_why: Option<&'a str>,
+}
+
+impl ToolCalls {
+    fn proposed_diff(&self, tool: &str, input: &Value) -> Option<ToolCallContent> {
+        match tool {
+            "edit" => self.diff(tool, input, None),
+            "write" => {
+                let before = hotl_tools::before_write(&self.root, input);
+                self.diff(tool, input, Some(&before))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn ask(&mut self, ask: &AskView, caps: &ClientCaps) -> ToolCallUpdate {
+        let diff = self.proposed_diff(ask.tool, ask.input);
+        let title = match (ask.protected_why, caps.ext) {
+            (Some(why), false) => format!("{} — {why}", ask.summary),
+            _ => ask.summary.to_string(),
+        };
+        let meta = caps.ext.then(|| {
+            let rows: Vec<Value> = match &diff {
+                Some(ToolCallContent::Diff(d)) => {
+                    crate::diffgen::unified(d.old_text.as_deref().unwrap_or(""), &d.new_text)
+                        .iter()
+                        .map(crate::diffgen::DiffLine::to_json)
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            let mut m = Meta::new();
+            if let Some(why) = ask.protected_why {
+                m.insert(META_PROTECTED_WHY.into(), Value::String(why.to_string()));
+            }
+            m.insert(
+                META_ASK.into(),
+                serde_json::json!({
+                    "summary": ask.summary,
+                    "protectedWhy": ask.protected_why,
+                    "diff": rows,
+                }),
+            );
+            m
+        });
+        let locations = self.locations(ask.tool, ask.input);
+        if !self.settled.contains(ask.call_id) {
+            self.open.insert(ask.call_id.to_string(), ask.input.clone());
+        }
+        ToolCallUpdate {
+            tool_call_id: ask.call_id.to_string(),
+            fields: ToolCallUpdateFields {
+                kind: Some(tool_kind(ask.tool)),
+                status: Some(ToolCallStatus::Pending),
+                title: Some(title),
+                content: diff.map(|d| vec![d]),
+                locations,
+                raw_input: Some(ask.input.clone()),
+                raw_output: None,
+            },
+            meta,
+        }
+    }
+}
+
+fn option(id: &str, name: &str, kind: PermissionOptionKind) -> PermissionOption {
+    PermissionOption {
+        option_id: id.to_string(),
+        name: name.to_string(),
+        kind,
+        meta: None,
+    }
+}
+
+pub fn ask_options(summary: &str) -> Vec<PermissionOption> {
+    let mut options = vec![option(
+        OPTION_ALLOW,
+        "Allow",
+        PermissionOptionKind::AllowOnce,
+    )];
+    if hotl_tools::sandbox::secret_read_grant_applies(summary) {
+        options.push(option(
+            OPTION_SECRET_READS,
+            "Allow, including secret files",
+            PermissionOptionKind::AllowOnce,
+        ));
+    }
+    options.push(option(
+        OPTION_DENY,
+        "Deny",
+        PermissionOptionKind::RejectOnce,
+    ));
+    options
+}
+
+pub fn ask_reply(
+    outcome: &RequestPermissionOutcome,
+    meta: Option<&Meta>,
+    ext: bool,
+    offered: &[PermissionOption],
+) -> AskReply {
+    let denied = AskReply::Deny { message: None };
+    let RequestPermissionOutcome::Selected(selected) = outcome else {
+        return denied;
+    };
+    let id = selected.option_id.as_str();
+    if !offered.iter().any(|o| o.option_id == id) {
+        return denied;
+    }
+    let reply = meta.filter(|_| ext).and_then(|m| m.get(META_REPLY));
+    let field = |key: &str| reply.and_then(|r| r.get(key));
+    match id {
+        OPTION_DENY => AskReply::Deny {
+            message: field("message").and_then(Value::as_str).map(String::from),
+        },
+        OPTION_ALLOW | OPTION_SECRET_READS => {
+            if let Some(content) = field("respond").and_then(Value::as_str) {
+                return AskReply::Respond {
+                    content: content.to_string(),
+                };
+            }
+            if let Some(input) = field("input") {
+                return AskReply::AllowEdited {
+                    input: input.clone(),
+                };
+            }
+            if id == OPTION_SECRET_READS {
+                AskReply::AllowWithSecretReads
+            } else {
+                AskReply::Allow
+            }
+        }
+        _ => denied,
+    }
+}
+
+pub fn egress_tool_call(req_id: u64, host: &str, caps: &ClientCaps) -> ToolCallUpdate {
+    ToolCallUpdate {
+        tool_call_id: format!("egress-{req_id}"),
+        fields: ToolCallUpdateFields {
+            kind: Some(ToolKind::Fetch),
+            status: Some(ToolCallStatus::Pending),
+            title: Some(format!("Network access to {host}")),
+            raw_input: Some(serde_json::json!({"host": host})),
+            ..ToolCallUpdateFields::default()
+        },
+        meta: caps
+            .ext
+            .then(|| meta_of(META_EGRESS, serde_json::json!({"host": host}))),
+    }
+}
+
+pub fn egress_options() -> Vec<PermissionOption> {
+    vec![
+        option(OPTION_ALLOW, "Allow", PermissionOptionKind::AllowOnce),
+        option(OPTION_DENY, "Deny", PermissionOptionKind::RejectOnce),
+    ]
+}
+
+pub fn egress_decision(outcome: &RequestPermissionOutcome) -> hotl_tools::net::EgressDecision {
+    use hotl_tools::net::EgressDecision;
+    match outcome {
+        RequestPermissionOutcome::Selected(s) if s.option_id == OPTION_ALLOW => {
+            EgressDecision::Allow
+        }
+        _ => EgressDecision::Deny,
     }
 }
 
@@ -2065,5 +2247,225 @@ mod tests {
         for (name, kind) in table {
             assert_eq!(tool_kind(name), kind, "{name}");
         }
+    }
+
+    fn asked<'a>(
+        call_id: &'a str,
+        tool: &'a str,
+        input: &'a Value,
+        why: Option<&'a str>,
+    ) -> AskView<'a> {
+        AskView {
+            call_id,
+            tool,
+            input,
+            summary: "the summary",
+            protected_why: why,
+        }
+    }
+
+    fn selected(id: &str) -> RequestPermissionOutcome {
+        RequestPermissionOutcome::Selected(crate::acp_types::SelectedPermissionOutcome {
+            option_id: id.into(),
+            meta: None,
+        })
+    }
+
+    fn reply_meta(v: Value) -> Meta {
+        meta_of(META_REPLY, v)
+    }
+
+    #[test]
+    fn ask_carries_tool_call_id_kind_and_diff() {
+        let mut calls = ToolCalls::rooted(root());
+        let input = json!({"path": "a.rs", "old_string": "x", "new_string": "y"});
+        let call = calls.ask(&asked("t1", "edit", &input, None), &plain());
+        assert_eq!(
+            serde_json::to_value(&call).unwrap(),
+            json!({
+                "toolCallId": "t1",
+                "kind": "edit",
+                "status": "pending",
+                "title": "the summary",
+                "content": [{"type": "diff", "path": at("a.rs"), "oldText": "x", "newText": "y"}],
+                "locations": [{"path": at("a.rs")}],
+                "rawInput": input,
+            })
+        );
+        let ids: Vec<String> = ask_options("the summary")
+            .into_iter()
+            .map(|o| o.option_id)
+            .collect();
+        assert_eq!(ids, [OPTION_ALLOW, OPTION_DENY]);
+        let after = update_json(outgoing(
+            &start("t1", "edit", input.clone()),
+            &plain(),
+            &mut calls,
+        ));
+        assert_eq!(after["sessionUpdate"], "tool_call_update", "{after}");
+    }
+
+    #[test]
+    fn a_write_ask_diffs_against_the_file_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.txt"), "before\n").unwrap();
+        let mut calls = ToolCalls::rooted(dir.path());
+        let content = |rel: &str, calls: &mut ToolCalls| {
+            let input = json!({"path": rel, "content": "after\n"});
+            let call = calls.ask(&asked(rel, "write", &input, None), &opted_in());
+            serde_json::to_value(&call).unwrap()
+        };
+        let over = content("old.txt", &mut calls);
+        assert_eq!(over["content"][0]["oldText"], "before\n");
+        assert_eq!(over["content"][0]["newText"], "after\n");
+        assert_eq!(
+            over["_meta"][META_ASK]["diff"],
+            json!([{"op": "del", "text": "before"}, {"op": "add", "text": "after"}])
+        );
+        let fresh = content("new.txt", &mut calls);
+        assert!(fresh["content"][0].get("oldText").is_none(), "{fresh}");
+        assert_eq!(fresh["content"][0]["newText"], "after\n");
+        #[cfg(unix)]
+        {
+            let elsewhere = tempfile::tempdir().unwrap();
+            std::fs::write(elsewhere.path().join("p.txt"), "private\n").unwrap();
+            std::os::unix::fs::symlink(elsewhere.path().join("p.txt"), dir.path().join("link.txt"))
+                .unwrap();
+            let hidden = content("link.txt", &mut calls);
+            assert!(hidden.get("content").is_none(), "{hidden}");
+            assert_eq!(hidden["_meta"][META_ASK]["diff"], json!([]));
+            assert!(!hidden.to_string().contains("private"));
+        }
+    }
+
+    #[test]
+    fn protected_why_is_meta_for_opted_in_and_title_for_plain() {
+        let input = json!({"command": "cat ~/.ssh/id"});
+        let call = |caps: &ClientCaps| {
+            let mut calls = ToolCalls::rooted(root());
+            serde_json::to_value(calls.ask(&asked("t", "bash", &input, Some("a key")), caps))
+                .unwrap()
+        };
+        let plain_call = call(&plain());
+        assert_eq!(plain_call["title"], "the summary — a key");
+        assert!(plain_call.get("_meta").is_none());
+        let ext_call = call(&opted_in());
+        assert_eq!(ext_call["title"], "the summary");
+        assert_eq!(ext_call["_meta"][META_PROTECTED_WHY], "a key");
+        assert_eq!(
+            ext_call["_meta"][META_ASK],
+            json!({"summary": "the summary", "protectedWhy": "a key", "diff": []})
+        );
+    }
+
+    #[test]
+    fn a_bash_ask_offers_secret_reads_once_they_are_still_denied() {
+        let ids = |summary: &str| -> Vec<String> {
+            ask_options(summary)
+                .into_iter()
+                .map(|o| o.option_id)
+                .collect()
+        };
+        assert_eq!(
+            ids("bash [sandboxed:seatbelt]: cat ~/.aws/credentials"),
+            [OPTION_ALLOW, OPTION_SECRET_READS, OPTION_DENY]
+        );
+        assert_eq!(
+            ids("bash [sandboxed:seatbelt reads:open]: cat x"),
+            [OPTION_ALLOW, OPTION_DENY]
+        );
+        let options = ask_options("bash [sandboxed:seatbelt]: cat x");
+        assert_eq!(options[1].name, "Allow, including secret files");
+        assert_eq!(options[1].kind, PermissionOptionKind::AllowOnce);
+        assert_eq!(options[2].kind, PermissionOptionKind::RejectOnce);
+    }
+
+    #[test]
+    fn cancelled_outcome_denies() {
+        let offered = ask_options("x");
+        assert_eq!(
+            ask_reply(&RequestPermissionOutcome::Cancelled, None, true, &offered),
+            AskReply::Deny { message: None }
+        );
+    }
+
+    #[test]
+    fn unknown_option_denies() {
+        let offered = ask_options("edit a.rs");
+        for id in ["maybe", OPTION_SECRET_READS, ""] {
+            assert_eq!(
+                ask_reply(&selected(id), None, true, &offered),
+                AskReply::Deny { message: None },
+                "{id}"
+            );
+        }
+        assert_eq!(
+            ask_reply(&selected("allow"), None, false, &offered),
+            AskReply::Allow
+        );
+    }
+
+    #[test]
+    fn respond_meta_ignored_for_plain_client() {
+        let offered = ask_options("x");
+        let respond = reply_meta(json!({"respond": "use main"}));
+        let edited = reply_meta(json!({"input": {"a": 1}}));
+        let said_no = reply_meta(json!({"message": "not now"}));
+        assert_eq!(
+            ask_reply(&selected("allow"), Some(&respond), false, &offered),
+            AskReply::Allow
+        );
+        assert_eq!(
+            ask_reply(&selected("allow"), Some(&edited), false, &offered),
+            AskReply::Allow
+        );
+        assert_eq!(
+            ask_reply(&selected("deny"), Some(&said_no), false, &offered),
+            AskReply::Deny { message: None }
+        );
+        assert_eq!(
+            ask_reply(&selected("allow"), Some(&respond), true, &offered),
+            AskReply::Respond {
+                content: "use main".into()
+            }
+        );
+        assert_eq!(
+            ask_reply(&selected("allow"), Some(&edited), true, &offered),
+            AskReply::AllowEdited {
+                input: json!({"a": 1})
+            }
+        );
+        assert_eq!(
+            ask_reply(&selected("deny"), Some(&said_no), true, &offered),
+            AskReply::Deny {
+                message: Some("not now".into())
+            }
+        );
+    }
+
+    #[test]
+    fn egress_is_a_fetch_permission() {
+        assert_eq!(
+            serde_json::to_value(egress_tool_call(7, "registry.npmjs.org", &plain())).unwrap(),
+            json!({
+                "toolCallId": "egress-7",
+                "kind": "fetch",
+                "status": "pending",
+                "title": "Network access to registry.npmjs.org",
+                "rawInput": {"host": "registry.npmjs.org"},
+            })
+        );
+        let ext = serde_json::to_value(egress_tool_call(7, "h", &opted_in())).unwrap();
+        assert_eq!(ext["_meta"][META_EGRESS], json!({"host": "h"}));
+        let ids: Vec<String> = egress_options().into_iter().map(|o| o.option_id).collect();
+        assert_eq!(ids, [OPTION_ALLOW, OPTION_DENY]);
+        use hotl_tools::net::EgressDecision;
+        assert_eq!(egress_decision(&selected("allow")), EgressDecision::Allow);
+        assert_eq!(egress_decision(&selected("deny")), EgressDecision::Deny);
+        assert_eq!(egress_decision(&selected("other")), EgressDecision::Deny);
+        assert_eq!(
+            egress_decision(&RequestPermissionOutcome::Cancelled),
+            EgressDecision::Deny
+        );
     }
 }

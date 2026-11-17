@@ -34,7 +34,7 @@ pub mod web;
 pub mod winfloor;
 
 pub use ask::AskUserTool;
-pub use builtins::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
+pub use builtins::{before_write, BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 pub use minified::MinifyConfig;
 pub use remember::RememberTool;
 pub use report_tool::ReportResultTool;

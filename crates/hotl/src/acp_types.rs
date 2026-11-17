@@ -791,3 +791,72 @@ pub struct SetSessionConfigOptionResponse {
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub meta: Option<Meta>,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestPermissionRequest {
+    pub session_id: String,
+    pub tool_call: ToolCallUpdate,
+    pub options: Vec<PermissionOption>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionOption {
+    pub option_id: String,
+    pub name: String,
+    pub kind: PermissionOptionKind,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionOptionKind {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestPermissionResponse {
+    pub outcome: RequestPermissionOutcome,
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "meta_or_none"
+    )]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum RequestPermissionOutcome {
+    Cancelled,
+    Selected(SelectedPermissionOutcome),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectedPermissionOutcome {
+    pub option_id: String,
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "meta_or_none"
+    )]
+    pub meta: Option<Meta>,
+}
+
+fn meta_or_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Meta>, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::Object(m) => Some(m),
+        _ => None,
+    })
+}

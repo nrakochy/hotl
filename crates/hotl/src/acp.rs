@@ -25,9 +25,9 @@ use crate::acp_types::{
     ConfigOptionUpdate, Cost, CurrentModeUpdate, ErrorObject, Implementation, InitializeRequest,
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
     LoadSessionResponse, McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse, Notice,
-    NoticeSeverity, PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest,
-    ResumeSessionResponse, SessionCapabilities, SessionInfo, SessionInfoUpdate,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    NoticeSeverity, PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionRequest,
+    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionInfo,
+    SessionInfoUpdate, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, UsageUpdate,
 };
 
@@ -67,67 +67,43 @@ pub const EXTENSION_METHODS: &[&str] = &[
     "session/jobs/stop",
     "session/request_permission",
     "session/request_question",
-    "session/request_egress",
 ];
 
 type Writer = Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
-type Pending = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<AskReply>>>>;
+struct AskSlot {
+    reply: oneshot::Sender<AskReply>,
+    offered: Vec<crate::acp_types::PermissionOption>,
+    ext: bool,
+}
+
+type Pending = Arc<std::sync::Mutex<HashMap<u64, AskSlot>>>;
 /// In-flight `session/request_question` round-trips, parallel to `Pending`.
 /// Disjoint ids from `Pending`: both draw from the same per-session `req_id`
 /// counter in `drain_events`, so an id never means two different things.
 type PendingQuestions =
     Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<hotl_types::QuestionAnswer>>>>;
-/// In-flight `session/request_egress` round-trips (plan 0026), parallel to
+/// In-flight network `session/request_permission` round-trips (plan 0026), parallel to
 /// `Pending` and disjoint from it for the same reason: one `req_id` counter,
 /// one meaning per id, but different reply types, so answering an egress
 /// prompt through the tool-ask path could only mis-route.
 type PendingEgress =
     Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<hotl_tools::net::EgressDecision>>>>;
 
-/// Map an ACP client's permission `result` to an `AskReply` (T1/§2b): a client
-/// may `{"allow":true}`, `{"allow":false,"message":"…"}`, provide edited
-/// `{"input":{…}}` (AllowEdited), or answer as the tool `{"respond":"…"}`.
-fn ask_reply_from_result(result: Option<&Value>) -> AskReply {
-    let Some(r) = result else {
-        return AskReply::Deny { message: None };
-    };
-    if let Some(content) = r.get("respond").and_then(Value::as_str) {
-        return AskReply::Respond {
-            content: content.to_string(),
-        };
-    }
-    if let Some(input) = r.get("input") {
-        return AskReply::AllowEdited {
-            input: input.clone(),
-        };
-    }
-    if r.get("allow").and_then(Value::as_bool) == Some(true) {
-        // Plan 0022: `{"allow":true,"secretReads":true}` also lifts the
-        // credential read-deny, for this one command. A client that does not
-        // send the field gets a plain `Allow` — the fail-closed direction.
-        return match r.get("secretReads").and_then(Value::as_bool) {
-            Some(true) => AskReply::AllowWithSecretReads,
-            _ => AskReply::Allow,
-        };
-    }
-    AskReply::Deny {
-        message: r.get("message").and_then(Value::as_str).map(String::from),
+fn permission_response(msg: &Value) -> Option<crate::acp_types::RequestPermissionResponse> {
+    serde_json::from_value(msg.get("result")?.clone()).ok()
+}
+
+fn ask_reply_of(msg: &Value, slot: &AskSlot) -> AskReply {
+    match permission_response(msg) {
+        Some(r) => crate::acp_map::ask_reply(&r.outcome, r.meta.as_ref(), slot.ext, &slot.offered),
+        None => AskReply::Deny { message: None },
     }
 }
 
-/// Map an ACP client's `session/request_egress` `result` (plan 0026) to an
-/// `EgressDecision`: `{"allow": true}` or `{"allow": false}`.
-///
-/// Anything else — a missing result, a client that hung up, a non-boolean —
-/// is `NoAnswer`, which refuses the connection exactly like `Deny` but is not
-/// recorded as the human's decision, so the next connection asks again rather
-/// than inheriting a denial nobody made.
-fn egress_decision_from_result(result: Option<&Value>) -> hotl_tools::net::EgressDecision {
-    use hotl_tools::net::EgressDecision;
-    match result.and_then(|r| r.get("allow")).and_then(Value::as_bool) {
-        Some(true) => EgressDecision::Allow,
-        Some(false) => EgressDecision::Deny,
-        None => EgressDecision::NoAnswer,
+fn egress_decision_of(msg: &Value) -> hotl_tools::net::EgressDecision {
+    match permission_response(msg) {
+        Some(r) => crate::acp_map::egress_decision(&r.outcome),
+        None => hotl_tools::net::EgressDecision::Deny,
     }
 }
 
@@ -494,13 +470,14 @@ pub async fn serve(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&id)
                 {
-                    let _ = reply.send(egress_decision_from_result(msg.get("result")));
-                } else if let Some(reply) = pending
+                    let _ = reply.send(egress_decision_of(&msg));
+                } else if let Some(slot) = pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&id)
                 {
-                    let _ = reply.send(ask_reply_from_result(msg.get("result")));
+                    let reply = ask_reply_of(&msg, &slot);
+                    let _ = slot.reply.send(reply);
                 }
             }
             continue;
@@ -1430,12 +1407,12 @@ async fn handle_request(
             }
             state.handle.interrupt();
             let dropped = state.handle.drop_queued();
-            for (_, reply) in pending
+            for (_, slot) in pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .drain()
             {
-                let _ = reply.send(AskReply::Deny { message: None });
+                let _ = slot.reply.send(AskReply::Deny { message: None });
             }
             for (_, reply) in pending_questions
                 .lock()
@@ -2452,33 +2429,43 @@ async fn drain_events(
             EngineEvent::Ask {
                 summary,
                 protected_why,
+                call_id,
+                tool,
+                input,
                 reply,
-                ..
             } => {
                 req_id += 1;
+                let tool_call = calls.ask(
+                    &crate::acp_map::AskView {
+                        call_id: &call_id,
+                        tool: &tool,
+                        input: &input,
+                        summary: &summary,
+                        protected_why: protected_why.as_deref(),
+                    },
+                    &caps,
+                );
+                let options = crate::acp_map::ask_options(&summary);
                 pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(req_id, reply);
-                // INVARIANT (unimplemented — see
-                // specs/exec-plans/active/0020-remediation-surface.md RQ-2):
-                // an `edit`/`write` ask also carries `"diff"`, the proposed
-                // change, so the human approving a write can see it. The
-                // generator (`crate::diffgen::for_tool`) and the client's
-                // renderer are both built and tested; this call site cannot
-                // use them because `EngineEvent::Ask` carries no `tool`/
-                // `input`. Once it does, this becomes:
-                //     let diff = crate::diffgen::for_tool(tool, input);
-                // plus `"diff": diff.map(|d| d.iter().map(DiffLine::to_json)…)`
-                // in the params below.
+                    .insert(
+                        req_id,
+                        AskSlot {
+                            reply,
+                            offered: options.clone(),
+                            ext: caps.ext,
+                        },
+                    );
                 send(
                     &writer,
                     &json!({
                         "jsonrpc": "2.0", "id": req_id, "method": "session/request_permission",
-                        "params": to_json(&RequestPermissionParams {
+                        "params": to_json(&RequestPermissionRequest {
                             session_id: session_id.clone(),
-                            summary,
-                            protected_why,
+                            tool_call,
+                            options,
+                            meta: None,
                         }),
                     }),
                 )
@@ -2522,10 +2509,12 @@ async fn drain_events(
                 send(
                     &writer,
                     &json!({
-                        "jsonrpc": "2.0", "id": req_id, "method": "session/request_egress",
-                        "params": to_json(&RequestEgressParams {
+                        "jsonrpc": "2.0", "id": req_id, "method": "session/request_permission",
+                        "params": to_json(&RequestPermissionRequest {
                             session_id: session_id.clone(),
-                            host,
+                            tool_call: crate::acp_map::egress_tool_call(req_id, &host, &caps),
+                            options: crate::acp_map::egress_options(),
+                            meta: None,
                         }),
                     }),
                 )
@@ -2542,7 +2531,7 @@ async fn drain_events(
                 pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .retain(|_, tx| !tx.is_closed());
+                    .retain(|_, slot| !slot.reply.is_closed());
                 pending_questions
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2971,27 +2960,54 @@ mod drain_tests {
 mod ask_reply_tests {
     use super::*;
 
-    /// 0076 D5: every reply shape the schema documents parses, through the
-    /// real lenient parser, to the answer the schema says it means — and
-    /// validates against the published reply defs.
+    fn slot(summary: &str, ext: bool) -> (AskSlot, oneshot::Receiver<AskReply>) {
+        let (reply, rx) = oneshot::channel();
+        (
+            AskSlot {
+                reply,
+                offered: crate::acp_map::ask_options(summary),
+                ext,
+            },
+            rx,
+        )
+    }
+
     #[test]
-    fn documented_client_replies_parse_as_the_schema_says() {
+    fn documented_client_replies_parse_and_validate() {
         use hotl_types::QuestionAnswer;
-        let ask = |v: Value| ask_reply_from_result(Some(&v));
-        assert!(
-            matches!(ask(json!({"respond": "use main"})), AskReply::Respond { content } if content == "use main")
+        let (ext, _rx) = slot("bash [sandboxed:seatbelt]: cat ~/.ssh/id", true);
+        let answer = |result: Value| ask_reply_of(&json!({"id": 1, "result": result}), &ext);
+        let examples = [
+            json!({"outcome": {"outcome": "selected", "optionId": "allow"}}),
+            json!({"outcome": {"outcome": "selected", "optionId": "allow-secret-reads"}}),
+            json!({"outcome": {"outcome": "selected", "optionId": "deny"}, "_meta": {"hotl.dev/reply": {"message": "no"}}}),
+            json!({"outcome": {"outcome": "selected", "optionId": "allow"}, "_meta": {"hotl.dev/reply": {"respond": "use main"}}}),
+            json!({"outcome": {"outcome": "selected", "optionId": "allow"}, "_meta": {"hotl.dev/reply": {"input": {"command": "ls"}}}}),
+            json!({"outcome": {"outcome": "cancelled"}}),
+        ];
+        assert_eq!(answer(examples[0].clone()), AskReply::Allow);
+        assert_eq!(answer(examples[1].clone()), AskReply::AllowWithSecretReads);
+        assert_eq!(
+            answer(examples[2].clone()),
+            AskReply::Deny {
+                message: Some("no".into())
+            }
         );
-        assert!(matches!(
-            ask(json!({"input": {"path": "a"}})),
-            AskReply::AllowEdited { .. }
-        ));
-        assert!(matches!(ask(json!({"allow": true})), AskReply::Allow));
-        assert!(matches!(
-            ask(json!({"allow": true, "secretReads": true})),
-            AskReply::AllowWithSecretReads
-        ));
-        assert!(
-            matches!(ask(json!({"allow": false, "message": "no"})), AskReply::Deny { message: Some(m) } if m == "no")
+        assert_eq!(
+            answer(examples[3].clone()),
+            AskReply::Respond {
+                content: "use main".into()
+            }
+        );
+        assert_eq!(
+            answer(examples[4].clone()),
+            AskReply::AllowEdited {
+                input: json!({"command": "ls"})
+            }
+        );
+        assert_eq!(
+            answer(examples[5].clone()),
+            AskReply::Deny { message: None }
         );
         let q = |v: Value| question_answer_from_result(Some(&v));
         assert_eq!(
@@ -3002,24 +3018,15 @@ mod ask_reply_tests {
             q(json!({"freeText": "later"})),
             QuestionAnswer::FreeText("later".into())
         );
-        assert!(matches!(
-            egress_decision_from_result(Some(&json!({"allow": true}))),
-            hotl_tools::net::EgressDecision::Allow
-        ));
         let schema = acp_schema();
         let defs = &schema["$defs"];
-        for (def, example) in [
-            ("PermissionReply", json!({"respond": "use main"})),
-            ("PermissionReply", json!({"input": {"path": "a"}})),
-            (
-                "PermissionReply",
-                json!({"allow": true, "secretReads": true}),
-            ),
-            ("PermissionReply", json!({"allow": false, "message": "no"})),
-            ("QuestionReply", json!({"selected": ["MVP"]})),
-            ("QuestionReply", json!({"freeText": "later"})),
-            ("EgressReply", json!({"allow": true})),
-        ] {
+        let mut cases: Vec<(&str, Value)> = examples
+            .iter()
+            .map(|e| ("RequestPermissionResponse", e.clone()))
+            .collect();
+        cases.push(("QuestionReply", json!({"selected": ["MVP"]})));
+        cases.push(("QuestionReply", json!({"freeText": "later"})));
+        for (def, example) in cases {
             let mut sub = defs[def].clone();
             sub["$defs"] = defs.clone();
             let v = jsonschema::validator_for(&sub).expect("a valid schema");
@@ -3027,61 +3034,41 @@ mod ask_reply_tests {
         }
     }
 
-    /// Plan 0022: the credential-read grant rides the same permission result
-    /// the TUI already sends. A client that never heard of it gets `Allow`,
-    /// which is the fail-closed direction.
-    /// Plan 0026: two answers, and everything else refuses. An absent result
-    /// — a client that hung up, or one that does not know this method — is
-    /// `NoAnswer`: it denies the connection, but is not recorded as a human's
-    /// decision, so the next connection asks again.
     #[test]
-    fn acp_egress_maps_two_answers_and_denies_everything_else() {
-        use hotl_tools::net::EgressDecision;
-        assert_eq!(
-            egress_decision_from_result(Some(&json!({"allow": true}))),
-            EgressDecision::Allow
-        );
-        assert_eq!(
-            egress_decision_from_result(Some(&json!({"allow": false}))),
-            EgressDecision::Deny
-        );
-        assert_eq!(
-            egress_decision_from_result(None),
-            EgressDecision::NoAnswer,
-            "a client that never answered is not a client that said no"
-        );
-        assert_eq!(
-            egress_decision_from_result(Some(&json!({}))),
-            EgressDecision::NoAnswer
-        );
-        assert_eq!(
-            egress_decision_from_result(Some(&json!({"allow": "yes"}))),
-            EgressDecision::NoAnswer,
-            "a non-boolean is malformed, never a grant"
-        );
+    fn a_reply_that_is_not_a_permission_response_denies() {
+        let (plain, _rx) = slot("bash: ls", false);
+        for msg in [
+            json!({"id": 1}),
+            json!({"id": 1, "error": {"code": -32603, "message": "x"}}),
+            json!({"id": 1, "result": {"allow": true}}),
+            json!({"id": 1, "result": {"outcome": {"outcome": "maybe"}}}),
+            json!({"id": 1, "result": {"outcome": {"outcome": "selected"}}}),
+        ] {
+            assert_eq!(
+                ask_reply_of(&msg, &plain),
+                AskReply::Deny { message: None },
+                "{msg}"
+            );
+        }
     }
 
     #[test]
-    fn secret_reads_is_opt_in_and_only_on_an_allow() {
-        let reply = |v: Value| ask_reply_from_result(Some(&v));
+    fn an_egress_reply_allows_only_on_allow() {
+        use hotl_tools::net::EgressDecision;
+        let decide = |result: Value| egress_decision_of(&json!({"id": 1, "result": result}));
         assert_eq!(
-            reply(serde_json::json!({"allow": true, "secretReads": true})),
-            AskReply::AllowWithSecretReads
+            decide(json!({"outcome": {"outcome": "selected", "optionId": "allow"}})),
+            EgressDecision::Allow
         );
         for result in [
-            serde_json::json!({"allow": true}),
-            serde_json::json!({"allow": true, "secretReads": false}),
-            // A non-boolean is not a grant.
-            serde_json::json!({"allow": true, "secretReads": "yes"}),
+            json!({"outcome": {"outcome": "selected", "optionId": "deny"}}),
+            json!({"outcome": {"outcome": "selected", "optionId": "allow-secret-reads"}}),
+            json!({"outcome": {"outcome": "cancelled"}}),
+            json!({"allow": true}),
         ] {
-            assert_eq!(reply(result.clone()), AskReply::Allow, "{result}");
+            assert_eq!(decide(result.clone()), EgressDecision::Deny, "{result}");
         }
-        // The flag cannot smuggle an approval past a denial.
-        assert!(matches!(
-            reply(serde_json::json!({"allow": false, "secretReads": true})),
-            AskReply::Deny { .. }
-        ));
-        assert!(matches!(ask_reply_from_result(None), AskReply::Deny { .. }));
+        assert_eq!(egress_decision_of(&json!({"id": 1})), EgressDecision::Deny);
     }
 }
 
@@ -3414,16 +3401,6 @@ pub struct ExtSessionUpdateParams {
     pub update: AcpUpdate,
 }
 
-/// Server → client `session/request_permission` params.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct RequestPermissionParams {
-    pub session_id: String,
-    pub summary: String,
-    /// Why a protected path is involved, when one is.
-    pub protected_why: Option<String>,
-}
-
 /// Server → client `session/request_question` params.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -3433,33 +3410,6 @@ pub struct RequestQuestionParams {
     pub prompt: String,
     pub options: Vec<hotl_types::QuestionOption>,
     pub multi: bool,
-}
-
-/// Server → client `session/request_egress` params.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct RequestEgressParams {
-    pub session_id: String,
-    pub host: String,
-}
-
-/// What a client answers `session/request_permission` with. Schema only:
-/// `ask_reply_from_result` reads these spellings in this priority (0076 D5).
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-#[serde(untagged)]
-#[allow(dead_code)] // schema-only
-pub enum PermissionReply {
-    /// A typed answer for an ask that wants one.
-    Respond { respond: String },
-    /// Allow with edited tool input.
-    Input { input: Value },
-    Allow {
-        allow: bool,
-        #[serde(rename = "secretReads", skip_serializing_if = "Option::is_none")]
-        secret_reads: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        message: Option<String>,
-    },
 }
 
 /// What a client answers `session/request_question` with. Schema only.
@@ -3473,13 +3423,6 @@ pub enum QuestionReply {
         #[serde(rename = "freeText")]
         free_text: String,
     },
-}
-
-/// What a client answers `session/request_egress` with. Schema only.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-#[allow(dead_code)] // schema-only
-pub struct EgressReply {
-    pub allow: bool,
 }
 
 /// Index type: exists so `schema_for!` puts every payload in `$defs`.
@@ -3504,12 +3447,10 @@ pub struct AcpPayloads {
     reload_ack: ReloadAck,
     reload_session_ack: ReloadSessionAck,
     queued: Queued,
-    request_permission: RequestPermissionParams,
+    request_permission: RequestPermissionRequest,
     request_question: RequestQuestionParams,
-    request_egress: RequestEgressParams,
-    permission_reply: PermissionReply,
+    permission_reply: crate::acp_types::RequestPermissionResponse,
     question_reply: QuestionReply,
-    egress_reply: EgressReply,
 }
 
 /// Where the ACP schema is published (0076 D3).

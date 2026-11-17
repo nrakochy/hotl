@@ -709,18 +709,6 @@
       ],
       "type": "object"
     },
-    "EgressReply": {
-      "description": "What a client answers `session/request_egress` with. Schema only.",
-      "properties": {
-        "allow": {
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "allow"
-      ],
-      "type": "object"
-    },
     "EmbeddedResource": {
       "properties": {
         "resource": {
@@ -2334,55 +2322,40 @@
         }
       ]
     },
-    "PermissionReply": {
-      "anyOf": [
-        {
-          "description": "A typed answer for an ask that wants one.",
-          "properties": {
-            "respond": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "respond"
-          ],
-          "type": "object"
+    "PermissionOption": {
+      "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
         },
-        {
-          "description": "Allow with edited tool input.",
-          "properties": {
-            "input": true
-          },
-          "required": [
-            "input"
-          ],
-          "type": "object"
+        "kind": {
+          "$ref": "#/$defs/PermissionOptionKind"
         },
-        {
-          "properties": {
-            "allow": {
-              "type": "boolean"
-            },
-            "message": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "secretReads": {
-              "type": [
-                "boolean",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "allow"
-          ],
-          "type": "object"
+        "name": {
+          "type": "string"
+        },
+        "optionId": {
+          "type": "string"
         }
+      },
+      "required": [
+        "optionId",
+        "name",
+        "kind"
       ],
-      "description": "What a client answers `session/request_permission` with. Schema only:\n`ask_reply_from_result` reads these spellings in this priority (0076 D5)."
+      "type": "object"
+    },
+    "PermissionOptionKind": {
+      "enum": [
+        "allow_once",
+        "allow_always",
+        "reject_once",
+        "reject_always"
+      ],
+      "type": "string"
     },
     "Phase": {
       "description": "The ten boundary events a turn's sample passes through. Declaration order\nis the critical-path order the design doc's per-phase deltas price\n(`SnapshotReady−BoundaryStart` prices the snapshot transport, etc.) — see\n[`DELTA_PAIRS`]. A doom-loop abort or a failed sample can legitimately\nskip phases past the point of failure; see [`LoopLedger::stamp`].\n\n`BatchProposed`/`WatermarkDurable` are the one place the critical path\nforks: a sample proposes once (the model's own assistant+usage entry) or\ntwice (that entry, then — only when a tool phase runs — the tool-results\nentry). These two phases use [`LoopLedger::restamp`] (last-wins, not\n`stamp`'s first-wins), so their recorded position always tracks the\nsample's REAL final commit — after `ToolsJoined` when a tool phase ran,\notherwise right after `LastBlockEnd`. Every other phase is written\nexactly once by construction, so `stamp`'s first-wins rule is what\napplies to them.\n\n**Declaration order is stamp order, not wall order** — and since S2c's\noptimistic dispatch those two genuinely diverge. A sample whose request\nwas dispatched at the *previous* boundary already had bytes on the wire\nbefore this sample's `BoundaryStart`: its true first byte can precede the\nprevious sample's `WatermarkDurable`, which is the overlap the mechanism\nexists for, not a measurement error. Every stamp is taken when the turn\n**observes** the event, so the recorded sequence stays monotone and the\nsummary needs no special case; what a reader must not do is treat\n`RequestBuilt→FirstByte` on an adopted sample as a round-trip\nmeasurement. It is the time to *notice* a byte that was already there,\nand it is legitimately near zero. ([`width`] saturates either way, so an\nout-of-order pair reports `0` rather than wrapping.)",
@@ -2646,42 +2619,79 @@
       ],
       "type": "object"
     },
-    "RequestEgressParams": {
-      "description": "Server → client `session/request_egress` params.",
-      "properties": {
-        "host": {
-          "type": "string"
+    "RequestPermissionOutcome": {
+      "oneOf": [
+        {
+          "properties": {
+            "outcome": {
+              "const": "cancelled",
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome"
+          ],
+          "type": "object"
         },
-        "sessionId": {
-          "type": "string"
+        {
+          "$ref": "#/$defs/SelectedPermissionOutcome",
+          "properties": {
+            "outcome": {
+              "const": "selected",
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome"
+          ],
+          "type": "object"
         }
-      },
-      "required": [
-        "sessionId",
-        "host"
-      ],
-      "type": "object"
+      ]
     },
-    "RequestPermissionParams": {
-      "description": "Server → client `session/request_permission` params.",
+    "RequestPermissionRequest": {
       "properties": {
-        "protectedWhy": {
-          "description": "Why a protected path is involved, when one is.",
+        "_meta": {
+          "additionalProperties": true,
           "type": [
-            "string",
+            "object",
             "null"
           ]
         },
+        "options": {
+          "items": {
+            "$ref": "#/$defs/PermissionOption"
+          },
+          "type": "array"
+        },
         "sessionId": {
           "type": "string"
         },
-        "summary": {
-          "type": "string"
+        "toolCall": {
+          "$ref": "#/$defs/ToolCallUpdate"
         }
       },
       "required": [
         "sessionId",
-        "summary"
+        "toolCall",
+        "options"
+      ],
+      "type": "object"
+    },
+    "RequestPermissionResponse": {
+      "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "outcome": {
+          "$ref": "#/$defs/RequestPermissionOutcome"
+        }
+      },
+      "required": [
+        "outcome"
       ],
       "type": "object"
     },
@@ -2810,6 +2820,24 @@
       "required": [
         "name",
         "description"
+      ],
+      "type": "object"
+    },
+    "SelectedPermissionOutcome": {
+      "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "optionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "optionId"
       ],
       "type": "object"
     },
@@ -3856,9 +3884,6 @@
     "ack": {
       "$ref": "#/$defs/Ack"
     },
-    "egressReply": {
-      "$ref": "#/$defs/EgressReply"
-    },
     "extSessionUpdate": {
       "$ref": "#/$defs/ExtSessionUpdateParams"
     },
@@ -3881,7 +3906,7 @@
       "$ref": "#/$defs/NewSessionResponse"
     },
     "permissionReply": {
-      "$ref": "#/$defs/PermissionReply"
+      "$ref": "#/$defs/RequestPermissionResponse"
     },
     "promptResponse": {
       "$ref": "#/$defs/PromptResponse"
@@ -3898,11 +3923,8 @@
     "reloadSessionAck": {
       "$ref": "#/$defs/ReloadSessionAck"
     },
-    "requestEgress": {
-      "$ref": "#/$defs/RequestEgressParams"
-    },
     "requestPermission": {
-      "$ref": "#/$defs/RequestPermissionParams"
+      "$ref": "#/$defs/RequestPermissionRequest"
     },
     "requestQuestion": {
       "$ref": "#/$defs/RequestQuestionParams"
@@ -3943,10 +3965,8 @@
     "queued",
     "requestPermission",
     "requestQuestion",
-    "requestEgress",
     "permissionReply",
-    "questionReply",
-    "egressReply"
+    "questionReply"
   ],
   "title": "hotl ACP-dialect payloads",
   "type": "object"

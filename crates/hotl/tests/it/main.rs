@@ -22,6 +22,9 @@ mod acp_map;
 #[path = "../../src/acp_types.rs"]
 #[allow(dead_code)]
 mod acp_types;
+#[path = "../../src/diffgen.rs"]
+#[allow(dead_code)]
+mod diffgen;
 #[path = "../../src/features.rs"]
 #[allow(dead_code)]
 mod features;

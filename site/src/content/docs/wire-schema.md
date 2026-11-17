@@ -35,8 +35,8 @@ unless the schema says `null` is a value.
 | `session/set_plan`, `set_mode`, `set_effort`, `set_model`, `set_goal` results | `PlanAck`, `ModeAck`, `EffortAck`, `ModelAck`, `GoalAck` |
 | `session/reload_config` result | `ReloadAck` / `ReloadSessionAck` |
 | `session/steer`, `session/fold` results | `Queued` (`session/cancel` is a notification and gets no reply); stops → `StoppedAck`; the rest → `Ack` |
-| server → client `session/request_permission`, `request_question`, `request_egress` | `RequestPermissionParams`, `RequestQuestionParams`, `RequestEgressParams` |
-| what the client answers them with | `PermissionReply`, `QuestionReply`, `EgressReply` |
+| server → client `session/request_permission` (tool asks and network asks), `request_question` | `RequestPermissionRequest`, `RequestQuestionParams` |
+| what the client answers them with | `RequestPermissionResponse`, `QuestionReply` |
 
 ## A dialect, not ACP v1
 

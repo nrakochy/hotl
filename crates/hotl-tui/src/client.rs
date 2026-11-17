@@ -63,15 +63,12 @@ pub enum ServerMsg {
         req_id: u64,
         summary: String,
         protected_why: Option<String>,
-        /// The proposed change, when the server sent one. Absent today for
-        /// every ask — the engine's ask carries no tool input to diff (RQ-2,
-        /// see `hotl::diffgen::for_tool`) — so this decodes to empty.
         diff: Vec<DiffLine>,
     },
     /// A `session/request_question` reverse-request (`ask_user`, tier-1
     /// gap #4) — NOT a permission gate; answering it never authorizes a tool.
     QuestionRequest { req_id: u64, question: Question },
-    /// A `session/request_egress` reverse-request (plan 0026): a subprocess
+    /// A network `session/request_permission` reverse-request (plan 0026): a subprocess
     /// reached a host outside `[network].allow`, and no human-approved call in
     /// flight had shown it. IS a grant — answering `y` opens the socket — but
     /// it grants only this host, only this session.
@@ -136,24 +133,25 @@ impl<W: AsyncWrite + Unpin> AcpClient<W> {
         secret_reads: bool,
         message: Option<String>,
     ) -> io::Result<()> {
-        let mut result = json!({"allow": allow});
-        // Plan 0022: only ever sent when set, so the ordinary allow stays
-        // byte-identical to the pre-0022 result an ACP client already parses.
-        if secret_reads {
-            result["secretReads"] = json!(true);
-        }
+        let option = match (allow, secret_reads) {
+            (false, _) => "deny",
+            (true, true) => "allow-secret-reads",
+            (true, false) => "allow",
+        };
+        let mut result = json!({"outcome": {"outcome": "selected", "optionId": option}});
         if let Some(m) = message {
-            result["message"] = json!(m);
+            result["_meta"] = json!({"hotl.dev/reply": {"message": m}});
         }
         self.send(&json!({"jsonrpc": "2.0", "id": req_id, "result": result}))
             .await
     }
 
-    /// Answer a `session/request_egress` (plan 0026). Two answers, both
+    /// Answer a network `session/request_permission` (plan 0026). Two answers, both
     /// scoped to this session; hotl never writes `config.toml`, so a
     /// permanent grant stays a deliberate edit.
     pub async fn reply_egress(&mut self, req_id: u64, allow: bool) -> io::Result<()> {
-        self.send(&json!({"jsonrpc": "2.0", "id": req_id, "result": {"allow": allow}}))
+        let option = if allow { "allow" } else { "deny" };
+        self.send(&json!({"jsonrpc": "2.0", "id": req_id, "result": {"outcome": {"outcome": "selected", "optionId": option}}}))
             .await
     }
 
@@ -317,27 +315,31 @@ fn decode(msg: &Value) -> Option<ServerMsg> {
         Some("_hotl/session/update") => {
             Some(ServerMsg::Update(msg.pointer("/params/update")?.clone()))
         }
-        Some("session/request_permission") => Some(ServerMsg::PermissionRequest {
-            req_id: msg.get("id").and_then(Value::as_u64)?,
-            summary: msg
-                .pointer("/params/summary")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            protected_why: msg
-                .pointer("/params/protectedWhy")
-                .and_then(Value::as_str)
-                .map(String::from),
-            diff: decode_diff(msg.pointer("/params/diff")),
-        }),
-        Some("session/request_egress") => Some(ServerMsg::EgressRequest {
-            req_id: msg.get("id").and_then(Value::as_u64)?,
-            host: msg
-                .pointer("/params/host")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-        }),
+        Some("session/request_permission") => {
+            let req_id = msg.get("id").and_then(Value::as_u64)?;
+            let call = msg.pointer("/params/toolCall")?;
+            if let Some(egress) = call.pointer("/_meta/hotl.dev~1egress") {
+                return Some(ServerMsg::EgressRequest {
+                    req_id,
+                    host: egress
+                        .get("host")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                });
+            }
+            let ask = call.pointer("/_meta/hotl.dev~1ask");
+            let text = |key: &str| ask.and_then(|a| a.get(key)).and_then(Value::as_str);
+            Some(ServerMsg::PermissionRequest {
+                req_id,
+                summary: text("summary")
+                    .or_else(|| call.get("title").and_then(Value::as_str))
+                    .unwrap_or("")
+                    .to_string(),
+                protected_why: text("protectedWhy").map(String::from),
+                diff: decode_diff(ask.and_then(|a| a.get("diff"))),
+            })
+        }
         Some("session/request_question") => {
             let options = msg
                 .pointer("/params/options")
@@ -1022,7 +1024,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"_hotl/session/update","params":{"sessionId":"s","update":{"type":"text_delta","text":"hi"}}}"#,
             "\n",
             "this is not json\n",
-            r#"{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"s","summary":"run bash","protectedWhy":"prod"}}"#,
+            r#"{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"t1","title":"run bash","_meta":{"hotl.dev/ask":{"summary":"run bash","protectedWhy":"prod","diff":[]}}},"options":[]}}"#,
             "\n",
             r#"{"jsonrpc":"2.0","id":2,"result":{"outcome":{"kind":"done"}}}"#,
             "\n",
@@ -1058,20 +1060,17 @@ mod tests {
         assert_eq!(read_server_msg(&mut r).await, None, "EOF");
     }
 
-    /// The client half of the diff pipeline. Nothing sends `params.diff` yet
-    /// (RQ-2), so this pins the decode against a hand-built frame — including
-    /// that an absent diff is empty, not a decode failure.
     #[test]
     fn a_permission_request_decodes_its_diff_rows() {
         let msg = json!({
             "method": "session/request_permission",
             "id": 3,
-            "params": {"summary": "edit ./x", "diff": [
+            "params": {"toolCall": {"toolCallId": "t", "title": "edit ./x", "_meta": {"hotl.dev/ask": {"summary": "edit ./x", "diff": [
                 {"op": "ctx", "text": "keep"},
                 {"op": "del", "text": "was"},
                 {"op": "add", "text": "now"},
                 {"op": "sideways", "text": "from a newer server"},
-            ]},
+            ]}}}},
         });
         let Some(ServerMsg::PermissionRequest { diff, .. }) = decode(&msg) else {
             panic!("not a permission request");
@@ -1096,18 +1095,24 @@ mod tests {
         );
 
         let bare = json!({"method": "session/request_permission", "id": 3,
-                          "params": {"summary": "edit ./x"}});
-        let Some(ServerMsg::PermissionRequest { diff, .. }) = decode(&bare) else {
-            panic!("not a permission request");
-        };
-        assert!(diff.is_empty(), "no diff field decodes to no rows");
+                          "params": {"toolCall": {"toolCallId": "t", "title": "edit ./x — why"}}});
+        assert_eq!(
+            decode(&bare),
+            Some(ServerMsg::PermissionRequest {
+                req_id: 3,
+                summary: "edit ./x — why".into(),
+                protected_why: None,
+                diff: Vec::new(),
+            }),
+            "a plain request decodes its title as the summary, with no rows"
+        );
     }
 
     #[tokio::test]
     async fn read_decodes_an_egress_request() {
         let (client, mut server) = tokio::io::duplex(4096);
         let feed = concat!(
-            r#"{"jsonrpc":"2.0","id":12,"method":"session/request_egress","params":{"sessionId":"s","host":"registry.npmjs.org"}}"#,
+            r#"{"jsonrpc":"2.0","id":12,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"egress-12","kind":"fetch","title":"Network access to registry.npmjs.org","_meta":{"hotl.dev/egress":{"host":"registry.npmjs.org"}}},"options":[]}}"#,
             "\n",
         );
         tokio::io::AsyncWriteExt::write_all(&mut server, feed.as_bytes())
@@ -1197,8 +1202,9 @@ mod tests {
             .reply_permission(8, false, false, Some("wrong dir".into()))
             .await
             .unwrap();
-        // Plan 0022: the grant rides the same result.
         client.reply_permission(9, true, true, None).await.unwrap();
+        client.reply_egress(10, true).await.unwrap();
+        client.reply_egress(11, false).await.unwrap();
         drop(client);
         let mut out = String::new();
         read.read_to_string(&mut out).await.unwrap();
@@ -1206,20 +1212,15 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(
-            lines[0],
-            json!({"jsonrpc": "2.0", "id": 7, "result": {"allow": true}})
-        );
+        let picked = |id: u64, option: &str| json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": {"outcome": "selected", "optionId": option}}});
+        assert_eq!(lines[0], picked(7, "allow"));
         assert_eq!(
             lines[1],
-            json!({"jsonrpc": "2.0", "id": 8, "result": {"allow": false, "message": "wrong dir"}})
+            json!({"jsonrpc": "2.0", "id": 8, "result": {"outcome": {"outcome": "selected", "optionId": "deny"}, "_meta": {"hotl.dev/reply": {"message": "wrong dir"}}}})
         );
-        // `secretReads` is present only when taken, so an ordinary allow stays
-        // byte-identical for every ACP client that has never heard of it.
-        assert_eq!(
-            lines[2],
-            json!({"jsonrpc": "2.0", "id": 9, "result": {"allow": true, "secretReads": true}})
-        );
+        assert_eq!(lines[2], picked(9, "allow-secret-reads"));
+        assert_eq!(lines[3], picked(10, "allow"));
+        assert_eq!(lines[4], picked(11, "deny"));
     }
 
     /// The wire-compat pin: a text-only payload serializes byte-identically

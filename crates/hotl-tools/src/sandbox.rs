@@ -242,6 +242,10 @@ static EXTRAS: std::sync::OnceLock<SandboxExtras> = std::sync::OnceLock::new();
 /// outside-the-floor target from `write_roots()`, and its memoized verdict
 /// must describe the floor the children actually get. An un-inited process
 /// falls back to the empty set — narrower than configured, never wider.
+pub fn secret_read_grant_applies(summary: &str) -> bool {
+    summary.starts_with("bash [") && !summary.contains("reads:open")
+}
+
 pub fn init_extras(extras: SandboxExtras) {
     let _ = EXTRAS.set(extras);
 }
