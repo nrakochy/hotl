@@ -5,8 +5,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::v1::schema::{
-    AuthenticateResponse, CreateElicitationRequest, InitializeResponse, LoadSessionResponse,
-    NewSessionResponse, PromptResponse, RequestPermissionRequest, SessionNotification,
+    AuthenticateResponse, CloseSessionResponse, CreateElicitationRequest, InitializeResponse,
+    ListSessionsResponse, LoadSessionResponse, NewSessionResponse, PromptResponse,
+    RequestPermissionRequest, ResumeSessionResponse, SessionNotification,
+    SetSessionConfigOptionResponse, SetSessionModeResponse,
 };
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, LineDirection};
 use serde::de::DeserializeOwned;
@@ -81,6 +83,10 @@ pub struct World {
 
 impl World {
     pub fn new(script: &[Value]) -> World {
+        World::with_model(script, "claude-conformance")
+    }
+
+    pub fn with_model(script: &[Value], model: &str) -> World {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let config = dir.path().join("config");
@@ -93,7 +99,7 @@ impl World {
         std::fs::write(
             config.join("hotl/config.toml"),
             format!(
-                "[provider]\nmodel = \"claude-conformance\"\nbase_url = \"{}\"\n\n\
+                "[provider]\nmodel = \"{model}\"\nbase_url = \"{}\"\n\n\
                  [permissions]\nmode = \"ask\"\n\n[behavior]\nsandbox = false\n",
                 fake.url
             ),
@@ -129,7 +135,10 @@ impl World {
 }
 
 fn untagged_default(path: &str, key: &str, value: &Value) -> bool {
-    path.contains("/authMethods/") && key == "type" && value == "agent"
+    let tool_call_default =
+        (key == "status" && value == "pending") || (key == "kind" && value == "other");
+    (path.contains("/authMethods/") && key == "type" && value == "agent")
+        || ((path.ends_with("/update") || path.ends_with("/toolCall")) && tool_call_default)
 }
 
 fn kept(sent: &Value, decoded: &Value, path: &str) -> Result<(), String> {
@@ -224,6 +233,27 @@ pub fn check_wire(wire: &Wire) -> usize {
                     }
                     Some("session/prompt") => {
                         same_through::<PromptResponse>("session/prompt result", result, line)
+                    }
+                    Some("session/list") => {
+                        same_through::<ListSessionsResponse>("session/list result", result, line)
+                    }
+                    Some("session/resume") => {
+                        same_through::<ResumeSessionResponse>("session/resume result", result, line)
+                    }
+                    Some("session/close") => {
+                        same_through::<CloseSessionResponse>("session/close result", result, line)
+                    }
+                    Some("session/set_mode") => same_through::<SetSessionModeResponse>(
+                        "session/set_mode result",
+                        result,
+                        line,
+                    ),
+                    Some("session/set_config_option") => {
+                        same_through::<SetSessionConfigOptionResponse>(
+                            "session/set_config_option result",
+                            result,
+                            line,
+                        )
                     }
                     other => panic!("a reply to an unknown request ({other:?})\n{line}"),
                 }
