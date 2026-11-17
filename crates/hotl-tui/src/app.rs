@@ -2283,6 +2283,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 text_of("summary")
             ),
         ),
+        "server_notice" => notice(state, text_of("text")),
         "question_no_human" => notice(
             state,
             format!(

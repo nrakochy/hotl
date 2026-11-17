@@ -298,6 +298,10 @@ fn standard_update(kind: &str, update: &Value) -> Option<Value> {
             let mode = update.get("currentModeId").and_then(Value::as_str)?;
             Some(json!({"type": "mode_changed", "mode": mode}))
         }
+        "notice" => {
+            let title = update.get("title").and_then(Value::as_str)?;
+            Some(json!({"type": "server_notice", "text": title}))
+        }
         "config_option_update" => {
             if let Some(change) = update.pointer("/_meta/hotl.dev~1model") {
                 let field = |k: &str| change.get(k).cloned().unwrap_or(Value::Null);
@@ -1490,6 +1494,47 @@ mod tests {
         let msg = decode(&serde_json::from_str(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"},"_meta":{"hotl.dev/frame":{"type":"text_delta","text":"hi"}}}}}"#).unwrap());
         assert!(
             matches!(msg, Some(ServerMsg::Update(v)) if v["type"] == "text_delta" && v["text"] == "hi")
+        );
+    }
+
+    #[test]
+    fn notice_and_compaction_updates_decode_as_their_frames() {
+        let frames = [
+            json!({"type": "retrying", "attempt": 1, "max": 3}),
+            json!({"type": "budget_notice", "pct": 80}),
+            json!({"type": "fold_skipped", "reason": "r"}),
+            json!({"type": "aside_failed", "question": "q", "reason": "r"}),
+            json!({"type": "fallback_model", "model": "m"}),
+            json!({"type": "compacting", "items": 3}),
+            json!({"type": "compacted", "degraded": false}),
+        ];
+        for (i, frame) in frames.iter().enumerate() {
+            let (kind, extra) = if i >= 5 {
+                (
+                    "compaction_update",
+                    json!({"compactionId": "c", "status": "in_progress"}),
+                )
+            } else {
+                ("notice", json!({"severity": "warning", "title": "t"}))
+            };
+            let mut update = extra;
+            update["sessionUpdate"] = json!(kind);
+            update["_meta"] = json!({"hotl.dev/frame": frame});
+            let line = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s", "update": update}});
+            match decode(&line) {
+                Some(ServerMsg::Update(v)) => assert_eq!(&v, frame),
+                other => panic!("{kind} did not decode: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_unframed_notice_decodes_as_a_server_notice() {
+        let msg = decode(
+            &json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s", "update": {"sessionUpdate": "notice", "severity": "warning", "title": "w"}}}),
+        );
+        assert!(
+            matches!(msg, Some(ServerMsg::Update(v)) if v == json!({"type": "server_notice", "text": "w"}))
         );
     }
 
