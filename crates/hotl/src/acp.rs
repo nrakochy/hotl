@@ -19,6 +19,8 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
+use crate::acp_ext::codes;
+
 /// Stable schema version of `session/update` / prompt-result payloads (an MD
 /// Tier-1 contract — bump only on a breaking change).
 pub const UPDATE_SCHEMA_VERSION: u32 = 1;
@@ -547,6 +549,7 @@ async fn handle_request(
                         return reply_err(
                             writer,
                             id,
+                            codes::INVALID_PARAMS,
                             "params.name must be 1–64 chars after trimming",
                         )
                         .await
@@ -570,12 +573,13 @@ async fn handle_request(
             let spec = if method == "session/load" {
                 let keep = match keep_spec(msg) {
                     Ok(k) => k,
-                    Err(e) => return reply_err(writer, id, &e).await,
+                    Err(e) => return reply_err(writer, id, codes::INVALID_PARAMS, &e).await,
                 };
                 if !is_fork && keep != KeepSpec::All {
                     return reply_err(
                         writer,
                         id,
+                        codes::INVALID_PARAMS,
                         "params.keepItems/keepTurns only apply to a fork (params.fork: true)",
                     )
                     .await;
@@ -584,6 +588,7 @@ async fn handle_request(
                     return reply_err(
                         writer,
                         id,
+                        codes::INVALID_PARAMS,
                         "params.worktree only applies to a new session or a fork — a resumed \
                          session already has a worktree, or had none",
                     )
@@ -602,8 +607,13 @@ async fn handle_request(
                         no_worktree,
                     },
                     None => {
-                        return reply_err(writer, id, "session/load requires params.sessionId")
-                            .await
+                        return reply_err(
+                            writer,
+                            id,
+                            codes::INVALID_PARAMS,
+                            "session/load requires params.sessionId",
+                        )
+                        .await
                     }
                 }
             } else {
@@ -704,15 +714,27 @@ async fn handle_request(
                     };
                     reply_ok(writer, id, to_json(&reply)).await;
                 }
-                Err(e) => reply_err(writer, id, &e).await,
+                Err(e) => reply_err(writer, id, codes::INTERNAL, &e).await,
             }
         }
         "session/prompt" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "no session — call session/new first").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "no session — call session/new first",
+                )
+                .await;
             };
             let Some(text) = msg.pointer("/params/text").and_then(Value::as_str) else {
-                return reply_err(writer, id, "session/prompt requires params.text").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::INVALID_PARAMS,
+                    "session/prompt requires params.text",
+                )
+                .await;
             };
             // Images are validated HERE, before the log: a poisoned base64
             // item would be durable and 400 every later sample (see
@@ -720,7 +742,15 @@ async fn handle_request(
             let images =
                 match crate::images::parse_images(msg.pointer("/params").unwrap_or(&Value::Null)) {
                     Ok(v) => v,
-                    Err(e) => return reply_err(writer, id, &format!("session/prompt: {e}")).await,
+                    Err(e) => {
+                        return reply_err(
+                            writer,
+                            id,
+                            codes::INTERNAL,
+                            &format!("session/prompt: {e}"),
+                        )
+                        .await
+                    }
                 };
             // Stash the id; the drain task answers it on TurnDone so the read
             // loop stays free to service permission responses meanwhile.
@@ -732,7 +762,13 @@ async fn handle_request(
         }
         "session/rename" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "no session — call session/new first").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "no session — call session/new first",
+                )
+                .await;
             };
             let Some(name) = msg
                 .pointer("/params/name")
@@ -742,6 +778,7 @@ async fn handle_request(
                 return reply_err(
                     writer,
                     id,
+                    codes::INVALID_PARAMS,
                     "session/rename requires params.name (1–64 chars after trimming)",
                 )
                 .await;
@@ -751,18 +788,33 @@ async fn handle_request(
         }
         "session/set_color" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "no session — call session/new first").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "no session — call session/new first",
+                )
+                .await;
             };
             let color = match msg.pointer("/params/color") {
                 Some(Value::Null) => None,
                 Some(Value::String(c)) => match hotl_theme::session_color(c) {
                     Some(c) => Some(c.to_string()),
-                    None => return reply_err(writer, id, &format!("unknown color {c:?}")).await,
+                    None => {
+                        return reply_err(
+                            writer,
+                            id,
+                            codes::INVALID_PARAMS,
+                            &format!("unknown color {c:?}"),
+                        )
+                        .await
+                    }
                 },
                 _ => {
                     return reply_err(
                         writer,
                         id,
+                        codes::INVALID_PARAMS,
                         "session/set_color requires params.color (a color name or null)",
                     )
                     .await
@@ -773,7 +825,13 @@ async fn handle_request(
         }
         "session/set_mode" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "no session — call session/new first").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "no session — call session/new first",
+                )
+                .await;
             };
             let raw = msg.pointer("/params/mode").and_then(Value::as_str);
             // `"plan"` was a mode before it became an overlay. A client still
@@ -802,6 +860,7 @@ async fn handle_request(
                 return reply_err(
                     writer,
                     id,
+                    codes::INVALID_PARAMS,
                     "session/set_mode requires params.mode (ask | bypass | dontask)",
                 )
                 .await;
@@ -836,12 +895,19 @@ async fn handle_request(
         }
         "session/set_plan" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "no session — call session/new first").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "no session — call session/new first",
+                )
+                .await;
             };
             let Some(plan) = msg.pointer("/params/plan").and_then(Value::as_bool) else {
                 return reply_err(
                     writer,
                     id,
+                    codes::INVALID_PARAMS,
                     "session/set_plan requires params.plan (a boolean)",
                 )
                 .await;
@@ -860,12 +926,19 @@ async fn handle_request(
         }
         "session/set_effort" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "no session — call session/new first").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "no session — call session/new first",
+                )
+                .await;
             };
             let Some(raw) = msg.pointer("/params/effort").and_then(Value::as_str) else {
                 return reply_err(
                     writer,
                     id,
+                    codes::INVALID_PARAMS,
                     "session/set_effort requires params.effort \
                      (low | medium | high | xhigh | max | default)",
                 )
@@ -881,6 +954,7 @@ async fn handle_request(
                         return reply_err(
                             writer,
                             id,
+                            codes::INVALID_PARAMS,
                             "session/set_effort requires params.effort \
                              (low | medium | high | xhigh | max | default)",
                         )
@@ -917,12 +991,19 @@ async fn handle_request(
         // relayed like every event — is the only thing that moves a surface.
         "session/set_model" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "no session — call session/new first").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "no session — call session/new first",
+                )
+                .await;
             };
             let Some(raw) = msg.pointer("/params/model").and_then(Value::as_str) else {
                 return reply_err(
                     writer,
                     id,
+                    codes::INVALID_PARAMS,
                     "session/set_model requires params.model (provider/model, or default)",
                 )
                 .await;
@@ -931,13 +1012,22 @@ async fn handle_request(
                 return reply_err(
                     writer,
                     id,
+                    codes::INTERNAL,
                     "session/set_model is not supported on this connection",
                 )
                 .await;
             };
             let (switch, warnings) = match resolver(raw) {
                 Ok(r) => r,
-                Err(e) => return reply_err(writer, id, &format!("session/set_model: {e}")).await,
+                Err(e) => {
+                    return reply_err(
+                        writer,
+                        id,
+                        codes::INTERNAL,
+                        &format!("session/set_model: {e}"),
+                    )
+                    .await
+                }
             };
             let spec = switch.spec.clone();
             match state.handle.set_model(switch).await {
@@ -954,12 +1044,26 @@ async fn handle_request(
                     )
                     .await
                 }
-                Err(e) => reply_err(writer, id, &format!("session/set_model: {e}")).await,
+                Err(e) => {
+                    reply_err(
+                        writer,
+                        id,
+                        codes::INTERNAL,
+                        &format!("session/set_model: {e}"),
+                    )
+                    .await
+                }
             }
         }
         "session/set_goal" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "no session — call session/new first").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "no session — call session/new first",
+                )
+                .await;
             };
             // `null` clears; a string must survive `normalize_goal`. No
             // bespoke broadcast, unlike `set_effort`: the engine emits
@@ -976,6 +1080,7 @@ async fn handle_request(
                         return reply_err(
                             writer,
                             id,
+                            codes::INVALID_PARAMS,
                             "session/set_goal requires params.goal of 1–4000 chars \
                              (or null to clear)",
                         )
@@ -986,6 +1091,7 @@ async fn handle_request(
                     return reply_err(
                         writer,
                         id,
+                        codes::INVALID_PARAMS,
                         "session/set_goal requires params.goal (a string, or null to clear)",
                     )
                     .await;
@@ -1003,7 +1109,13 @@ async fn handle_request(
         // entries. The write itself reaches every surface as `memory_changed`.
         "session/remember" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "no session — call session/new first").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "no session — call session/new first",
+                )
+                .await;
             };
             let raw = msg
                 .pointer("/params/note")
@@ -1012,7 +1124,13 @@ async fn handle_request(
                 .filter(|s| !s.is_empty());
             let Some(raw) = raw else {
                 let Some(report) = state.handle.memory_report().await else {
-                    return reply_err(writer, id, "session/remember: memory is off").await;
+                    return reply_err(
+                        writer,
+                        id,
+                        codes::INTERNAL,
+                        "session/remember: memory is off",
+                    )
+                    .await;
                 };
                 reply_ok(writer, id, to_json(&Ack { ok: true })).await;
                 notify(
@@ -1040,6 +1158,7 @@ async fn handle_request(
                 return reply_err(
                     writer,
                     id,
+                    codes::INVALID_PARAMS,
                     &format!(
                         "session/remember requires params.note of 1–{} characters on one line",
                         hotl_types::MEMORY_NOTE_MAX_CHARS
@@ -1054,21 +1173,49 @@ async fn handle_request(
             tokio::spawn(async move {
                 match pending.await {
                     Ok(()) => reply_ok(&writer, id, to_json(&Ack { ok: true })).await,
-                    Err(why) => reply_err(&writer, id, &format!("session/remember: {why}")).await,
+                    Err(why) => {
+                        reply_err(
+                            &writer,
+                            id,
+                            codes::INTERNAL,
+                            &format!("session/remember: {why}"),
+                        )
+                        .await
+                    }
                 }
             });
         }
         "session/steer" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "no session — call session/new first").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "no session — call session/new first",
+                )
+                .await;
             };
             let Some(text) = msg.pointer("/params/text").and_then(Value::as_str) else {
-                return reply_err(writer, id, "session/steer requires params.text").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::INVALID_PARAMS,
+                    "session/steer requires params.text",
+                )
+                .await;
             };
             let images =
                 match crate::images::parse_images(msg.pointer("/params").unwrap_or(&Value::Null)) {
                     Ok(v) => v,
-                    Err(e) => return reply_err(writer, id, &format!("session/steer: {e}")).await,
+                    Err(e) => {
+                        return reply_err(
+                            writer,
+                            id,
+                            codes::INTERNAL,
+                            &format!("session/steer: {e}"),
+                        )
+                        .await
+                    }
                 };
             state.handle.steer_with(text.to_string(), images).await;
             reply_ok(writer, id, to_json(&Queued { queued: true })).await;
@@ -1077,7 +1224,13 @@ async fn handle_request(
         // the turn boundary; the fold's own frames ride `session/update`.
         "session/fold" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "no session — call session/new first").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "no session — call session/new first",
+                )
+                .await;
             };
             let focus = match msg.pointer("/params/focus") {
                 None | Some(Value::Null) => None,
@@ -1087,6 +1240,7 @@ async fn handle_request(
                         return reply_err(
                             writer,
                             id,
+                            codes::INVALID_PARAMS,
                             "session/fold: focus must be 1–4000 chars after trimming",
                         )
                         .await
@@ -1096,6 +1250,7 @@ async fn handle_request(
                     return reply_err(
                         writer,
                         id,
+                        codes::INVALID_PARAMS,
                         "session/fold: focus must be 1–4000 chars after trimming",
                     )
                     .await
@@ -1108,7 +1263,15 @@ async fn handle_request(
                 Some(hotl_engine::FoldAdmission::Queued) => {
                     reply_ok(writer, id, to_json(&Queued { queued: true })).await
                 }
-                None => reply_err(writer, id, "session/fold: the session is gone").await,
+                None => {
+                    reply_err(
+                        writer,
+                        id,
+                        codes::NOT_FOUND,
+                        "session/fold: the session is gone",
+                    )
+                    .await
+                }
             }
         }
         "session/cancel" => {
@@ -1129,6 +1292,7 @@ async fn handle_request(
                 return reply_err(
                     writer,
                     id,
+                    codes::INTERNAL,
                     "session/reload_config is not supported on this connection",
                 )
                 .await;
@@ -1149,7 +1313,13 @@ async fn handle_request(
                         )
                         .await;
                     }
-                    return reply_err(writer, id, &format!("config reload failed: {e}")).await;
+                    return reply_err(
+                        writer,
+                        id,
+                        codes::INTERNAL,
+                        &format!("config reload failed: {e}"),
+                    )
+                    .await;
                 }
             };
             *factory = new_factory;
@@ -1239,6 +1409,7 @@ async fn handle_request(
                     reply_err(
                         writer,
                         id,
+                        codes::INTERNAL,
                         &format!("config reloaded but session re-open failed: {e}"),
                     )
                     .await
@@ -1252,7 +1423,13 @@ async fn handle_request(
         // (or `aside_failed`) through the update stream like any event.
         "session/aside" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "session/aside requires an open session").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "session/aside requires an open session",
+                )
+                .await;
             };
             let Some(question) = msg
                 .pointer("/params/question")
@@ -1260,14 +1437,26 @@ async fn handle_request(
                 .map(str::trim)
                 .filter(|q| !q.is_empty())
             else {
-                return reply_err(writer, id, "session/aside requires params.question").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::INVALID_PARAMS,
+                    "session/aside requires params.question",
+                )
+                .await;
             };
             state.handle.aside(question.to_string()).await;
             reply_ok(writer, id, to_json(&Ack { ok: true })).await;
         }
         "session/context" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "session/context requires an open session").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "session/context requires an open session",
+                )
+                .await;
             };
             let sid = state.id.clone();
             match state.handle.context_breakdown().await {
@@ -1287,7 +1476,15 @@ async fn handle_request(
                     )
                     .await;
                 }
-                None => reply_err(writer, id, "session/context: the session is gone").await,
+                None => {
+                    reply_err(
+                        writer,
+                        id,
+                        codes::NOT_FOUND,
+                        "session/context: the session is gone",
+                    )
+                    .await
+                }
             }
         }
         // Every workflow run this process has started (0044), live. The
@@ -1295,7 +1492,13 @@ async fn handle_request(
         // on — the same guard and ack-then-broadcast shape as `session/context`.
         "session/workflows" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "session/workflows requires an open session").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "session/workflows requires an open session",
+                )
+                .await;
             };
             let sid = state.id.clone();
             reply_ok(writer, id, to_json(&Ack { ok: true })).await;
@@ -1307,7 +1510,13 @@ async fn handle_request(
         // `session/workflows` shape. Additive, so `UPDATE_SCHEMA_VERSION` stands.
         "session/jobs" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "session/jobs requires an open session").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "session/jobs requires an open session",
+                )
+                .await;
             };
             let jobs = state.handle.jobs().await;
             let now = std::time::SystemTime::now()
@@ -1347,7 +1556,13 @@ async fn handle_request(
         // `session/jobs` shape. Additive, so `UPDATE_SCHEMA_VERSION` stands.
         "session/children" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "session/children requires an open session").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "session/children requires an open session",
+                )
+                .await;
             };
             let children = state.handle.children().await;
             let now = std::time::SystemTime::now()
@@ -1389,8 +1604,13 @@ async fn handle_request(
         // parked one; the `agent` done frame that follows is the outcome.
         "session/children/stop" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "session/children/stop requires an open session")
-                    .await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "session/children/stop requires an open session",
+                )
+                .await;
             };
             let Some(child) = msg
                 .pointer("/params/child")
@@ -1398,7 +1618,13 @@ async fn handle_request(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             else {
-                return reply_err(writer, id, "session/children/stop requires params.child").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::INVALID_PARAMS,
+                    "session/children/stop requires params.child",
+                )
+                .await;
             };
             let stopped = state.handle.stop_child(child).await;
             reply_ok(writer, id, to_json(&StoppedAck { ok: true, stopped })).await;
@@ -1407,7 +1633,13 @@ async fn handle_request(
         // follows is the outcome.
         "session/jobs/stop" => {
             let Some(state) = session.as_ref() else {
-                return reply_err(writer, id, "session/jobs/stop requires an open session").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "session/jobs/stop requires an open session",
+                )
+                .await;
             };
             let Some(job) = msg
                 .pointer("/params/job")
@@ -1415,12 +1647,26 @@ async fn handle_request(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             else {
-                return reply_err(writer, id, "session/jobs/stop requires params.job").await;
+                return reply_err(
+                    writer,
+                    id,
+                    codes::INVALID_PARAMS,
+                    "session/jobs/stop requires params.job",
+                )
+                .await;
             };
             let stopped = state.handle.stop_job(job).await;
             reply_ok(writer, id, to_json(&StoppedAck { ok: true, stopped })).await;
         }
-        other => reply_err(writer, id, &format!("unknown method `{other}`")).await,
+        other => {
+            reply_err(
+                writer,
+                id,
+                codes::METHOD_NOT_FOUND,
+                &format!("unknown method `{other}`"),
+            )
+            .await
+        }
     }
 }
 
@@ -1792,10 +2038,10 @@ async fn reply_ok(writer: &Writer, id: Value, result: Value) {
     .await;
 }
 
-async fn reply_err(writer: &Writer, id: Value, message: &str) {
+async fn reply_err(writer: &Writer, id: Value, code: i64, message: &str) {
     send(
         writer,
-        &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": message}}),
+        &json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}),
     )
     .await;
 }

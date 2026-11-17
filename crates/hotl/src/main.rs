@@ -19,6 +19,8 @@
 
 mod acp;
 mod acp_child;
+#[allow(dead_code)]
+mod acp_ext;
 mod agent;
 mod approve_cli;
 mod arg_audit;

@@ -3675,3 +3675,46 @@ async fn every_handled_method_is_advertised_as_an_extension() {
         assert!(!msg.contains("unknown method"), "{m}: {r}");
     }
 }
+
+async fn error_code_for(request: Value) -> i64 {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(&mut cwrite, request).await;
+    let reply = read_until_id(&mut lines, 1).await;
+    reply["error"]["code"].as_i64().unwrap()
+}
+
+#[tokio::test]
+async fn unknown_method_is_32601() {
+    let code = error_code_for(json!({"jsonrpc":"2.0","id":1,"method":"session/frobnicate"})).await;
+    assert_eq!(code, -32601);
+}
+
+#[tokio::test]
+async fn missing_session_id_is_32602() {
+    let code =
+        error_code_for(json!({"jsonrpc":"2.0","id":1,"method":"session/load","params":{}})).await;
+    assert_eq!(code, -32602);
+}
+
+#[tokio::test]
+async fn a_request_with_no_open_session_is_32002() {
+    let code =
+        error_code_for(json!({"jsonrpc":"2.0","id":1,"method":"session/fold","params":{}})).await;
+    assert_eq!(code, -32002);
+}
+
+#[test]
+fn ext_names_carry_the_hotl_prefix() {
+    assert_eq!(crate::acp_ext::ext("session/steer"), "_hotl/session/steer");
+    assert_eq!(crate::acp_ext::META_EXT, "hotl.dev/extensions");
+}
