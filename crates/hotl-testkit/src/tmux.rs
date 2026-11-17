@@ -137,6 +137,7 @@ impl TmuxSession {
 
     pub fn pane_title(&self) -> String {
         let argv: Vec<String> = [
+            "-u",
             "-L",
             &self.socket,
             "display-message",

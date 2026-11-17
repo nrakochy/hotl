@@ -89,6 +89,7 @@ async fn an_intervening_steer_refuses_adoption_and_rebuilds() {
     // A steer while the turn runs is held, and released exactly when the
     // prompt's commit settles — the intervening entry.
     h.handle.steer("actually, be brief".to_string()).await;
+    h.handle.jobs().await;
     h.pause_writer(false);
     let outcome = h.wait_for_outcome().await;
     assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");

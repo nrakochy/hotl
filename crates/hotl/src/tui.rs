@@ -1762,7 +1762,7 @@ mod tests {
     /// the printing `acp_factory` wrapper would scribble startup warnings on it.
     #[test]
     fn open_session_never_prints_under_the_screen() {
-        let src = include_str!("tui.rs");
+        let src = include_str!("tui.rs").replace("\r\n", "\n");
         let start = src.find("async fn open_session").expect("open_session");
         let end = start + src[start..].find("\n}\n").expect("open_session ends");
         let body = &src[start..end];
