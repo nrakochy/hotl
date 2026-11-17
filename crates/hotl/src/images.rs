@@ -36,32 +36,40 @@ pub fn parse_images(params: &Value) -> Result<Vec<UserImage>, String> {
             .as_array()
             .ok_or("images must be an array of {media_type, data} objects")?,
     };
-    if arr.len() > MAX_IMAGES_PER_PROMPT {
-        return Err(format!(
-            "{} images exceeds the {MAX_IMAGES_PER_PROMPT}-per-prompt cap",
-            arr.len()
-        ));
-    }
-    let mut total = 0usize;
-    let mut out = Vec::with_capacity(arr.len());
+    let mut raw = Vec::with_capacity(arr.len());
     for (i, img) in arr.iter().enumerate() {
         let media_type = img
             .get("media_type")
             .and_then(Value::as_str)
             .ok_or_else(|| format!("images[{i}] is missing media_type"))?;
-        if !MEDIA_TYPES.contains(&media_type) {
-            return Err(format!(
-                "images[{i}] media_type {media_type:?} is not one of {MEDIA_TYPES:?}"
-            ));
-        }
         let data = img
             .get("data")
             .and_then(Value::as_str)
             .ok_or_else(|| format!("images[{i}] is missing data"))?;
-        let decoded = decoded_len(data).map_err(|e| format!("images[{i}]: {e}"))?;
+        raw.push((format!("images[{i}]"), media_type, data));
+    }
+    check_images(&raw)
+}
+
+pub fn check_images(images: &[(String, &str, &str)]) -> Result<Vec<UserImage>, String> {
+    if images.len() > MAX_IMAGES_PER_PROMPT {
+        return Err(format!(
+            "{} images exceeds the {MAX_IMAGES_PER_PROMPT}-per-prompt cap",
+            images.len()
+        ));
+    }
+    let mut total = 0usize;
+    let mut out = Vec::with_capacity(images.len());
+    for (label, media_type, data) in images {
+        if !MEDIA_TYPES.contains(media_type) {
+            return Err(format!(
+                "{label} media_type {media_type:?} is not one of {MEDIA_TYPES:?}"
+            ));
+        }
+        let decoded = decoded_len(data).map_err(|e| format!("{label}: {e}"))?;
         if decoded > MAX_IMAGE_DECODED_BYTES {
             return Err(format!(
-                "images[{i}] is {:.1}MB decoded — the per-image cap is {}MB",
+                "{label} is {:.1}MB decoded — the per-image cap is {}MB",
                 decoded as f64 / (1024.0 * 1024.0),
                 MAX_IMAGE_DECODED_BYTES / (1024 * 1024),
             ));
@@ -75,7 +83,7 @@ pub fn parse_images(params: &Value) -> Result<Vec<UserImage>, String> {
         }
         out.push(UserImage {
             media_type: media_type.to_string(),
-            data: data.into(),
+            data: (*data).into(),
         });
     }
     Ok(out)

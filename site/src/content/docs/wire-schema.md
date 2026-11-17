@@ -30,11 +30,11 @@ unless the schema says `null` is a value.
 |---|---|
 | `initialize` result | `InitializeResult` |
 | `session/new`, `session/load`, fork result | `SessionOpenResult` |
-| `session/prompt` result | `PromptResult` |
+| `session/prompt` result | `PromptResponse`; its `_meta["hotl.dev/turn"]` is `TurnMeta` |
 | `session/update` params | `SessionUpdateParams` (its `update` is a stream frame or an ACP-only kind) |
 | `session/set_plan`, `set_mode`, `set_effort`, `set_model`, `set_goal` results | `PlanAck`, `ModeAck`, `EffortAck`, `ModelAck`, `GoalAck` |
 | `session/reload_config` result | `ReloadAck` / `ReloadSessionAck` |
-| `session/steer`, `session/fold` results | `Queued`; `session/cancel` → `Cancelled`; stops → `StoppedAck`; the rest → `Ack` |
+| `session/steer`, `session/fold` results | `Queued` (`session/cancel` is a notification and gets no reply); stops → `StoppedAck`; the rest → `Ack` |
 | server → client `session/request_permission`, `request_question`, `request_egress` | `RequestPermissionParams`, `RequestQuestionParams`, `RequestEgressParams` |
 | what the client answers them with | `PermissionReply`, `QuestionReply`, `EgressReply` |
 

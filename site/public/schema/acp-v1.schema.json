@@ -16,31 +16,6 @@
       "description": "`session/update` bodies only the ACP surface sends.",
       "oneOf": [
         {
-          "description": "The turn ended; the usage rides the prompt result instead.",
-          "properties": {
-            "mispredictions": {
-              "format": "uint32",
-              "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "outcome": {
-              "$ref": "#/$defs/OutcomeFrame"
-            },
-            "type": {
-              "const": "turn_done",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "outcome"
-          ],
-          "type": "object"
-        },
-        {
           "properties": {
             "bytes": {
               "format": "uint",
@@ -252,6 +227,21 @@
       ],
       "type": "object"
     },
+    "AudioContent": {
+      "properties": {
+        "data": {
+          "type": "string"
+        },
+        "mimeType": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "data",
+        "mimeType"
+      ],
+      "type": "object"
+    },
     "AuthMethod": {
       "oneOf": [
         {
@@ -384,14 +374,24 @@
       ],
       "type": "object"
     },
-    "Cancelled": {
+    "BlobResourceContents": {
       "properties": {
-        "cancelled": {
-          "type": "boolean"
+        "blob": {
+          "type": "string"
+        },
+        "mimeType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uri": {
+          "type": "string"
         }
       },
       "required": [
-        "cancelled"
+        "uri",
+        "blob"
       ],
       "type": "object"
     },
@@ -506,6 +506,58 @@
             "type"
           ],
           "type": "object"
+        },
+        {
+          "$ref": "#/$defs/ImageContent",
+          "properties": {
+            "type": {
+              "const": "image",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/AudioContent",
+          "properties": {
+            "type": {
+              "const": "audio",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/ResourceLink",
+          "properties": {
+            "type": {
+              "const": "resource_link",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/EmbeddedResource",
+          "properties": {
+            "type": {
+              "const": "resource",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -565,6 +617,22 @@
       ],
       "type": "object"
     },
+    "Cost": {
+      "properties": {
+        "amount": {
+          "format": "double",
+          "type": "number"
+        },
+        "currency": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "amount",
+        "currency"
+      ],
+      "type": "object"
+    },
     "CurrentModeUpdate": {
       "properties": {
         "currentModeId": {
@@ -587,6 +655,27 @@
         "allow"
       ],
       "type": "object"
+    },
+    "EmbeddedResource": {
+      "properties": {
+        "resource": {
+          "$ref": "#/$defs/EmbeddedResourceResource"
+        }
+      },
+      "required": [
+        "resource"
+      ],
+      "type": "object"
+    },
+    "EmbeddedResourceResource": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TextResourceContents"
+        },
+        {
+          "$ref": "#/$defs/BlobResourceContents"
+        }
+      ]
     },
     "EmptyCapability": {
       "type": "object"
@@ -1685,6 +1774,27 @@
       ],
       "type": "string"
     },
+    "ImageContent": {
+      "properties": {
+        "data": {
+          "type": "string"
+        },
+        "mimeType": {
+          "type": "string"
+        },
+        "uri": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "data",
+        "mimeType"
+      ],
+      "type": "object"
+    },
     "Implementation": {
       "properties": {
         "_meta": {
@@ -2306,33 +2416,21 @@
       ],
       "type": "object"
     },
-    "PromptResult": {
-      "description": "The `session/prompt` result, sent when the turn ends.",
+    "PromptResponse": {
       "properties": {
-        "mispredictions": {
-          "format": "uint32",
-          "minimum": 0,
+        "_meta": {
+          "additionalProperties": true,
           "type": [
-            "integer",
+            "object",
             "null"
           ]
         },
-        "outcome": {
-          "$ref": "#/$defs/OutcomeFrame"
-        },
-        "schemaVersion": {
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "usage": {
-          "$ref": "#/$defs/UsageFrame"
+        "stopReason": {
+          "$ref": "#/$defs/StopReason"
         }
       },
       "required": [
-        "schemaVersion",
-        "outcome",
-        "usage"
+        "stopReason"
       ],
       "type": "object"
     },
@@ -2528,6 +2626,46 @@
         "prompt",
         "options",
         "multi"
+      ],
+      "type": "object"
+    },
+    "ResourceLink": {
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mimeType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "size": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uri": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri",
+        "name"
       ],
       "type": "object"
     },
@@ -3116,6 +3254,16 @@
       ],
       "type": "object"
     },
+    "StopReason": {
+      "enum": [
+        "end_turn",
+        "max_tokens",
+        "max_turn_requests",
+        "refusal",
+        "cancelled"
+      ],
+      "type": "string"
+    },
     "StoppedAck": {
       "properties": {
         "ok": {
@@ -3138,6 +3286,27 @@
         }
       },
       "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "TextResourceContents": {
+      "properties": {
+        "mimeType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "type": "string"
+        },
+        "uri": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri",
         "text"
       ],
       "type": "object"
@@ -3335,6 +3504,29 @@
       ],
       "type": "string"
     },
+    "TurnMeta": {
+      "properties": {
+        "mispredictions": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "outcome": {
+          "$ref": "#/$defs/OutcomeFrame"
+        },
+        "usage": {
+          "$ref": "#/$defs/UsageFrame"
+        }
+      },
+      "required": [
+        "outcome",
+        "usage"
+      ],
+      "type": "object"
+    },
     "UnstructuredCommandInput": {
       "properties": {
         "hint": {
@@ -3404,6 +3596,16 @@
     },
     "UsageUpdate": {
       "properties": {
+        "cost": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Cost"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "size": {
           "format": "uint64",
           "minimum": 0,
@@ -3445,9 +3647,6 @@
     "ack": {
       "$ref": "#/$defs/Ack"
     },
-    "cancelled": {
-      "$ref": "#/$defs/Cancelled"
-    },
     "egressReply": {
       "$ref": "#/$defs/EgressReply"
     },
@@ -3472,8 +3671,8 @@
     "permissionReply": {
       "$ref": "#/$defs/PermissionReply"
     },
-    "promptResult": {
-      "$ref": "#/$defs/PromptResult"
+    "promptResponse": {
+      "$ref": "#/$defs/PromptResponse"
     },
     "questionReply": {
       "$ref": "#/$defs/QuestionReply"
@@ -3510,6 +3709,9 @@
     },
     "stoppedAck": {
       "$ref": "#/$defs/StoppedAck"
+    },
+    "turnMeta": {
+      "$ref": "#/$defs/TurnMeta"
     }
   },
   "required": [
@@ -3520,7 +3722,8 @@
     "listSessions",
     "sessionNotification",
     "sessionOpenExtras",
-    "promptResult",
+    "promptResponse",
+    "turnMeta",
     "sessionUpdate",
     "ack",
     "modelAck",
@@ -3529,7 +3732,6 @@
     "reloadAck",
     "reloadSessionAck",
     "queued",
-    "cancelled",
     "requestPermission",
     "requestQuestion",
     "requestEgress",

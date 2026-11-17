@@ -220,17 +220,18 @@ fn every_acp_payload_validates_against_the_published_schema() {
         ))
         .unwrap(),
     );
+    acp_valid("PromptResponse", &json!({"stopReason": "end_turn"}));
     acp_valid(
-        "PromptResult",
-        &json!({"schemaVersion": 1, "outcome": {"kind": "done", "text": "x"}, "usage": wire::usage_frame("claude-opus-5", &TokenUsage { input_tokens: 3, ..Default::default() })}),
+        "TurnMeta",
+        &json!({"outcome": {"kind": "done", "text": "x"}, "usage": wire::usage_frame("claude-opus-5", &TokenUsage { input_tokens: 3, ..Default::default() })}),
     );
     acp_valid(
         "SessionUpdateParams",
         &json!({"schemaVersion": 1, "sessionId": "s", "update": wire::update_frame(&EngineEvent::TextDelta("x".into())).unwrap()}),
     );
     acp_valid(
-        "SessionUpdateParams",
-        &json!({"schemaVersion": 1, "sessionId": "s", "update": {"type": "turn_done", "outcome": {"kind": "cancelled"}}}),
+        "SessionNotification",
+        &json!({"sessionId": "s", "update": {"sessionUpdate": "usage_update", "used": 10, "size": 200000, "cost": {"amount": 0.5, "currency": "USD"}}}),
     );
     acp_valid(
         "RequestPermissionParams",

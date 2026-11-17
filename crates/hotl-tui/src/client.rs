@@ -121,6 +121,14 @@ impl<W: AsyncWrite + Unpin> AcpClient<W> {
         Ok(id)
     }
 
+    pub async fn notify(&mut self, method: &str, params: Value) -> io::Result<()> {
+        let mut msg = json!({"jsonrpc": "2.0", "method": method});
+        if !params.is_null() {
+            msg["params"] = params;
+        }
+        self.send(&msg).await
+    }
+
     pub async fn reply_permission(
         &mut self,
         req_id: u64,
@@ -371,11 +379,14 @@ fn decode(msg: &Value) -> Option<ServerMsg> {
         None => {
             let id = msg.get("id").and_then(Value::as_u64)?;
             let result = match msg.get("error") {
-                Some(e) => Err(e
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("error")
-                    .to_string()),
+                Some(e) => match e.pointer("/data/_meta/hotl.dev~1turn") {
+                    Some(turn) => Ok(json!({"_meta": {"hotl.dev/turn": turn}})),
+                    None => Err(e
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("error")
+                        .to_string()),
+                },
                 None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
             };
             Some(ServerMsg::Response { id, result })
@@ -448,18 +459,27 @@ pub fn translate(
 fn prompt_result_msg(result: Result<Value, String>) -> Msg {
     match result {
         Ok(v) => {
+            let turn = v.pointer("/_meta/hotl.dev~1turn").unwrap_or(&Value::Null);
             let text = ["text", "message", "pattern", "tool"]
                 .iter()
-                .find_map(|k| v.pointer(&format!("/outcome/{k}")).and_then(Value::as_str))
+                .find_map(|k| {
+                    turn.pointer(&format!("/outcome/{k}"))
+                        .and_then(Value::as_str)
+                })
                 .map(String::from);
+            let kind = turn
+                .pointer("/outcome/kind")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    v.get("stopReason")
+                        .and_then(Value::as_str)
+                        .map(kind_of_stop_reason)
+                })
+                .unwrap_or("error");
             Msg::PromptResult {
-                outcome_kind: v
-                    .pointer("/outcome/kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or("error")
-                    .to_string(),
+                outcome_kind: kind.to_string(),
                 outcome_text: text,
-                usage: v.get("usage").cloned().unwrap_or(Value::Null),
+                usage: turn.get("usage").cloned().unwrap_or(Value::Null),
                 // The runtime owns the clock (0061 T9).
                 finished_at: None,
             }
@@ -470,6 +490,16 @@ fn prompt_result_msg(result: Result<Value, String>) -> Msg {
             usage: Value::Null,
             finished_at: None,
         },
+    }
+}
+
+fn kind_of_stop_reason(reason: &str) -> &'static str {
+    match reason {
+        "end_turn" => "done",
+        "cancelled" => "cancelled",
+        "max_turn_requests" => "turn_limit",
+        "refusal" => "refused",
+        _ => "error",
     }
 }
 
@@ -487,13 +517,15 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
 ) -> io::Result<Option<Cmd>> {
     match cmd {
         Cmd::SendPrompt(p) => {
-            prompt_ids.push_back(client.request("session/prompt", prompt_params(&p)).await?);
+            let params = client.with_session(prompt_params(&p));
+            prompt_ids.push_back(client.request("session/prompt", params).await?);
         }
         Cmd::SendSteer(p) => {
-            steer_ids.push_back(client.request("session/steer", prompt_params(&p)).await?);
+            steer_ids.push_back(client.request("session/steer", steer_params(&p)).await?);
         }
         Cmd::Cancel => {
-            client.request("session/cancel", Value::Null).await?;
+            let params = client.with_session(json!({}));
+            client.notify("session/cancel", params).await?;
         }
         // Cancel/rename acks are noise: `translate` only surfaces prompt
         // replies and rejected steers.
@@ -625,14 +657,24 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
     Ok(None)
 }
 
-/// `session/prompt` / `session/steer` params. `images` carries only entries
+fn prompt_params(p: &crate::paste::PromptPayload) -> Value {
+    let mut blocks = vec![json!({"type": "text", "text": p.text})];
+    blocks.extend(p.images.iter().filter_map(|i| {
+        i.data
+            .as_ref()
+            .map(|d| json!({"type": "image", "mimeType": i.media_type, "data": d}))
+    }));
+    json!({"prompt": blocks})
+}
+
+/// `session/steer` params. `images` carries only entries
 /// the runtime seam encoded (`data: Some`) and is omitted entirely when
 /// empty, so a text-only frame stays byte-identical to the pre-image
 /// protocol — an older server never sees a key it does not know. Unencoded
 /// entries are dropped, not asserted: the e2e harness legitimately drives
 /// this without the runtime seam, exactly as it already skips `@[file]`
 /// expansion.
-fn prompt_params(p: &crate::paste::PromptPayload) -> Value {
+fn steer_params(p: &crate::paste::PromptPayload) -> Value {
     let mut params = json!({"text": p.text});
     let images: Vec<Value> = p
         .images
@@ -671,7 +713,9 @@ mod tests {
             let mut steer_ids = VecDeque::new();
             let msg = ServerMsg::Response {
                 id: 7,
-                result: Ok(json!({"outcome": {"kind": kind, key: "payload"}})),
+                result: Ok(
+                    json!({"stopReason": "end_turn", "_meta": {"hotl.dev/turn": {"outcome": {"kind": kind, key: "payload"}}}}),
+                ),
             };
             let Some(Msg::PromptResult {
                 outcome_kind,
@@ -1149,10 +1193,10 @@ mod tests {
     /// to the pre-image protocol (no `images` key at all), encoded entries
     /// ride, unencoded entries (harness runs without the runtime seam) drop.
     #[test]
-    fn prompt_params_omit_images_when_empty_and_serialize_encoded_ones() {
+    fn steer_params_omit_images_when_empty_and_serialize_encoded_ones() {
         use crate::paste::{ImageAttachment, PromptPayload};
         let text_only = PromptPayload::text_only("hi".into());
-        assert_eq!(prompt_params(&text_only).to_string(), r#"{"text":"hi"}"#);
+        assert_eq!(steer_params(&text_only).to_string(), r#"{"text":"hi"}"#);
 
         let mixed = PromptPayload {
             text: "see [Image #1] and [Image #2]".into(),
@@ -1171,10 +1215,142 @@ mod tests {
                 },
             ],
         };
-        let params = prompt_params(&mixed);
+        let params = steer_params(&mixed);
         assert_eq!(
             params["images"],
             json!([{"media_type": "image/png", "data": "aW1n"}])
+        );
+    }
+
+    fn mixed_payload() -> crate::paste::PromptPayload {
+        use crate::paste::{ImageAttachment, PromptPayload};
+        PromptPayload {
+            text: "see [Image #1] and [Image #2]".into(),
+            images: vec![
+                ImageAttachment {
+                    marker: "[Image #1]".into(),
+                    path: "/a/1.png".into(),
+                    media_type: "image/png".into(),
+                    data: Some("aW1n".into()),
+                },
+                ImageAttachment {
+                    marker: "[Image #2]".into(),
+                    path: "/a/2.png".into(),
+                    media_type: "image/png".into(),
+                    data: None,
+                },
+            ],
+        }
+    }
+
+    async fn written(cmd: Cmd) -> (Vec<Value>, VecDeque<u64>) {
+        let (mut read, write) = tokio::io::duplex(4096);
+        let mut client = AcpClient::new(write);
+        client.set_session_id("s1");
+        let mut ids = VecDeque::new();
+        exec_wire_cmd(
+            cmd,
+            &mut client,
+            &mut ids,
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+        )
+        .await
+        .expect("the write succeeded");
+        drop(client);
+        let mut out = String::new();
+        read.read_to_string(&mut out).await.unwrap();
+        let lines = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        (lines, ids)
+    }
+
+    #[tokio::test]
+    async fn a_prompt_sends_content_blocks_with_the_session() {
+        let (lines, ids) = written(Cmd::SendPrompt(mixed_payload())).await;
+        assert_eq!(
+            lines,
+            [
+                json!({"jsonrpc": "2.0", "id": 1, "method": "session/prompt", "params": {
+                    "sessionId": "s1",
+                    "prompt": [
+                        {"type": "text", "text": "see [Image #1] and [Image #2]"},
+                        {"type": "image", "mimeType": "image/png", "data": "aW1n"}
+                    ]
+                }})
+            ]
+        );
+        assert_eq!(ids, [1]);
+    }
+
+    #[tokio::test]
+    async fn cancel_is_a_notification_naming_the_session() {
+        let (lines, ids) = written(Cmd::Cancel).await;
+        assert_eq!(
+            lines,
+            [json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "s1"}})]
+        );
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn an_error_turn_end_reads_like_the_old_error_result() {
+        let msg = decode(&json!({"jsonrpc": "2.0", "id": 7, "error": {
+            "code": -32603,
+            "message": "authentication failed: bad key",
+            "data": {"kind": "error", "message": "authentication failed: bad key",
+                "_meta": {"hotl.dev/turn": {
+                    "outcome": {"kind": "error", "message": "authentication failed: bad key"},
+                    "usage": {"input_tokens": 3}
+                }}}
+        }}))
+        .unwrap();
+        let got = translate(
+            msg,
+            &mut VecDeque::from([7]),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+        );
+        assert_eq!(
+            got,
+            Some(Msg::PromptResult {
+                outcome_kind: "error".into(),
+                outcome_text: Some("authentication failed: bad key".into()),
+                usage: json!({"input_tokens": 3}),
+                finished_at: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_done_reply_reads_its_usage_from_the_turn_meta() {
+        let got = translate(
+            ServerMsg::Response {
+                id: 7,
+                result: Ok(
+                    json!({"stopReason": "end_turn", "_meta": {"hotl.dev/turn": {
+                        "outcome": {"kind": "done", "text": "ok"},
+                        "usage": {"input_tokens": 5}
+                    }}}),
+                ),
+            },
+            &mut VecDeque::from([7]),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+        );
+        assert_eq!(
+            got,
+            Some(Msg::PromptResult {
+                outcome_kind: "done".into(),
+                outcome_text: Some("ok".into()),
+                usage: json!({"input_tokens": 5}),
+                finished_at: None,
+            })
         );
     }
 

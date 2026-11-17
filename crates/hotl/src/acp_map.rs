@@ -1,14 +1,104 @@
-use hotl_types::{Item, SyntheticReason, TodoStatus};
+use hotl_engine::Outcome;
+use hotl_types::{Item, SyntheticReason, TodoStatus, UserImage};
 use serde_json::Value;
 
 use crate::acp::{SessionOpen, SessionOpenExtras, WorktreeInfo};
 use crate::acp_types::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, Content, ContentBlock,
-    ContentChunk, McpServer, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    SessionConfigBoolean, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelect, SessionConfigSelectOption, SessionMode, SessionModeState, SessionUpdate,
-    ToolCall, ToolCallContent, ToolCallStatus, ToolKind, UnstructuredCommandInput,
+    ContentChunk, EmbeddedResource, EmbeddedResourceResource, McpServer, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, SessionConfigBoolean, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelect,
+    SessionConfigSelectOption, SessionMode, SessionModeState, SessionUpdate, StopReason, ToolCall,
+    ToolCallContent, ToolCallStatus, ToolKind, UnstructuredCommandInput,
 };
+
+pub fn prompt_from_blocks(blocks: &[ContentBlock]) -> Result<(String, Vec<UserImage>), String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut raw_images = Vec::new();
+    for (i, block) in blocks.iter().enumerate() {
+        match block {
+            ContentBlock::Text(t) => lines.push(t.text.clone()),
+            ContentBlock::Image(img) => {
+                raw_images.push((format!("prompt[{i}]"), img.mime_type.as_str(), img.data.as_str()))
+            }
+            ContentBlock::ResourceLink(link) => lines.push(format!("@{}", reference(&link.uri))),
+            ContentBlock::Resource(EmbeddedResource {
+                resource: EmbeddedResourceResource::TextResourceContents(r),
+            }) => lines.push(fenced(&r.uri, &r.text)),
+            ContentBlock::Resource(EmbeddedResource {
+                resource: EmbeddedResourceResource::BlobResourceContents(_),
+            }) => {
+                return Err(format!(
+                    "prompt[{i}] is a binary resource, which hotl does not read; send a resource_link instead"
+                ))
+            }
+            ContentBlock::Audio(_) => {
+                return Err(format!("prompt[{i}] is audio, which hotl does not accept"))
+            }
+        }
+    }
+    let images = crate::images::check_images(&raw_images)?;
+    Ok((lines.join("\n"), images))
+}
+
+fn fenced(uri: &str, text: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat(longest.max(2) + 1);
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    format!("@{}\n{fence}\n{body}\n{fence}", reference(uri))
+}
+
+fn reference(uri: &str) -> String {
+    let Some(rest) = uri.strip_prefix("file://") else {
+        return uri.to_string();
+    };
+    let path = rest.strip_prefix("localhost").unwrap_or(rest);
+    let decoded = percent_decode(path);
+    let bytes = decoded.as_bytes();
+    if bytes.len() > 2 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        return decoded[1..].to_string();
+    }
+    decoded
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+pub fn stop_reason(outcome: &Outcome) -> Result<StopReason, Value> {
+    match outcome {
+        Outcome::Done { .. }
+        | Outcome::DoomLoop { .. }
+        | Outcome::ToolFailureBudget { .. }
+        | Outcome::DenialSpiral { .. } => Ok(StopReason::EndTurn),
+        Outcome::Cancelled => Ok(StopReason::Cancelled),
+        Outcome::TurnLimit => Ok(StopReason::MaxTurnRequests),
+        Outcome::Refused => Ok(StopReason::Refusal),
+        Outcome::Budget { kind, .. } if kind == "tool_calls" => Ok(StopReason::MaxTurnRequests),
+        Outcome::Budget { .. } => Ok(StopReason::EndTurn),
+        Outcome::Error { .. } => Err(crate::wire::outcome_frame(outcome)),
+    }
+}
 
 pub fn tool_kind(name: &str) -> ToolKind {
     match name {
@@ -173,6 +263,7 @@ pub struct ConfigState {
     pub effort: String,
     pub models: Vec<String>,
     pub ext: bool,
+    pub context_window: u64,
 }
 
 pub fn effort_wire(open: &SessionOpen) -> String {
@@ -522,6 +613,7 @@ mod tests {
 
     fn state() -> ConfigState {
         ConfigState {
+            context_window: 200_000,
             model: "anthropic/m".into(),
             plan: false,
             effort: "default".into(),
@@ -624,5 +716,119 @@ mod tests {
     fn rfc3339_formats_utc_seconds() {
         let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         assert_eq!(rfc3339(t), "2023-11-14T22:13:20Z");
+    }
+
+    fn blocks(v: Value) -> Vec<ContentBlock> {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn stop_reason_table() {
+        use hotl_engine::Outcome;
+        let ok = |o: Outcome| stop_reason(&o).unwrap();
+        assert_eq!(ok(Outcome::Done { text: "x".into() }), StopReason::EndTurn);
+        assert_eq!(ok(Outcome::Cancelled), StopReason::Cancelled);
+        assert_eq!(ok(Outcome::TurnLimit), StopReason::MaxTurnRequests);
+        assert_eq!(ok(Outcome::Refused), StopReason::Refusal);
+        assert_eq!(
+            ok(Outcome::Budget {
+                kind: "tool_calls".into(),
+                used: 5.0,
+                cap: 5.0
+            }),
+            StopReason::MaxTurnRequests
+        );
+        assert_eq!(
+            ok(Outcome::Budget {
+                kind: "cost_usd".into(),
+                used: 1.0,
+                cap: 1.0
+            }),
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            ok(Outcome::DoomLoop {
+                pattern: "p".into()
+            }),
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            ok(Outcome::ToolFailureBudget { tool: "t".into() }),
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            ok(Outcome::DenialSpiral {
+                consecutive: 3,
+                total: 3
+            }),
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            stop_reason(&Outcome::Error {
+                message: "boom".into()
+            })
+            .unwrap_err(),
+            json!({"kind": "error", "message": "boom"})
+        );
+    }
+
+    #[test]
+    fn text_blocks_join_with_newlines() {
+        let (text, images) = prompt_from_blocks(&blocks(json!([
+            {"type": "text", "text": "one"},
+            {"type": "text", "text": "two"}
+        ])))
+        .unwrap();
+        assert_eq!(text, "one\ntwo");
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn a_file_resource_link_becomes_a_decoded_path_reference() {
+        let (text, _) = prompt_from_blocks(&blocks(json!([
+            {"type": "text", "text": "look at"},
+            {"type": "resource_link", "uri": "file:///tmp/my%20dir/a.rs", "name": "a.rs"},
+            {"type": "resource_link", "uri": "https://example.com/x", "name": "x"}
+        ])))
+        .unwrap();
+        assert_eq!(text, "look at\n@/tmp/my dir/a.rs\n@https://example.com/x");
+    }
+
+    #[test]
+    fn an_embedded_text_resource_is_fenced_under_its_reference() {
+        let (text, _) = prompt_from_blocks(&blocks(json!([
+            {"type": "resource", "resource": {"uri": "file:///w/a.rs", "text": "fn a() {}\n```x```"}}
+        ])))
+        .unwrap();
+        assert_eq!(text, "@/w/a.rs\n````\nfn a() {}\n```x```\n````");
+    }
+
+    #[test]
+    fn image_blocks_pass_the_wire_checks() {
+        let (_, images) = prompt_from_blocks(&blocks(json!([
+            {"type": "image", "mimeType": "image/png", "data": "aW1nMQ=="}
+        ])))
+        .unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].media_type, "image/png");
+        let err = prompt_from_blocks(&blocks(json!([
+            {"type": "image", "mimeType": "image/tiff", "data": "aW1nMQ=="}
+        ])))
+        .unwrap_err();
+        assert!(err.contains("prompt[0]"), "{err}");
+    }
+
+    #[test]
+    fn audio_and_blob_resources_are_refused() {
+        let audio = prompt_from_blocks(&blocks(json!([
+            {"type": "audio", "mimeType": "audio/wav", "data": "aW1n"}
+        ])))
+        .unwrap_err();
+        assert!(audio.contains("audio"), "{audio}");
+        let blob = prompt_from_blocks(&blocks(json!([
+            {"type": "resource", "resource": {"uri": "file:///a.bin", "blob": "aW1n"}}
+        ])))
+        .unwrap_err();
+        assert!(blob.contains("binary"), "{blob}");
     }
 }

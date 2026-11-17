@@ -22,11 +22,11 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::acp_ext::codes;
 use crate::acp_types::{
     AgentCapabilities, AuthMethod, AuthenticateRequest, CloseSessionRequest, ConfigOptionUpdate,
-    CurrentModeUpdate, ErrorObject, Implementation, InitializeRequest, InitializeResponse,
+    Cost, CurrentModeUpdate, ErrorObject, Implementation, InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse, Notice, NoticeSeverity,
-    PromptCapabilities, ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities,
-    SessionInfo, SessionInfoUpdate, SessionNotification, SessionUpdate,
+    PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
+    SessionCapabilities, SessionInfo, SessionInfoUpdate, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     UsageUpdate,
 };
@@ -682,6 +682,7 @@ async fn handle_request(
                 &info.model,
                 &info.fallback_models,
                 client_caps.ext,
+                info.context_window,
             );
             if let Some(state) = session.as_mut() {
                 state.mcp = mcp;
@@ -778,6 +779,7 @@ async fn handle_request(
                     SessionUpdate::UsageUpdate(UsageUpdate {
                         used,
                         size: info.context_window,
+                        cost: None,
                     }),
                 )
                 .await;
@@ -860,38 +862,38 @@ async fn handle_request(
                 )
                 .await;
             };
-            let Some(text) = msg.pointer("/params/text").and_then(Value::as_str) else {
-                return reply_err(
-                    writer,
-                    id,
-                    codes::INVALID_PARAMS,
-                    "session/prompt requires params.text",
-                )
-                .await;
-            };
-            // Images are validated HERE, before the log: a poisoned base64
-            // item would be durable and 400 every later sample (see
-            // `crate::images`). A rejected prompt commits nothing.
-            let images =
-                match crate::images::parse_images(msg.pointer("/params").unwrap_or(&Value::Null)) {
-                    Ok(v) => v,
+            let request: PromptRequest =
+                match serde_json::from_value(msg.get("params").cloned().unwrap_or(Value::Null)) {
+                    Ok(r) => r,
                     Err(e) => {
                         return reply_err(
                             writer,
                             id,
-                            codes::INTERNAL,
-                            &format!("session/prompt: {e}"),
+                            codes::INVALID_PARAMS,
+                            &format!(
+                            "session/prompt requires params.prompt, a list of content blocks: {e}"
+                        ),
                         )
                         .await
                     }
                 };
-            // Stash the id; the drain task answers it on TurnDone so the read
-            // loop stays free to service permission responses meanwhile.
+            let (text, images) = match crate::acp_map::prompt_from_blocks(&request.prompt) {
+                Ok(v) => v,
+                Err(e) => {
+                    return reply_err(
+                        writer,
+                        id,
+                        codes::INVALID_PARAMS,
+                        &format!("session/prompt: {e}"),
+                    )
+                    .await
+                }
+            };
             pending_prompt
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push_back(id);
-            state.handle.prompt_with(text.to_string(), images).await;
+            state.handle.prompt_with(text, images).await;
         }
         "session/rename" => {
             let Some(state) = session.as_ref() else {
@@ -1375,7 +1377,27 @@ async fn handle_request(
             if let Some(state) = session.as_ref() {
                 state.handle.interrupt();
             }
-            reply_ok(writer, id, to_json(&Cancelled { cancelled: true })).await;
+            for (_, reply) in pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .drain()
+            {
+                let _ = reply.send(AskReply::Deny { message: None });
+            }
+            for (_, reply) in pending_questions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .drain()
+            {
+                let _ = reply.send(hotl_types::QuestionAnswer::NoHuman);
+            }
+            for (_, reply) in pending_egress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .drain()
+            {
+                let _ = reply.send(hotl_tools::net::EgressDecision::NoAnswer);
+            }
         }
         // Re-read `config.toml` and rebuild the engine behind this connection,
         // then re-open the live session through the ordinary resume path so its
@@ -1479,6 +1501,7 @@ async fn handle_request(
                         &info.model,
                         &info.fallback_models,
                         client_caps.ext,
+                        info.context_window,
                     );
                     if let Some(state) = session.as_mut() {
                         state.mcp = mcp;
@@ -2120,6 +2143,7 @@ fn install_session(
     model: &str,
     fallbacks: &[String],
     ext: bool,
+    context_window: u64,
 ) {
     retire_session(
         session,
@@ -2136,6 +2160,7 @@ fn install_session(
             .chain(fallbacks.iter().cloned())
             .collect(),
         ext,
+        context_window,
     }));
     let lease = open.lease;
     let mut state = start_session(
@@ -2303,6 +2328,7 @@ async fn drain_events(
             let (config_options, ext) = {
                 let mut state = lock_config(&config);
                 state.model = model.clone();
+                state.context_window = *context_window;
                 (crate::acp_map::config_options(&state), state.ext)
             };
             let meta = ext.then(|| {
@@ -2431,28 +2457,68 @@ async fn drain_events(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .retain(|_, tx| !tx.is_closed());
-                // `mispredictions` is omitted at zero, exactly as the JSON
-                // stream renders it (0050 T5).
                 let misses = (mispredictions > 0).then_some(mispredictions);
-                let done = AcpOnlyUpdate::TurnDone {
-                    outcome: crate::wire::OutcomeFrame::of(&outcome),
-                    mispredictions: misses,
+                let frame = crate::wire::UsageFrame::of(&model, &usage);
+                let (size, ext) = {
+                    let state = lock_config(&config);
+                    (state.context_window, state.ext)
                 };
-                notify(&writer, &session_id, to_json(&done)).await;
-                // Take the id and drop the guard *before* awaiting (a
-                // std::sync guard held across .await would make this non-Send).
+                send_update(
+                    &writer,
+                    &session_id,
+                    SessionUpdate::UsageUpdate(UsageUpdate {
+                        used: usage.input_tokens
+                            + usage.cache_read_input_tokens
+                            + usage.cache_creation_input_tokens,
+                        size,
+                        cost: frame.cost_usd.map(|amount| Cost {
+                            amount,
+                            currency: "USD".into(),
+                        }),
+                    }),
+                )
+                .await;
                 let prompt_id = pending_prompt
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .pop_front();
-                if let Some(id) = prompt_id {
-                    let reply = PromptResult {
-                        schema_version: UPDATE_SCHEMA_VERSION,
-                        outcome: crate::wire::OutcomeFrame::of(&outcome),
-                        usage: crate::wire::UsageFrame::of(&model, &usage),
-                        mispredictions: misses,
-                    };
-                    reply_ok(&writer, id, to_json(&reply)).await;
+                let Some(id) = prompt_id else {
+                    continue;
+                };
+                let meta = ext.then(|| {
+                    let mut m = serde_json::Map::new();
+                    m.insert(
+                        META_TURN.into(),
+                        to_json(&TurnMeta {
+                            outcome: crate::wire::OutcomeFrame::of(&outcome),
+                            usage: frame,
+                            mispredictions: misses,
+                        }),
+                    );
+                    m
+                });
+                match crate::acp_map::stop_reason(&outcome) {
+                    Ok(stop_reason) => {
+                        reply_ok(&writer, id, to_json(&PromptResponse { stop_reason, meta })).await
+                    }
+                    Err(mut data) => {
+                        if let (Some(meta), Some(obj)) = (meta, data.as_object_mut()) {
+                            obj.insert("_meta".into(), Value::Object(meta));
+                        }
+                        let message = match &outcome {
+                            Outcome::Error { message } => message.clone(),
+                            _ => "the turn failed".into(),
+                        };
+                        send(
+                            &writer,
+                            &json!({"jsonrpc": "2.0", "id": id, "error": ErrorObject {
+                                code: codes::INTERNAL,
+                                message,
+                                data: Some(data),
+                            }}),
+                        )
+                        .await;
+                    }
                 }
             }
             other => {
@@ -2548,6 +2614,7 @@ mod drain_tests {
                 effort: "default".into(),
                 models: Vec::new(),
                 ext: false,
+                context_window: 200_000,
             })),
         )
         .await;
@@ -2947,11 +3014,11 @@ pub struct SessionOpenExtras {
     pub color: Option<String>,
 }
 
-/// The `session/prompt` result, sent when the turn ends.
+pub const META_TURN: &str = "hotl.dev/turn";
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct PromptResult {
-    pub schema_version: u32,
+pub struct TurnMeta {
     pub outcome: crate::wire::OutcomeFrame,
     pub usage: crate::wire::UsageFrame,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3013,11 +3080,6 @@ pub struct Queued {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct Cancelled {
-    pub cancelled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct MemoryEntryRow {
     pub date: String,
     pub note: String,
@@ -3059,12 +3121,6 @@ pub struct ChildRow {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AcpOnlyUpdate {
-    /// The turn ended; the usage rides the prompt result instead.
-    TurnDone {
-        outcome: crate::wire::OutcomeFrame,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mispredictions: Option<u32>,
-    },
     MemoryReport {
         mode: String,
         path: String,
@@ -3195,7 +3251,8 @@ pub struct AcpPayloads {
     list_sessions: ListSessionsResponse,
     session_notification: SessionNotification,
     session_open_extras: SessionOpenExtras,
-    prompt_result: PromptResult,
+    prompt_response: PromptResponse,
+    turn_meta: TurnMeta,
     session_update: SessionUpdateParams,
     ack: Ack,
     model_ack: ModelAck,
@@ -3204,7 +3261,6 @@ pub struct AcpPayloads {
     reload_ack: ReloadAck,
     reload_session_ack: ReloadSessionAck,
     queued: Queued,
-    cancelled: Cancelled,
     request_permission: RequestPermissionParams,
     request_question: RequestQuestionParams,
     request_egress: RequestEgressParams,

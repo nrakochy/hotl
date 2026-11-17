@@ -8677,7 +8677,7 @@ mod tests {
                     "env": [{"name": "TOKEN", "value": "s3cret"}]
                 }]
             }}),
-            serde_json::json!({"method":"session/prompt","params":{"text":"hi"}}),
+            serde_json::json!({"method":"session/prompt","params":{"prompt":[{"type":"text","text":"hi"}]}}),
         ];
         for (i, call) in calls.iter().enumerate() {
             let mut call = call.clone();

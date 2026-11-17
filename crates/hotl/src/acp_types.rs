@@ -380,10 +380,14 @@ pub struct ContentChunk {
     pub content: ContentBlock,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text(TextContent),
+    Image(ImageContent),
+    Audio(AudioContent),
+    ResourceLink(ResourceLink),
+    Resource(EmbeddedResource),
 }
 
 impl ContentBlock {
@@ -392,9 +396,107 @@ impl ContentBlock {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TextContent {
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageContent {
+    pub data: String,
+    pub mime_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioContent {
+    pub data: String,
+    pub mime_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceLink {
+    pub uri: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct EmbeddedResource {
+    pub resource: EmbeddedResourceResource,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum EmbeddedResourceResource {
+    TextResourceContents(TextResourceContents),
+    BlobResourceContents(BlobResourceContents),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TextResourceContents {
+    pub uri: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobResourceContents {
+    pub uri: String,
+    pub blob: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptRequest {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub prompt: Vec<ContentBlock>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptResponse {
+    pub stop_reason: StopReason,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    EndTurn,
+    MaxTokens,
+    MaxTurnRequests,
+    Refusal,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelNotification {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Meta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
@@ -502,6 +604,14 @@ pub struct UnstructuredCommandInput {
 pub struct UsageUpdate {
     pub used: u64,
     pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<Cost>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct Cost {
+    pub amount: f64,
+    pub currency: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
