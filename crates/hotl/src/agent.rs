@@ -460,6 +460,13 @@ pub(crate) fn create_session_log_in(
         LogHome::Ephemeral => SessionLog::create_ephemeral(model, parent, masker, now_ms),
     }
     .map_err(|e| format!("could not create session log: {e}"))?;
+    if let Some(color) = lineage.and_then(|r| r.color.clone()) {
+        log.append(
+            &hotl_types::EntryPayload::ColorSet { color: Some(color) },
+            now_ms,
+        )
+        .map_err(|e| format!("could not create session log: {e}"))?;
+    }
     if is_fork {
         record_fork_point(
             &mut log,
@@ -5962,10 +5969,17 @@ mod fork_tests {
             .unwrap();
         let resumed = load_lineage(dir.path(), &parent_id, KeepSpec::All).unwrap();
         assert_eq!(resumed.color.as_deref(), Some("pink"));
-        let child =
-            create_session_log(dir.path(), "m", Masker::empty(), 9, Some(&resumed), false).unwrap();
-        let again = load_lineage(dir.path(), &child.session_id, KeepSpec::All).unwrap();
-        assert_eq!(again.color.as_deref(), Some("pink"));
+        let mut sid = parent_id;
+        for _ in 0..=hotl_store::LINEAGE_DEPTH_CAP {
+            let resumed = load_lineage(dir.path(), &sid, KeepSpec::All).unwrap();
+            assert_eq!(resumed.color.as_deref(), Some("pink"));
+            sid = create_session_log(dir.path(), "m", Masker::empty(), 9, Some(&resumed), false)
+                .unwrap()
+                .session_id
+                .clone();
+        }
+        let deep = load_lineage(dir.path(), &sid, KeepSpec::All).unwrap();
+        assert_eq!(deep.color.as_deref(), Some("pink"));
     }
 
     #[test]

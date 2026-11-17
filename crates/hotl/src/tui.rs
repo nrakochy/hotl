@@ -122,9 +122,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         }
     };
     seed_state(&mut state, model, opened, first_run_hint);
-    // A prompt typed and entered during the open window fires now, through
-    // the normal submit path — exactly one SendPrompt, history included.
-    let initial: VecDeque<Cmd> = hotl_tui::app::fire_queued_submit(&mut state).into();
+    let initial = startup_cmds(&mut state);
     let result = run_loop(
         &mut guard,
         &mut client,
@@ -152,6 +150,12 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
 /// Point a fresh `State` at a just-opened session: server-side truth for
 /// the strip and title, then the notices the open produced. Startup and
 /// `/resume` both land here.
+fn startup_cmds(state: &mut State) -> VecDeque<Cmd> {
+    let mut cmds: VecDeque<Cmd> = hotl_tui::app::opened_cmds(state).into();
+    cmds.extend(hotl_tui::app::fire_queued_submit(state));
+    cmds
+}
+
 fn seed_state(state: &mut State, model: String, opened: Opened, first_run_hint: Option<String>) {
     let Opened {
         name: session_name,
@@ -1708,6 +1712,24 @@ fn age(t: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_titles_the_pane_with_the_resumed_color() {
+        let mut state = hotl_tui::app::State::new(false, "m".into());
+        let opened = super::Opened {
+            name: Some("fix-auth".into()),
+            color: Some("pink".into()),
+            ..Default::default()
+        };
+        super::seed_state(&mut state, "m".into(), opened, None);
+        let cmds = super::startup_cmds(&mut state);
+        assert!(
+            cmds.iter().any(
+                |c| matches!(c, hotl_tui::app::Cmd::SetTitle(t) if t == "hotl · fix-auth ● pink")
+            ),
+            "{cmds:?}"
+        );
+    }
+
     #[test]
     fn seed_state_restores_a_known_color_and_drops_an_unknown_one() {
         let mut state = hotl_tui::app::State::new(false, "m".into());
