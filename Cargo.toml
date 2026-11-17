@@ -157,6 +157,9 @@ unix-archive = ".tar.gz"
 # the PowerShell installer unpacks either form. Consistency with other Windows
 # tools is not worth a new unpack path in the self-updater.
 
+[workspace.metadata.dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+
 # dist inherits the (now fully optimized) release profile unchanged.
 [profile.dist]
 inherits = "release"
