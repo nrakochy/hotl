@@ -465,3 +465,75 @@ See [Configuration → Concurrency](../configuration/#concurrency-concurrency)
 for the full `[concurrency]` reference, and
 [permissions-and-sandbox.md](../permissions-and-sandbox/) for how permission
 gating and the untrusted-content envelope work everywhere else in hotl.
+
+## Use hotl from an editor (`hotl acp`)
+
+The rest of this page is about hotl running other agents. This section is the
+other direction: an editor running hotl. `hotl acp` speaks the standard
+[Agent Client Protocol](https://agentclientprotocol.com) v1 over stdin and
+stdout, so an editor that supports ACP can start hotl and drive it.
+
+### Zed
+
+Open the agent settings (`agent: open settings` in the command palette), go to
+External Agents, choose Add Agent, then Add Custom Agent. Zed opens your
+settings file. Add hotl under `agent_servers`:
+
+```json
+{
+  "agent_servers": {
+    "hotl": {
+      "type": "custom",
+      "command": "hotl",
+      "args": ["acp"],
+      "env": {}
+    }
+  }
+}
+```
+
+If Zed cannot find `hotl`, put its full path in `command`.
+
+### Signing in
+
+hotl uses the API key `hotl setup` saved, or the provider's environment
+variable, the same as everywhere else. The editor sees one sign-in method,
+`hotl-key`. When no key is found, opening a session fails with an error that
+says to run `hotl setup`. Run it in a terminal, then try again.
+An editor that can run a sign-in in a terminal also sees `hotl-setup`, which
+runs `hotl setup` for it.
+
+### What the editor gets
+
+- **The project folder is the session's root.** The editor sends it as `cwd`.
+  It must be a full path to a folder that exists.
+- **Prompts** can carry text, images, and files. A linked file (how Zed sends
+  an `@` mention) reaches the model as an `@path` reference it can read. A
+  file's text sent inline is included with its path. Binary files and audio are
+  refused.
+- **Modes:** Ask, Don't ask, and Bypass, the same three as `/mode`. A new
+  session starts in your `[permissions] mode`.
+- **Settings:** model, effort, and plan mode, the same as `/model`, `/effort`
+  and `/plan`.
+- **Permission asks** offer Allow and Deny. A sandboxed shell command also
+  offers "Allow, including secret files", which lets that one command read the
+  files the sandbox normally hides. hotl never offers "always allow";
+  standing permission lives in your `[[allow]]` rules. A network ask (with
+  `[network].allow` set) arrives as a permission ask too.
+- **Questions** from the model appear as a form when the editor supports
+  forms. When it does not, the model is told no one is there to answer.
+- **Sessions** can be listed, loaded, resumed, and closed. Loading one replays
+  its history into the editor first.
+- **Cancel** ends the turn as `cancelled`, denies any ask still open, and drops
+  prompts the editor queued behind it.
+- **A prompt sent while a turn runs** waits and runs next, the same as typing
+  ahead in the console.
+
+### hotl-only extras
+
+Features ACP has no message for, such as `/goal`, background jobs, steering a
+running turn, and memory notes, are extensions. hotl sends them only to a
+client that asks for them in `initialize`, so an editor that does not know
+about them never sees them. The console and `hotl attach` ask for them. The
+[Wire schemas](../wire-schema/) page lists every extension and links its
+schema.

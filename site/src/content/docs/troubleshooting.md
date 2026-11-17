@@ -52,6 +52,15 @@ Look up the message you saw. Text in `code` is what hotl prints; find yours by g
 | `preapproved rules at … refused` | The admin file isn't root-owned, or is group/world-writable. | `sudo chown root /etc/hotl/preapproved.toml && sudo chmod 644 /etc/hotl/preapproved.toml` |
 | `permissions.mode=auto requested, but this is a security-enforced build` | Expected on enforced builds; per-action asks are the build's contract. | None. |
 
+## hotl in an editor (`hotl acp`)
+
+| Message or symptom | Cause | Fix |
+|---|---|---|
+| `no API key — run \`hotl setup\`` | hotl found no key for its provider. | Run `hotl setup` in a terminal, or set the provider's key variable where the editor starts hotl (the `env` of its agent entry). |
+| `params.cwd must be an absolute path` / `params.cwd is not an existing directory` | The editor sent a project folder hotl cannot use. | Open a folder in the editor first. hotl needs a full path to a folder that exists. |
+| `unknown method \`session/set_model\`` (or another old name) | A client written for hotl's pre-ACP-v1 protocol. hotl now speaks standard ACP v1. | Update the client. The CHANGELOG lists each old method and its new name. |
+| Goals, jobs, or memory notes never show up in the editor | They are hotl-only extras, sent only to a client that asks for them. | Expected. Use the console or `hotl attach` for those. |
+
 ## External agents (`backend: acp`)
 
 | Message or symptom | Cause | Fix |

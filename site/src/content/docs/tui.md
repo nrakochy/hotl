@@ -400,9 +400,8 @@ rendered as a misleading two-cell bar.
 
 `/context` is TUI-only. It describes a live session's assembled context, and
 `hotl -p` builds one, runs it and exits — there is no session left to measure.
-Under `hotl acp` the same thing is a `_hotl/session/context` call: the reply is a
-thin `{"ok": true}` ack and the report itself arrives as a `context_report`
-`session/update`, so every attached surface sees it.
+Under `hotl acp` the same thing is a `_hotl/session/context` call. The reply is
+the `context_report` itself.
 
 ### Reloading config
 
@@ -446,16 +445,18 @@ them. Restart hotl to change these:
 Under `hotl acp` the same thing is a `_hotl/session/reload_config` call, so an editor
 or orchestrator embedding hotl gets it too. Likewise `/compact` is
 `_hotl/session/fold` with an optional `focus`; it answers `{"queued": true}` when a
-turn is running. `/model` is `session/set_model` with a `model`; its reply
-carries `applied` (false while a turn runs) and the engine's `model_changed`
-notification is the only thing that moves a client's model display.
+turn is running. `/model` is the standard `session/set_config_option` with
+`configId: "model"`. The switch waits for the turn boundary, and a
+`config_option_update` tells every client when it lands. `/effort` and `/plan`
+are the `effort` and `plan` options of the same call, and `/mode` is the
+standard `session/set_mode`.
 `/color` is `_hotl/session/set_color` with a `color` name or `null`; an unknown name
 is an error (the console resolves its random pick before it sends), and the
 open reply carries the session's `color` when it has one.
 `/remember` is `_hotl/session/remember`: with a `note` the confirm arrives as the
 ordinary `session/request_permission` while the request is in flight and the
-reply is `{"ok": true}` or the refusal; without one a `memory_report`
-notification follows the ack.
+reply is `{"ok": true}` or the refusal; without one the reply is the
+`memory_report`.
 
 ### Folding on purpose
 

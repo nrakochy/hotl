@@ -213,7 +213,7 @@ An allowlist starts from a curated set of 19 exact hosts — the package registr
 
 #### The egress ask
 
-A host the allowlist does not cover reaches an interactive human as a two-answer prompt (`y` allow for this session / `n` deny) on the console TUI, `hotl attach`, and ACP (`session/request_egress`). Both answers are remembered for the session, symmetrically — remembering the deny is what stops a retry loop from using the human as a rate limiter. Neither answer writes `config.toml`; the prompt prints the line to paste.
+A host the allowlist does not cover reaches an interactive human as a two-answer prompt (`y` allow for this session / `n` deny) on the console TUI, `hotl attach`, and ACP (`session/request_permission` with `toolCall.kind: "fetch"`). Both answers are remembered for the session, symmetrically — remembering the deny is what stops a retry loop from using the human as a rate limiter. Neither answer writes `config.toml`; the prompt prints the line to paste.
 
 **Three filters sit in front of the human**, in cost order: the static allowlist, the session decision table, and the **shown-hosts rule** — the ask does not fire for a host the human was already shown when they approved the call that opened the connection. Four conditions, all required:
 

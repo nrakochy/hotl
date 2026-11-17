@@ -6,6 +6,63 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- `hotl acp` now speaks standard [ACP](https://agentclientprotocol.com) v1,
+  so ACP editors such as Zed can run hotl: add
+  `{"type": "custom", "command": "hotl", "args": ["acp"]}` under
+  `agent_servers` in Zed's settings. The old hotl dialect (`protocolVersion:
+  "0.1"`) is gone with no fallback, and scripts written for it must move.
+  `initialize` now answers `protocolVersion: 1`. Updates use the standard
+  `sessionUpdate` kinds and no longer carry `schemaVersion`. Errors use real
+  JSON-RPC codes: `-32601` unknown method, `-32602` bad params, `-32000` no
+  API key, `-32002` unknown session, `-32603` internal.
+
+  | Old (0.1 dialect) | Now (ACP v1) |
+  |---|---|
+  | `session/new {name, worktree}` | `session/new {cwd, mcpServers}`; `name`, `worktree` in `_meta["hotl.dev/open"]` |
+  | `session/load {sessionId, name, noWorktree}` | `session/load` (replays the history first) or `session/resume` (no replay); `name`, `noWorktree` in `_meta["hotl.dev/open"]` |
+  | `session/load {fork: true, keepItems, keepTurns, worktree}` | `_hotl/session/fork` |
+  | `session/prompt {text, images}` | `session/prompt {prompt: [content blocks]}`, answered with `{stopReason}` |
+  | `session/cancel` (a request) | `session/cancel` (a notification, no reply) |
+  | `session/set_mode {mode}` | `session/set_mode {modeId}` |
+  | `session/set_model`, `session/set_effort`, `session/set_plan` | `session/set_config_option` with `configId` `model`, `effort` or `plan` |
+  | `session/rename`, `set_color`, `set_goal`, `remember`, `steer`, `fold`, `reload_config`, `aside`, `context`, `workflows`, `jobs`, `jobs/stop`, `children`, `children/stop` | `_hotl/session/<same name>`, same params and results |
+  | `session/request_permission {summary, protectedWhy}` | `session/request_permission {toolCall, options}` |
+  | `session/request_egress {host}` | `session/request_permission` with `toolCall.kind: "fetch"` |
+  | `session/request_question` | `elicitation/create` (a form) when the client supports forms, else `_hotl/session/request_question` |
+
+  Removed outright: `session/request_egress`, the old `session/request_permission`
+  shape and its free-form replies, and `schemaVersion` on ACP updates (the
+  `-p --json` stream keeps its `schema_version`).
+- hotl-only features are extensions now: `_hotl/` methods and `hotl.dev/`
+  `_meta` keys. hotl sends them only to a client that opts in with
+  `clientCapabilities._meta["hotl.dev/extensions"]: 1`. The console and
+  `hotl attach` opt in. A turn's outcome, usage and cost ride
+  `_meta["hotl.dev/turn"]` on the prompt result, or inside `error.data` when
+  the turn ends in an error.
+- `hotl serve` and `hotl attach` speak ACP v1 on the session socket instead
+  of their own framing. Put the socket token in
+  `initialize`'s `params._meta["hotl.dev/socketToken"]`, then `session/resume`.
+  The new `_hotl/session/stop` ends the session (and, on `hotl serve`, the
+  background process).
+- `session/cancel` drops only the prompts the client queued. Work hotl queued
+  itself, such as a retry for structured output, still runs.
+- `hotl schema acp` prints only hotl's extensions. The published schema moved
+  from `acp-v1.schema.json` to `acp-hotl-extensions.schema.json`; standard
+  messages follow the ACP v1 schema.
+
+### Added
+
+- `authenticate` (method `hotl-key`; a client that can run terminal sign-in
+  also gets `hotl-setup`), `session/list`, `session/resume`, `session/close`.
+  A keyless `hotl acp` still answers `initialize`, so an editor can show the
+  sign-in.
+- `conformance/acp/`: the official ACP Rust SDK drives the built `hotl acp`
+  and fails if any message hotl writes does not decode through its types.
+  Run it with `cargo build -p hotl -p hotl-testkit --bins --examples` then
+  `cargo test --manifest-path conformance/acp/Cargo.toml`. CI runs it.
+
 ## [0.32.0] - 2026-11-17
 
 ### Added

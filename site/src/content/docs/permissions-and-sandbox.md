@@ -76,7 +76,7 @@ refused, and spent turns discovering the wall.
 **`present_plan` is how a plan reaches you.** Plan mode adds one tool the
 ordinary roster does not carry: `present_plan`, which takes a summary and the
 steps and hands them over as a card in the TUI (or a `plan_presented` frame
-over ACP and `--json`). It is the only channel from thinking to a plan you
+over `--json`, and over ACP to a client that turned on hotl's extras). It is the only channel from thinking to a plan you
 see — prose in the transcript is not a plan — and the steps it carries become
 the session's todo list and its plan artifact in the same move. The tool's
 reply tells the model to stop and wait for you.
@@ -85,7 +85,7 @@ In the TUI the card offers two keys: `a` approves — plan mode turns off and
 the model is told to implement the plan one step at a time, verifying each —
 and `r` dismisses the card so you can say what to change. Typing anything
 dismisses it too; a revision is just the next thing you send. ACP clients
-approve with `session/set_plan`.
+approve by setting the `plan` option to `false` with `session/set_config_option`.
 
 Headless `-p --plan` prints the summary and the numbered steps to stdout and
 exits 0 — and exits **3**, naming the paths, if the worktree changed anyway.
@@ -93,8 +93,8 @@ Outside a git repo there is nothing to compare against, and hotl says so
 rather than claiming a clean tree.
 
 Toggle it with `/plan` (or `/plan on` / `/plan off`), `--plan` on the command
-line, `[permissions] plan = true`, `HOTL_PLAN=1`, or `session/set_plan` over
-ACP. It composes with whichever mode you're in:
+line, `[permissions] plan = true`, `HOTL_PLAN=1`, or the `plan` option of
+`session/set_config_option` over ACP. It composes with whichever mode you're in:
 
 | | `ask` | `bypass` | `dontask` |
 |---|---|---|---|

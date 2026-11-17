@@ -27,7 +27,7 @@ Compilation targets: **native from day one; WASM (browser) is a deferred future 
 | Plane                       | Protocol                                                               |
 | --------------------------- | ---------------------------------------------------------------------- |
 | Agent ↔ tools               | MCP                                                                    |
-| Agent ↔ frontend            | ACP (Zed's) — the embedding contract                                   |
+| Agent ↔ frontend            | ACP v1 (standard) + opt-in `_hotl/` extensions — the embedding contract |
 | Agent ↔ own sub/peer agents | Own spawn interface; agents-as-tools (MCP) / agents-as-providers (ACP) |
 | Agent ↔ un-owned peers      | A2A — seam reserved, implementation deferred                           |
 
@@ -95,7 +95,7 @@ flowchart TB
     ACTOR -->|"⑩ TurnDone (outcome + usage)"| CLIENT
 ```
 
-ACP is already the console's transport — the TUI is a pure ACP client of an in-process `acp::serve`, and `hotl acp` exposes the same contract to external editors; `hotl fleet` (a reserved stub today) will be one more ACP client. `hotl watch` observes from outside this diagram entirely — pane titles, process state, never these internals.
+ACP is already the console's transport — the TUI is a pure ACP client of an in-process `acp::serve`, and `hotl acp` exposes the same contract to external editors. The contract is standard ACP v1 (hand-written types in `crates/hotl/src/acp_types.rs`, checked from outside the workspace by `conformance/acp/` against the official SDK); hotl-only features ride `_hotl/` methods and `hotl.dev/` `_meta` keys that a client must opt in to; `hotl fleet` (a reserved stub today) will be one more ACP client. `hotl watch` observes from outside this diagram entirely — pane titles, process state, never these internals.
 
 _\* The native-Windows write floor is written but fail-closed; until it is certified, every exec on Windows is individually human-gated._
 
