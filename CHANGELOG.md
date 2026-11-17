@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-11-17
+
 ### Added
 
 - `/resume` in the TUI: switch to another saved session without leaving the
