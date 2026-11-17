@@ -35,6 +35,7 @@ fn memory_factory(mem: std::path::PathBuf) -> acp::SessionFactory {
         let session_id = log.session_id.clone();
         let provider = Arc::new(ScriptedProvider::new(vec![]));
         Ok(acp::SessionOpen {
+            history: Vec::new(),
             memory_mode: Some("read-write".into()),
             worktree: None,
             lease: None,
@@ -182,6 +183,7 @@ fn scripted_factory() -> acp::SessionFactory {
             ScriptedProvider::text_reply("all done via tui"),
         ]));
         Ok(acp::SessionOpen {
+            history: Vec::new(),
             memory_mode: None,
             worktree: None,
             lease: None,
@@ -254,6 +256,7 @@ fn scripted_ask_user_factory() -> acp::SessionFactory {
             ScriptedProvider::text_reply("all done via tui"),
         ]));
         Ok(acp::SessionOpen {
+            history: Vec::new(),
             memory_mode: None,
             worktree: None,
             lease: None,
@@ -325,6 +328,7 @@ async fn start_with(factory: acp::SessionFactory) -> (Client, Reader) {
             stream_idle_secs: 90,
             model_resolver: None,
             key_available: true,
+            sessions_dir: None,
             model: "m".into(),
         },
         None,
@@ -344,7 +348,10 @@ async fn start_with(factory: acp::SessionFactory) -> (Client, Reader) {
         .expect("write");
     wait_response(&mut reader, init).await.expect("initialize");
     let open = client
-        .request("session/new", Value::Null)
+        .request(
+            "session/new",
+            json!({"cwd": std::env::temp_dir(), "mcpServers": []}),
+        )
         .await
         .expect("write");
     wait_response(&mut reader, open).await.expect("session/new");

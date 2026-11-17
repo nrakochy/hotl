@@ -670,13 +670,6 @@ pub async fn acp_main() -> i32 {
     0
 }
 
-/// The real-engine session factory `hotl acp` and `hotl tui` share, built from
-/// a freshly-read `config.toml`, plus what `initialize` advertises and the
-/// startup warnings the caller decides how to surface.
-///
-/// Deliberately silent: `/reload` (`acp::Reload`) calls this with the
-/// alternate screen up, where a stray `eprintln!` would corrupt the display.
-/// The startup wrapper below is what prints.
 pub(crate) async fn build_acp_strict() -> Result<
     (
         crate::acp::SessionFactory,
@@ -700,6 +693,13 @@ fn missing_key_message() -> String {
     }
 }
 
+/// The real-engine session factory `hotl acp` and `hotl tui` share, built from
+/// a freshly-read `config.toml`, plus what `initialize` advertises and the
+/// startup warnings the caller decides how to surface.
+///
+/// Deliberately silent: `/reload` (`acp::Reload`) calls this with the
+/// alternate screen up, where a stray `eprintln!` would corrupt the display.
+/// The startup wrapper below is what prints.
 pub(crate) async fn build_acp() -> Result<
     (
         crate::acp::SessionFactory,
@@ -778,6 +778,7 @@ pub(crate) async fn build_acp_with(
         model: scaffold.model.clone(),
         model_resolver: Some(model_resolver()),
         key_available,
+        sessions_dir: Some(sessions_dir()),
     };
     let factory: crate::acp::SessionFactory = Box::new(move |spec| {
         // §S3.2 (TUI/ACP handshake trigger): the provider is process-wide
@@ -792,17 +793,22 @@ pub(crate) async fn build_acp_with(
         // typing-time trigger (first composer keystroke) has no ACP signal
         // to hang off today — see the task report for that deferral.
         scaffold.provider.arm().detach();
-        let (resumed, requested, is_fork, worktree_arg, no_worktree) = match spec {
-            crate::acp::SessionSpec::New { name, worktree } => (None, name, false, worktree, false),
+        let (resumed, requested, is_fork, worktree_arg, no_worktree, base) = match spec {
+            crate::acp::SessionSpec::New {
+                name,
+                worktree,
+                cwd,
+            } => (None, name, false, worktree, false, cwd),
             crate::acp::SessionSpec::Load {
                 session_id: sid,
                 name,
                 no_worktree,
+                cwd,
             } => {
                 let resumed = load_lineage(&sessions_dir(), &sid, KeepSpec::All)?;
                 // An explicit rename-on-resume beats the inherited name.
                 let name = name.or_else(|| resumed.inherited_name.clone());
-                (Some(resumed), name, false, None, no_worktree)
+                (Some(resumed), name, false, None, no_worktree, cwd)
             }
             // A fork is a resume that (a) may stop at a prefix and (b) never
             // takes the parent's name: two live sessions sharing one name
@@ -812,17 +818,19 @@ pub(crate) async fn build_acp_with(
                 keep,
                 name,
                 worktree,
+                cwd,
             } => (
                 Some(load_lineage(&sessions_dir(), &sid, keep)?),
                 name,
                 true,
                 worktree,
                 false,
+                cwd,
             ),
         };
         // The worktree (0065): a cheap refusal before any log is minted.
         if let Some(arg) = &worktree_arg {
-            hotl_store::worktree::SessionWorktree::precheck(&scaffold.cwd, arg.name())?;
+            hotl_store::worktree::SessionWorktree::precheck(&base, arg.name())?;
         }
         let mut log = create_session_log(
             &sessions_dir(),
@@ -832,6 +840,12 @@ pub(crate) async fn build_acp_with(
             resumed.as_ref(),
             is_fork,
         )?;
+        let _ = log.append(
+            &hotl_types::EntryPayload::CwdSet {
+                path: base.display().to_string(),
+            },
+            scaffold.clock.now_ms(),
+        );
         // Copy-forward: the resumed name lives in this log too, so listing
         // and name resolution stay a single-file scan.
         if let Some(n) = &requested {
@@ -995,13 +1009,13 @@ pub(crate) async fn build_acp_with(
             resumed.as_ref().and_then(|r| r.worktree.clone()),
         ) {
             (Some(arg), _) => Some(open_worktree(
-                &scaffold.cwd,
+                &base,
                 scaffold.clock.now_ms(),
                 &mut log,
                 arg,
             )?),
             (None, Some(inherited)) => reopen_worktree(
-                &scaffold.cwd,
+                &base,
                 scaffold.clock.now_ms(),
                 &mut log,
                 &inherited,
@@ -1009,7 +1023,10 @@ pub(crate) async fn build_acp_with(
             )?,
             (None, None) => None,
         };
-        let root = opened.as_ref().map(|o| o.lease.path().to_path_buf());
+        let root = opened
+            .as_ref()
+            .map(|o| o.lease.path().to_path_buf())
+            .or_else(|| (base != scaffold.cwd).then(|| base.clone()));
         let (initial, mut notices) = session_context(
             &scaffold,
             &resumed,
@@ -1052,6 +1069,11 @@ pub(crate) async fn build_acp_with(
                 o.lease.branch().to_string(),
             )
         });
+        let history = resumed
+            .as_ref()
+            .filter(|_| !is_fork)
+            .map(|r| r.items.clone())
+            .unwrap_or_default();
         let handle = spawn_interactive_session(
             scaffold.registry_rooted(root.as_deref()),
             Some(scaffold.spawn_registration(session_id.clone(), root.as_deref())),
@@ -1107,6 +1129,7 @@ pub(crate) async fn build_acp_with(
             warnings: notices,
             title: inherited_title,
             model: open_model,
+            history,
         })
     });
     Ok((factory, info, warnings))

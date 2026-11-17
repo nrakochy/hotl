@@ -269,14 +269,22 @@ async fn open_session(tui_args: TuiArgs) -> Result<(Client, ServerReader, String
 /// over the server default (a resumed session inherits and coerces its own);
 /// both fall back so a newer client against an older server still runs — it
 /// simply shows the library default instead of guessing.
-fn open_settings(hello: &Value, opened: &Value) -> (String, bool, u64, Option<u64>) {
-    let mode = opened
-        .get("mode")
+fn open_meta(result: &Value) -> Value {
+    result
+        .get("_meta")
+        .and_then(|m| m.get("hotl.dev/open"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn open_settings(hello: &Value, result: &Value) -> (String, bool, u64, Option<u64>) {
+    let mode = result
+        .pointer("/modes/currentModeId")
         .or_else(|| hello.get("defaultMode"))
         .and_then(Value::as_str)
         .unwrap_or("ask")
         .to_string();
-    let plan = opened
+    let plan = open_meta(result)
         .get("plan")
         .or_else(|| hello.get("defaultPlan"))
         .and_then(Value::as_bool)
@@ -463,16 +471,11 @@ async fn handshake(
         worktree,
         no_worktree,
     } = args;
-    // A fork rides `session/load` as extension params rather than a new
-    // method: existing clients ignore what they don't know, so the wire stays
-    // backward-compatible. Turn resolution is deliberately server-side — the
-    // projection those turns are counted against only exists there. The
-    // worktree (0065) rides the same way: `worktree` is a branch name or
-    // `@derived`, `noWorktree` only on a resume.
     let worktree = worktree.as_ref().map(|w| w.wire().to_string());
+    let cwd = std::env::current_dir().map_err(|e| format!("no working directory: {e}"))?;
     let open = match (spec, fork_from) {
         (_, Some(sid)) => {
-            let mut params = json!({"sessionId": sid, "name": name, "fork": true});
+            let mut params = json!({"sessionId": sid, "name": name, "cwd": cwd});
             if let Some(n) = keep {
                 params["keepItems"] = json!(n);
             }
@@ -482,26 +485,37 @@ async fn handshake(
             if let Some(w) = &worktree {
                 params["worktree"] = json!(w);
             }
-            client.request("session/load", params).await
+            client.request("_hotl/session/fork", params).await
         }
         (None, None) => {
-            let mut params = json!({"name": name});
+            let mut extras = json!({"name": name});
             if let Some(w) = &worktree {
-                params["worktree"] = json!(w);
+                extras["worktree"] = json!(w);
             }
-            client.request("session/new", params).await
+            client
+                .request(
+                    "session/new",
+                    json!({"cwd": cwd, "mcpServers": [], "_meta": {"hotl.dev/open": extras}}),
+                )
+                .await
         }
         (Some(sid), None) => {
-            let mut params = json!({"sessionId": sid, "name": name});
+            let mut extras = json!({"name": name});
             if no_worktree {
-                params["noWorktree"] = json!(true);
+                extras["noWorktree"] = json!(true);
             }
-            client.request("session/load", params).await
+            client
+                .request(
+                    "session/resume",
+                    json!({"sessionId": sid, "cwd": cwd, "_meta": {"hotl.dev/open": extras}}),
+                )
+                .await
         }
     }
     .map_err(|e| e.to_string())?;
-    let v = wait_response(reader, open).await?;
-    let (mode, plan, context_window, stream_idle_secs) = open_settings(&hello, &v);
+    let result = wait_response(reader, open).await?;
+    let (mode, plan, context_window, stream_idle_secs) = open_settings(&hello, &result);
+    let v = open_meta(&result);
     let (context_tokens, todos, effort, previous_model) = open_extras(&v);
     Ok(Opened {
         name: v.get("name").and_then(Value::as_str).map(String::from),
@@ -2002,12 +2016,17 @@ mod tests {
         let hello = json!({"defaultMode": "auto", "contextWindow": 1_000_000,
             "agentInfo": {"name": "hotl", "title": "hotl", "version": "0"},
             "agentCapabilities": {"_meta": {"hotl": {"dialect": "0.1"}}}});
-        let opened = json!({"sessionId": "s", "name": null, "mode": "plan"});
-        let (mode, _plan, window, idle) = super::open_settings(&hello, &opened);
+        let opened = json!({"sessionId": "s", "modes": {"currentModeId": "dontask"},
+            "_meta": {"hotl.dev/open": {"name": null, "plan": true}}});
+        let (mode, plan, window, idle) = super::open_settings(&hello, &opened);
+        assert!(plan, "plan rides the open extras");
         assert_eq!(idle, None);
         let (_, _, _, idle) = super::open_settings(&json!({"streamIdleSecs": 90}), &opened);
         assert_eq!(idle, Some(90), "open_extras_parses_stream_idle_secs");
-        assert_eq!(mode, "plan", "the session's mode beats the server default");
+        assert_eq!(
+            mode, "dontask",
+            "the session's mode beats the server default"
+        );
         assert_eq!(window, 1_000_000);
 
         // An older server that reports neither must not brick the client.

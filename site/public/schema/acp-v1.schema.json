@@ -388,6 +388,52 @@
         }
       ]
     },
+    "AvailableCommand": {
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "input": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AvailableCommandInput"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "description"
+      ],
+      "type": "object"
+    },
+    "AvailableCommandInput": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UnstructuredCommandInput"
+        }
+      ]
+    },
+    "AvailableCommandsUpdate": {
+      "properties": {
+        "availableCommands": {
+          "items": {
+            "$ref": "#/$defs/AvailableCommand"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "availableCommands"
+      ],
+      "type": "object"
+    },
     "Cancelled": {
       "properties": {
         "cancelled": {
@@ -461,6 +507,45 @@
         "isolated",
         "state",
         "secs"
+      ],
+      "type": "object"
+    },
+    "Content": {
+      "properties": {
+        "content": {
+          "$ref": "#/$defs/ContentBlock"
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "type": "object"
+    },
+    "ContentBlock": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/TextContent",
+          "properties": {
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ContentChunk": {
+      "properties": {
+        "content": {
+          "$ref": "#/$defs/ContentBlock"
+        }
+      },
+      "required": [
+        "content"
       ],
       "type": "object"
     },
@@ -1750,6 +1835,48 @@
       ],
       "type": "object"
     },
+    "ListSessionsResponse": {
+      "properties": {
+        "nextCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessions": {
+          "items": {
+            "$ref": "#/$defs/SessionInfo"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "sessions"
+      ],
+      "type": "object"
+    },
+    "LoadSessionResponse": {
+      "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "modes": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionModeState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
     "McpCapabilities": {
       "properties": {
         "http": {
@@ -1819,6 +1946,34 @@
         "model",
         "applied",
         "warnings"
+      ],
+      "type": "object"
+    },
+    "NewSessionResponse": {
+      "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "modes": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionModeState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sessionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId"
       ],
       "type": "object"
     },
@@ -2080,6 +2235,20 @@
       ],
       "type": "object"
     },
+    "Plan": {
+      "properties": {
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/PlanEntry"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "entries"
+      ],
+      "type": "object"
+    },
     "PlanAck": {
       "properties": {
         "ok": {
@@ -2094,6 +2263,41 @@
         "plan"
       ],
       "type": "object"
+    },
+    "PlanEntry": {
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "priority": {
+          "$ref": "#/$defs/PlanEntryPriority"
+        },
+        "status": {
+          "$ref": "#/$defs/PlanEntryStatus"
+        }
+      },
+      "required": [
+        "content",
+        "priority",
+        "status"
+      ],
+      "type": "object"
+    },
+    "PlanEntryPriority": {
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ],
+      "type": "string"
+    },
+    "PlanEntryStatus": {
+      "enum": [
+        "pending",
+        "in_progress",
+        "completed"
+      ],
+      "type": "string"
     },
     "PromptCapabilities": {
       "properties": {
@@ -2339,6 +2543,28 @@
       ],
       "type": "object"
     },
+    "ResumeSessionResponse": {
+      "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "modes": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionModeState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
     "RetryScopeTag": {
       "enum": [
         "sample",
@@ -2400,7 +2626,105 @@
       },
       "type": "object"
     },
-    "SessionOpenResult": {
+    "SessionInfo": {
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updatedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionId",
+        "cwd"
+      ],
+      "type": "object"
+    },
+    "SessionInfoUpdate": {
+      "properties": {
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updatedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SessionMode": {
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    },
+    "SessionModeState": {
+      "properties": {
+        "availableModes": {
+          "items": {
+            "$ref": "#/$defs/SessionMode"
+          },
+          "type": "array"
+        },
+        "currentModeId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "currentModeId",
+        "availableModes"
+      ],
+      "type": "object"
+    },
+    "SessionNotification": {
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "update": {
+          "$ref": "#/$defs/SessionUpdate"
+        }
+      },
+      "required": [
+        "sessionId",
+        "update"
+      ],
+      "type": "object"
+    },
+    "SessionOpenExtras": {
       "description": "The `session/new` / `session/load` / fork result. Absent keys mean\nsomething different from `null` (probe failed / never set / same model).",
       "properties": {
         "color": {
@@ -2452,9 +2776,6 @@
             "null"
           ]
         },
-        "mode": {
-          "type": "string"
-        },
         "model": {
           "type": "string"
         },
@@ -2472,9 +2793,6 @@
             "string",
             "null"
           ]
-        },
-        "sessionId": {
-          "type": "string"
         },
         "title": {
           "type": [
@@ -2506,8 +2824,6 @@
         }
       },
       "required": [
-        "sessionId",
-        "mode",
         "plan",
         "images",
         "todos",
@@ -2515,6 +2831,114 @@
         "model"
       ],
       "type": "object"
+    },
+    "SessionUpdate": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ContentChunk",
+          "properties": {
+            "sessionUpdate": {
+              "const": "user_message_chunk",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/ContentChunk",
+          "properties": {
+            "sessionUpdate": {
+              "const": "agent_message_chunk",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/ContentChunk",
+          "properties": {
+            "sessionUpdate": {
+              "const": "agent_thought_chunk",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/ToolCall",
+          "properties": {
+            "sessionUpdate": {
+              "const": "tool_call",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/Plan",
+          "properties": {
+            "sessionUpdate": {
+              "const": "plan",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/AvailableCommandsUpdate",
+          "properties": {
+            "sessionUpdate": {
+              "const": "available_commands_update",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/UsageUpdate",
+          "properties": {
+            "sessionUpdate": {
+              "const": "usage_update",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/SessionInfoUpdate",
+          "properties": {
+            "sessionUpdate": {
+              "const": "session_info_update",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "SessionUpdateParams": {
       "description": "`session/update` params.",
@@ -2550,6 +2974,17 @@
       "required": [
         "ok",
         "stopped"
+      ],
+      "type": "object"
+    },
+    "TextContent": {
+      "properties": {
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
       ],
       "type": "object"
     },
@@ -2674,6 +3109,89 @@
       },
       "type": "object"
     },
+    "ToolCall": {
+      "properties": {
+        "content": {
+          "items": {
+            "$ref": "#/$defs/ToolCallContent"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "$ref": "#/$defs/ToolKind"
+        },
+        "rawInput": true,
+        "status": {
+          "$ref": "#/$defs/ToolCallStatus"
+        },
+        "title": {
+          "type": "string"
+        },
+        "toolCallId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "toolCallId",
+        "title",
+        "kind",
+        "status",
+        "content"
+      ],
+      "type": "object"
+    },
+    "ToolCallContent": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Content",
+          "properties": {
+            "type": {
+              "const": "content",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ToolCallStatus": {
+      "enum": [
+        "pending",
+        "in_progress",
+        "completed",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "ToolKind": {
+      "enum": [
+        "read",
+        "edit",
+        "delete",
+        "move",
+        "search",
+        "execute",
+        "think",
+        "fetch",
+        "switch_mode",
+        "other"
+      ],
+      "type": "string"
+    },
+    "UnstructuredCommandInput": {
+      "properties": {
+        "hint": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "hint"
+      ],
+      "type": "object"
+    },
     "UsageFrame": {
       "description": "`TokenUsage` plus the derived `hit_ratio` and `cost_usd`, each omitted\nwhen there is nothing to report.",
       "properties": {
@@ -2730,6 +3248,25 @@
       },
       "type": "object"
     },
+    "UsageUpdate": {
+      "properties": {
+        "size": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "used": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "used",
+        "size"
+      ],
+      "type": "object"
+    },
     "WorktreeInfo": {
       "description": "`{path, branch}` of a session's worktree.",
       "properties": {
@@ -2769,11 +3306,20 @@
     "initialize": {
       "$ref": "#/$defs/InitializeResponse"
     },
+    "listSessions": {
+      "$ref": "#/$defs/ListSessionsResponse"
+    },
+    "loadSession": {
+      "$ref": "#/$defs/LoadSessionResponse"
+    },
     "modeAck": {
       "$ref": "#/$defs/ModeAck"
     },
     "modelAck": {
       "$ref": "#/$defs/ModelAck"
+    },
+    "newSession": {
+      "$ref": "#/$defs/NewSessionResponse"
     },
     "permissionReply": {
       "$ref": "#/$defs/PermissionReply"
@@ -2805,8 +3351,14 @@
     "requestQuestion": {
       "$ref": "#/$defs/RequestQuestionParams"
     },
-    "sessionOpen": {
-      "$ref": "#/$defs/SessionOpenResult"
+    "resumeSession": {
+      "$ref": "#/$defs/ResumeSessionResponse"
+    },
+    "sessionNotification": {
+      "$ref": "#/$defs/SessionNotification"
+    },
+    "sessionOpenExtras": {
+      "$ref": "#/$defs/SessionOpenExtras"
     },
     "sessionUpdate": {
       "$ref": "#/$defs/SessionUpdateParams"
@@ -2817,7 +3369,12 @@
   },
   "required": [
     "initialize",
-    "sessionOpen",
+    "newSession",
+    "loadSession",
+    "resumeSession",
+    "listSessions",
+    "sessionNotification",
+    "sessionOpenExtras",
     "promptResult",
     "sessionUpdate",
     "ack",

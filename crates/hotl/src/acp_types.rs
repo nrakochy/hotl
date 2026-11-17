@@ -167,3 +167,320 @@ pub struct SessionCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub close: Option<EmptyCapability>,
 }
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NewSessionRequest {
+    pub cwd: std::path::PathBuf,
+    #[serde(default)]
+    pub mcp_servers: Option<Vec<McpServer>>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadSessionRequest {
+    pub session_id: String,
+    pub cwd: std::path::PathBuf,
+    #[serde(default)]
+    pub mcp_servers: Option<Vec<McpServer>>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeSessionRequest {
+    pub session_id: String,
+    pub cwd: std::path::PathBuf,
+    #[serde(default)]
+    pub mcp_servers: Option<Vec<McpServer>>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSessionsRequest {
+    #[serde(default)]
+    pub cwd: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseSessionRequest {
+    pub session_id: String,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum McpServer {
+    Http(McpServerHttp),
+    Sse(McpServerHttp),
+    #[serde(untagged)]
+    Stdio(McpServerStdio),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerHttp {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub headers: Vec<HttpHeader>,
+    #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerStdio {
+    pub name: String,
+    pub command: std::path::PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<EnvVariable>,
+    #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HttpHeader {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EnvVariable {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NewSessionResponse {
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modes: Option<SessionModeState>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadSessionResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modes: Option<SessionModeState>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeSessionResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modes: Option<SessionModeState>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSessionsResponse {
+    pub sessions: Vec<SessionInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfo {
+    pub session_id: String,
+    pub cwd: std::path::PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModeState {
+    pub current_mode_id: String,
+    pub available_modes: Vec<SessionMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMode {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionNotification {
+    pub session_id: String,
+    pub update: SessionUpdate,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(tag = "sessionUpdate", rename_all = "snake_case")]
+pub enum SessionUpdate {
+    UserMessageChunk(ContentChunk),
+    AgentMessageChunk(ContentChunk),
+    AgentThoughtChunk(ContentChunk),
+    ToolCall(ToolCall),
+    Plan(Plan),
+    AvailableCommandsUpdate(AvailableCommandsUpdate),
+    UsageUpdate(UsageUpdate),
+    SessionInfoUpdate(SessionInfoUpdate),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct ContentChunk {
+    pub content: ContentBlock,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlock {
+    Text(TextContent),
+}
+
+impl ContentBlock {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text(TextContent { text: text.into() })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct TextContent {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCall {
+    pub tool_call_id: String,
+    pub title: String,
+    pub kind: ToolKind,
+    pub status: ToolCallStatus,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<ToolCallContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_input: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    Read,
+    Edit,
+    Delete,
+    Move,
+    Search,
+    Execute,
+    Think,
+    Fetch,
+    SwitchMode,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolCallContent {
+    Content(Content),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct Content {
+    pub content: ContentBlock,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct Plan {
+    pub entries: Vec<PlanEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct PlanEntry {
+    pub content: String,
+    pub priority: PlanEntryPriority,
+    pub status: PlanEntryStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanEntryPriority {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanEntryStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailableCommandsUpdate {
+    pub available_commands: Vec<AvailableCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct AvailableCommand {
+    pub name: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<AvailableCommandInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum AvailableCommandInput {
+    Unstructured(UnstructuredCommandInput),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct UnstructuredCommandInput {
+    pub hint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct UsageUpdate {
+    pub used: u64,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfoUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}

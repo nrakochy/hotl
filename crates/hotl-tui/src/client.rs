@@ -248,7 +248,13 @@ fn decode_diff(v: Option<&Value>) -> Vec<DiffLine> {
 
 fn decode(msg: &Value) -> Option<ServerMsg> {
     match msg.get("method").and_then(Value::as_str) {
-        Some("session/update") => Some(ServerMsg::Update(msg.pointer("/params/update")?.clone())),
+        Some("session/update") => {
+            let update = msg.pointer("/params/update")?;
+            if update.get("sessionUpdate").is_some() {
+                return None;
+            }
+            Some(ServerMsg::Update(update.clone()))
+        }
         Some("session/request_permission") => Some(ServerMsg::PermissionRequest {
             req_id: msg.get("id").and_then(Value::as_u64)?,
             summary: msg
@@ -766,6 +772,15 @@ mod tests {
     /// The run loop drops this future whenever a tick or a key wins its
     /// `select!`. A half-read line must survive the drop — before 0062 T2 it
     /// was lost with the future and the tail parsed as garbage.
+    #[test]
+    fn a_standard_session_update_is_skipped_for_now() {
+        let msg: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(decode(&msg), None);
+    }
+
     #[tokio::test]
     async fn a_dropped_read_keeps_the_partial_line() {
         let (client, mut server) = tokio::io::duplex(4096);

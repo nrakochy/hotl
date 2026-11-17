@@ -21,9 +21,12 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::acp_ext::codes;
 use crate::acp_types::{
-    AgentCapabilities, AuthMethod, AuthenticateRequest, ErrorObject, Implementation,
-    InitializeRequest, InitializeResponse, McpCapabilities, PromptCapabilities,
-    SessionCapabilities,
+    AgentCapabilities, AuthMethod, AuthenticateRequest, CloseSessionRequest, ErrorObject,
+    Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities,
+    NewSessionRequest, NewSessionResponse, PromptCapabilities, ResumeSessionRequest,
+    ResumeSessionResponse, SessionCapabilities, SessionInfo, SessionInfoUpdate,
+    SessionNotification, SessionUpdate, UsageUpdate,
 };
 
 /// Stable schema version of `session/update` / prompt-result payloads (an MD
@@ -39,6 +42,9 @@ pub const ACP_SCHEMA_CHECKED: &str = "agent-client-protocol-schema 1.18.0";
 pub const EXTENSION_METHODS: &[&str] = &[
     "session/new",
     "session/load",
+    "session/resume",
+    "session/list",
+    "session/close",
     "session/prompt",
     "session/rename",
     "session/set_color",
@@ -207,6 +213,7 @@ pub enum SessionSpec {
         name: Option<String>,
         /// `-w [name]` (0065): open a git worktree for this session.
         worktree: Option<WorktreeArg>,
+        cwd: std::path::PathBuf,
     },
     Load {
         session_id: String,
@@ -214,6 +221,7 @@ pub enum SessionSpec {
         /// `--no-worktree` (0065): reopen in the main checkout, tombstone the
         /// chain's worktree.
         no_worktree: bool,
+        cwd: std::path::PathBuf,
     },
     /// A **new** session seeded with another's projection — optionally only a
     /// prefix of it — pinned to that session's fork-time tip. Unlike `Load`,
@@ -226,6 +234,7 @@ pub enum SessionSpec {
         /// `-w [name]` on a fork opens a new worktree from `HEAD` and does not
         /// inherit the parent's (0065).
         worktree: Option<WorktreeArg>,
+        cwd: std::path::PathBuf,
     },
 }
 
@@ -296,6 +305,7 @@ pub struct SessionOpen {
     /// The `provider/model` this session runs when it is not the process
     /// default (a resumed `/model` switch; 0067). The open reply's `model`.
     pub model: Option<String>,
+    pub history: Vec<hotl_types::Item>,
 }
 
 /// Builds a session per the client's request. The real binary wires engine
@@ -364,6 +374,7 @@ pub struct ServerInfo {
     /// How `session/set_model` resolves a spec (0067); `None` = unsupported.
     pub model_resolver: Option<ModelResolver>,
     pub key_available: bool,
+    pub sessions_dir: Option<std::path::PathBuf>,
     /// The session's primary model — prices `turn_done`'s `usage.cost_usd`
     /// (Task 5 cost telemetry). One process serves one model for its whole
     /// lifetime (process-per-session), so this is fixed for every
@@ -489,6 +500,7 @@ struct SessionState {
     /// `session/reload_config`) has to name. Not `id`, which is this
     /// connection's `acp-N` handle and means nothing to the store.
     store_id: String,
+    cwd: std::path::PathBuf,
     handle: SessionHandle,
     drain: tokio::task::JoinHandle<()>,
     /// The worktree lock (0065 T7): unlocked when this state drops — a
@@ -534,9 +546,12 @@ async fn handle_request(
             match request.method_id.as_deref() {
                 Some(AUTH_METHOD_KEY) => {
                     if let Some(hook) = reload.as_mut() {
-                        if let Ok((new_factory, new_info, _)) = hook().await {
-                            *factory = new_factory;
-                            *info = new_info;
+                        match hook().await {
+                            Ok((new_factory, new_info, _)) => {
+                                *factory = new_factory;
+                                *info = new_info;
+                            }
+                            Err(e) => return reply_err(writer, id, codes::INTERNAL, &e).await,
                         }
                     }
                     if key_available(info) {
@@ -574,185 +589,173 @@ async fn handle_request(
                 }
             }
         }
-        method @ ("session/new" | "session/load") => {
+        method @ ("session/new" | "session/load" | "session/resume" | "_hotl/session/fork") => {
             if !key_available(info) {
                 return reply_err(writer, id, codes::AUTH_REQUIRED, NO_KEY_MESSAGE).await;
             }
-            let name = match msg.pointer("/params/name") {
-                None | Some(Value::Null) => None,
-                Some(v) => match v.as_str().and_then(hotl_types::normalize_session_name) {
-                    Some(n) => Some(n),
-                    None => {
+            let Opening {
+                spec,
+                kind,
+                client_id,
+                cwd,
+            } = match parse_open(method, msg) {
+                Ok(o) => o,
+                Err(e) => return reply_err(writer, id, codes::INVALID_PARAMS, &e).await,
+            };
+            let mut open = match factory(spec) {
+                Ok(open) => open,
+                Err(e) => return reply_err(writer, id, codes::INTERNAL, &e).await,
+            };
+            let history = std::mem::take(&mut open.history);
+            let mode = open.mode.clone();
+            let todos = open.todos.clone();
+            let title = open.name.clone().or_else(|| open.title.clone());
+            let mut extras = crate::acp_map::open_extras(&open, &info.model);
+            let sid = match (&kind, client_id) {
+                (OpenKind::Load | OpenKind::Resume, Some(client_id)) => client_id,
+                _ => open.session_id.clone(),
+            };
+            install_session(
+                open,
+                sid.clone(),
+                cwd,
+                writer,
+                session,
+                pending,
+                pending_questions,
+                pending_egress,
+                pending_prompt,
+                next_id,
+                &info.model,
+            );
+            let context_tokens = match session.as_ref() {
+                Some(state) => state
+                    .handle
+                    .context_breakdown()
+                    .await
+                    .map(|b| b.rows.iter().map(|r| r.tokens).sum::<u64>()),
+                None => None,
+            };
+            extras.context_tokens = context_tokens;
+            if kind == OpenKind::Load {
+                for update in crate::acp_map::replay_updates(&history) {
+                    send_update(writer, &sid, update).await;
+                }
+            }
+            let meta = client_caps.ext.then(|| {
+                let mut m = serde_json::Map::new();
+                m.insert(META_OPEN.into(), to_json(&extras));
+                m
+            });
+            let modes = Some(crate::acp_map::session_modes(&mode));
+            let result = match kind {
+                OpenKind::New | OpenKind::Fork => to_json(&NewSessionResponse {
+                    session_id: sid.clone(),
+                    modes,
+                    meta,
+                }),
+                OpenKind::Load => to_json(&LoadSessionResponse { modes, meta }),
+                OpenKind::Resume => to_json(&ResumeSessionResponse { modes, meta }),
+            };
+            reply_ok(writer, id, result).await;
+            let commands = info
+                .skills
+                .iter()
+                .map(|s| (s.name.as_str(), s.description.as_str()))
+                .chain(
+                    info.workflows
+                        .iter()
+                        .map(|w| (w.name.as_str(), w.description.as_str())),
+                );
+            send_update(
+                writer,
+                &sid,
+                SessionUpdate::AvailableCommandsUpdate(crate::acp_map::available_commands(
+                    commands,
+                )),
+            )
+            .await;
+            if !todos.is_empty() {
+                send_update(
+                    writer,
+                    &sid,
+                    SessionUpdate::Plan(crate::acp_map::plan_of(&todos)),
+                )
+                .await;
+            }
+            if let Some(used) = context_tokens {
+                send_update(
+                    writer,
+                    &sid,
+                    SessionUpdate::UsageUpdate(UsageUpdate {
+                        used,
+                        size: info.context_window,
+                    }),
+                )
+                .await;
+            }
+            if let Some(title) = title {
+                send_update(
+                    writer,
+                    &sid,
+                    SessionUpdate::SessionInfoUpdate(SessionInfoUpdate {
+                        title: Some(title),
+                        updated_at: None,
+                    }),
+                )
+                .await;
+            }
+            if matches!(kind, OpenKind::Load | OpenKind::Resume) {
+                if let Some(state) = session.as_ref() {
+                    state.handle.continue_turn().await;
+                }
+            }
+        }
+        "session/list" => {
+            let request: ListSessionsRequest = match msg.get("params") {
+                None | Some(Value::Null) => ListSessionsRequest::default(),
+                Some(p) => match serde_json::from_value(p.clone()) {
+                    Ok(r) => r,
+                    Err(e) => {
                         return reply_err(
                             writer,
                             id,
                             codes::INVALID_PARAMS,
-                            "params.name must be 1–64 chars after trimming",
+                            &format!("invalid session/list params: {e}"),
                         )
                         .await
                     }
                 },
             };
-            let is_fork = msg
-                .pointer("/params/fork")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            // `-w [name]` (0065) rides as `worktree`: a branch name, or
-            // `@derived` for one named after the session id.
-            let worktree = msg
-                .pointer("/params/worktree")
-                .and_then(Value::as_str)
-                .map(WorktreeArg::from_wire);
-            let no_worktree = msg
-                .pointer("/params/noWorktree")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let spec = if method == "session/load" {
-                let keep = match keep_spec(msg) {
-                    Ok(k) => k,
-                    Err(e) => return reply_err(writer, id, codes::INVALID_PARAMS, &e).await,
-                };
-                if !is_fork && keep != KeepSpec::All {
-                    return reply_err(
-                        writer,
-                        id,
-                        codes::INVALID_PARAMS,
-                        "params.keepItems/keepTurns only apply to a fork (params.fork: true)",
-                    )
-                    .await;
-                }
-                if worktree.is_some() && !is_fork {
-                    return reply_err(
-                        writer,
-                        id,
-                        codes::INVALID_PARAMS,
-                        "params.worktree only applies to a new session or a fork — a resumed \
-                         session already has a worktree, or had none",
-                    )
-                    .await;
-                }
-                match msg.pointer("/params/sessionId").and_then(Value::as_str) {
-                    Some(sid) if is_fork => SessionSpec::Fork {
-                        session_id: sid.to_string(),
-                        keep,
-                        name,
-                        worktree,
-                    },
-                    Some(sid) => SessionSpec::Load {
-                        session_id: sid.to_string(),
-                        name,
-                        no_worktree,
-                    },
-                    None => {
+            match list_sessions(info.sessions_dir.as_deref(), &request) {
+                Ok(list) => reply_ok(writer, id, to_json(&list)).await,
+                Err(e) => reply_err(writer, id, codes::INVALID_PARAMS, &e).await,
+            }
+        }
+        "session/close" => {
+            let request: CloseSessionRequest =
+                match msg.get("params").cloned().map(serde_json::from_value) {
+                    Some(Ok(r)) => r,
+                    _ => {
                         return reply_err(
                             writer,
                             id,
                             codes::INVALID_PARAMS,
-                            "session/load requires params.sessionId",
+                            "session/close requires params.sessionId",
                         )
                         .await
                     }
-                }
-            } else {
-                SessionSpec::New { name, worktree }
-            };
-            match factory(spec) {
-                Ok(open) => {
-                    // Captured before `open.handle` moves into `install_session`.
-                    let mode = open.mode.clone();
-                    let plan = open.plan;
-                    let default_effort = open.default_effort.clone();
-                    let effort_schedule = open.effort_schedule.clone();
-                    let goal = open.goal.clone();
-                    let name = open.name.clone();
-                    let todos = open.todos.clone();
-                    let effort = open.effort.clone();
-                    let previous_model = open.previous_model.clone();
-                    let open_warnings = open.warnings.clone();
-                    let open_title = open.title.clone();
-                    let open_model = open.model.clone().unwrap_or_else(|| info.model.clone());
-                    let memory_mode = open.memory_mode.clone();
-                    let open_worktree = open.worktree.clone();
-                    let open_color = open.color.clone();
-                    let sid = install_session(
-                        open,
-                        writer,
-                        session,
-                        pending,
-                        pending_questions,
-                        pending_egress,
-                        pending_prompt,
-                        next_id,
-                        &info.model,
-                    );
-                    // The at-open context estimate (0040). Computed here
-                    // because the factory is sync and cannot await the actor;
-                    // placed before the auto-continuation below so ordering
-                    // makes it the at-open value by construction.
-                    // `ContextBreakdown` is a pure snapshot read — no append,
-                    // no publish — so it cannot deadlock the continuation.
-                    let context_tokens = match session.as_ref() {
-                        Some(state) => state
-                            .handle
-                            .context_breakdown()
-                            .await
-                            .map(|b| b.rows.iter().map(|r| r.tokens).sum::<u64>()),
-                        None => None,
-                    };
-                    // Resume auto-continuation (M4/#8): a loaded projection
-                    // that ends mid-turn (user prompt or unanswered tool
-                    // results) picks the work back up; the engine no-ops when
-                    // there is nothing to continue.
-                    //
-                    // A **fork** never does (D-A9). For resume, finishing the
-                    // interrupted turn is what the user wants; for a fork the
-                    // sense is inverted — they forked to send it somewhere
-                    // else, and auto-continuing would spend a full-price
-                    // sample re-answering the parent's stale prompt before the
-                    // phase instruction ever arrives.
-                    if method == "session/load" && !is_fork {
-                        if let Some(state) = session.as_ref() {
-                            state.handle.continue_turn().await;
-                        }
-                    }
-                    // The session's own effective mode rides the open result:
-                    // a client's handshake runs before it takes the screen and
-                    // wants the seed synchronously, rather than waiting for a
-                    // notification that only fires on a *change* — the same
-                    // reason the 0040 at-open keys (context, todos, effort,
-                    // previous model) ride here too.
-                    // `images: true` is the client's feature detection: an
-                    // old server simply never sends the key, so a client can
-                    // tell "images accepted" from "images silently ignored".
-                    // Absent keys mean something different from null (probe
-                    // failed / never set / same model) — see `SessionOpenResult`.
-                    let reply = SessionOpenResult {
-                        session_id: sid,
-                        name,
-                        mode,
-                        plan,
-                        default_effort,
-                        goal,
-                        images: true,
-                        todos,
-                        context_tokens,
-                        effort,
-                        previous_model,
-                        effort_schedule,
-                        warnings: open_warnings,
-                        title: open_title,
-                        // The model this session actually runs (a resumed
-                        // switch may differ from the process default).
-                        model: open_model,
-                        memory_mode,
-                        // Absent for a main-checkout session (0065).
-                        worktree: open_worktree.map(|(path, branch)| WorktreeInfo { path, branch }),
-                        color: open_color,
-                    };
-                    reply_ok(writer, id, to_json(&reply)).await;
-                }
-                Err(e) => reply_err(writer, id, codes::INTERNAL, &e).await,
+                };
+            if session.as_ref().is_some_and(|s| s.id == request.session_id) {
+                retire_session(
+                    session,
+                    pending,
+                    pending_questions,
+                    pending_egress,
+                    pending_prompt,
+                );
             }
+            reply_ok(writer, id, json!({})).await;
         }
         "session/prompt" => {
             let Some(state) = session.as_ref() else {
@@ -1366,7 +1369,10 @@ async fn handle_request(
             *info = new_info;
             // No live session: the new factory is in place and the next
             // `session/new` gets the reloaded engine. Nothing to re-open.
-            let Some(store_id) = session.as_ref().map(|s| s.store_id.clone()) else {
+            let Some((store_id, cwd)) = session
+                .as_ref()
+                .map(|s| (s.store_id.clone(), s.cwd.clone()))
+            else {
                 return reply_ok(
                     writer,
                     id,
@@ -1391,13 +1397,17 @@ async fn handle_request(
                 session_id: store_id,
                 name: None,
                 no_worktree: false,
+                cwd: cwd.clone(),
             };
             match factory(spec) {
                 Ok(open) => {
                     let mode = open.mode.clone();
                     let plan = open.plan;
-                    let sid = install_session(
+                    let sid = open.session_id.clone();
+                    install_session(
                         open,
+                        sid.clone(),
+                        cwd,
                         writer,
                         session,
                         pending,
@@ -1710,7 +1720,218 @@ async fn handle_request(
     }
 }
 
-/// `keepItems` / `keepTurns` off a `session/load` request. Mutually exclusive:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenKind {
+    New,
+    Load,
+    Resume,
+    Fork,
+}
+
+struct Opening {
+    spec: SessionSpec,
+    kind: OpenKind,
+    client_id: Option<String>,
+    cwd: std::path::PathBuf,
+}
+
+#[derive(Default)]
+struct OpenMeta {
+    name: Option<String>,
+    worktree: Option<WorktreeArg>,
+    no_worktree: bool,
+}
+
+fn session_name_param(v: Option<&Value>, field: &str) -> Result<Option<String>, String> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .and_then(hotl_types::normalize_session_name)
+            .map(Some)
+            .ok_or_else(|| format!("{field} must be 1–64 chars after trimming")),
+    }
+}
+
+fn open_meta(meta: Option<&crate::acp_types::Meta>) -> Result<OpenMeta, String> {
+    let Some(open) = meta.and_then(|m| m.get(META_OPEN)) else {
+        return Ok(OpenMeta::default());
+    };
+    Ok(OpenMeta {
+        name: session_name_param(open.get("name"), "_meta[\"hotl.dev/open\"].name")?,
+        worktree: open
+            .get("worktree")
+            .and_then(Value::as_str)
+            .map(WorktreeArg::from_wire),
+        no_worktree: open
+            .get("noWorktree")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn session_root(cwd: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    if !cwd.is_absolute() {
+        return Err(format!("params.cwd must be an absolute path, got {cwd:?}"));
+    }
+    if !cwd.is_dir() {
+        return Err(format!("params.cwd is not an existing directory: {cwd:?}"));
+    }
+    Ok(cwd.to_path_buf())
+}
+
+fn check_mcp_servers(msg: &Value) -> Result<(), String> {
+    match msg.pointer("/params/mcpServers") {
+        None | Some(Value::Null) | Some(Value::Array(_)) => Ok(()),
+        Some(_) => Err("params.mcpServers must be an array".into()),
+    }
+}
+
+fn parse_params<T: serde::de::DeserializeOwned>(method: &str, msg: &Value) -> Result<T, String> {
+    serde_json::from_value(msg.get("params").cloned().unwrap_or(Value::Null))
+        .map_err(|e| format!("invalid {method} params: {e}"))
+}
+
+fn parse_open(method: &str, msg: &Value) -> Result<Opening, String> {
+    if method == "session/new" {
+        parse_new(method, msg)
+    } else if method == "session/load" || method == "session/resume" {
+        parse_load(method, msg)
+    } else {
+        parse_fork(method, msg)
+    }
+}
+
+fn parse_new(method: &str, msg: &Value) -> Result<Opening, String> {
+    check_mcp_servers(msg)?;
+    let request: NewSessionRequest = parse_params(method, msg)?;
+    let cwd = session_root(&request.cwd)?;
+    let meta = open_meta(request.meta.as_ref())?;
+    if meta.no_worktree {
+        return Err("noWorktree only applies to session/load or session/resume".into());
+    }
+    Ok(Opening {
+        spec: SessionSpec::New {
+            name: meta.name,
+            worktree: meta.worktree,
+            cwd: cwd.clone(),
+        },
+        kind: OpenKind::New,
+        client_id: None,
+        cwd,
+    })
+}
+
+fn parse_load(method: &str, msg: &Value) -> Result<Opening, String> {
+    for key in ["fork", "keepItems", "keepTurns"] {
+        if msg.pointer(&format!("/params/{key}")).is_some() {
+            return Err(format!(
+                "params.{key} is not part of {method} — fork with _hotl/session/fork"
+            ));
+        }
+    }
+    check_mcp_servers(msg)?;
+    let (session_id, cwd, meta, kind) = if method == "session/load" {
+        let r: LoadSessionRequest = parse_params(method, msg)?;
+        (r.session_id, r.cwd, r.meta, OpenKind::Load)
+    } else {
+        let r: ResumeSessionRequest = parse_params(method, msg)?;
+        (r.session_id, r.cwd, r.meta, OpenKind::Resume)
+    };
+    let cwd = session_root(&cwd)?;
+    let meta = open_meta(meta.as_ref())?;
+    if meta.worktree.is_some() {
+        return Err(
+            "worktree only applies to a new session or a fork — a resumed session \
+             already has a worktree, or had none"
+                .into(),
+        );
+    }
+    Ok(Opening {
+        spec: SessionSpec::Load {
+            session_id: session_id.clone(),
+            name: meta.name,
+            no_worktree: meta.no_worktree,
+            cwd: cwd.clone(),
+        },
+        kind,
+        client_id: Some(session_id),
+        cwd,
+    })
+}
+
+fn parse_fork(method: &str, msg: &Value) -> Result<Opening, String> {
+    let session_id = msg
+        .pointer("/params/sessionId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{method} requires params.sessionId"))?;
+    let keep = keep_spec(msg)?;
+    let name = session_name_param(msg.pointer("/params/name"), "params.name")?;
+    let worktree = msg
+        .pointer("/params/worktree")
+        .and_then(Value::as_str)
+        .map(WorktreeArg::from_wire);
+    let cwd = match msg.pointer("/params/cwd").and_then(Value::as_str) {
+        Some(c) => session_root(std::path::Path::new(c))?,
+        None => std::env::current_dir().map_err(|e| format!("no working directory: {e}"))?,
+    };
+    Ok(Opening {
+        spec: SessionSpec::Fork {
+            session_id: session_id.to_string(),
+            keep,
+            name,
+            worktree,
+            cwd: cwd.clone(),
+        },
+        kind: OpenKind::Fork,
+        client_id: None,
+        cwd,
+    })
+}
+
+const SESSION_LIST_PAGE: usize = 50;
+
+fn list_sessions(
+    dir: Option<&std::path::Path>,
+    request: &ListSessionsRequest,
+) -> Result<ListSessionsResponse, String> {
+    let start = match request.cursor.as_deref() {
+        None => 0,
+        Some(c) => c
+            .parse::<usize>()
+            .map_err(|_| format!("params.cursor {c:?} is not a cursor this server gave out"))?,
+    };
+    let want = request.cwd.as_ref().map(|c| c.display().to_string());
+    let mut sessions: Vec<SessionInfo> = dir
+        .map(hotl_store::list_sessions)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(session_id, path, modified)| {
+            let cwd = hotl_store::session_cwd(&path)?;
+            if want.as_ref().is_some_and(|w| *w != cwd) {
+                return None;
+            }
+            Some(SessionInfo {
+                session_id,
+                cwd: cwd.into(),
+                title: hotl_store::session_name(&path).or_else(|| hotl_store::session_title(&path)),
+                updated_at: Some(crate::acp_map::rfc3339(modified)),
+            })
+        })
+        .skip(start)
+        .take(SESSION_LIST_PAGE + 1)
+        .collect();
+    let next_cursor = (sessions.len() > SESSION_LIST_PAGE).then(|| {
+        sessions.truncate(SESSION_LIST_PAGE);
+        (start + SESSION_LIST_PAGE).to_string()
+    });
+    Ok(ListSessionsResponse {
+        sessions,
+        next_cursor,
+    })
+}
+
+/// `keepItems` / `keepTurns` off a `_hotl/session/fork` request. Mutually exclusive:
 /// they are two coordinate systems onto the same cut, and a request naming both
 /// has no single meaning worth guessing at.
 fn keep_spec(msg: &Value) -> Result<KeepSpec, String> {
@@ -1744,9 +1965,46 @@ fn keep_spec(msg: &Value) -> Result<KeepSpec, String> {
 ///
 /// Shared by `session/new`, `session/load` and `session/reload_config` so the
 /// three can never drift on what "retire the old session" means.
+/// Replacing a session: interrupt its in-flight turn (its events are about to
+/// stop rendering anywhere — it must not keep running tools invisibly in the
+/// shared cwd), stop its drain task, and drop its parked state — a dropped ask
+/// sender reads as a deny to the old engine, and a stale prompt id must never
+/// be answered with the new session's first TurnDone.
+fn retire_session(
+    session: &mut Option<SessionState>,
+    pending: &Pending,
+    pending_questions: &PendingQuestions,
+    pending_egress: &PendingEgress,
+    pending_prompt: &PendingPrompt,
+) {
+    let Some(old) = session.take() else {
+        return;
+    };
+    old.handle.interrupt();
+    old.drain.abort();
+    pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    pending_questions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    pending_egress
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    pending_prompt
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
 #[allow(clippy::too_many_arguments)]
 fn install_session(
     open: SessionOpen,
+    id: String,
+    cwd: std::path::PathBuf,
     writer: &Writer,
     session: &mut Option<SessionState>,
     pending: &Pending,
@@ -1755,30 +2013,18 @@ fn install_session(
     pending_prompt: &PendingPrompt,
     next_id: &mut u64,
     model: &str,
-) -> String {
-    if let Some(old) = session.take() {
-        old.handle.interrupt();
-        old.drain.abort();
-        pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        pending_questions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        pending_egress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        pending_prompt
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-    }
+) {
+    retire_session(
+        session,
+        pending,
+        pending_questions,
+        pending_egress,
+        pending_prompt,
+    );
     let lease = open.lease;
     let mut state = start_session(
         open.handle,
+        id,
         open.session_id,
         writer.clone(),
         pending.clone(),
@@ -1789,14 +2035,14 @@ fn install_session(
         model.to_string(),
     );
     state._lease = lease;
-    let sid = state.id.clone();
+    state.cwd = cwd;
     *session = Some(state);
-    sid
 }
 
 #[allow(clippy::too_many_arguments)]
 fn start_session(
     mut handle: SessionHandle,
+    id: String,
     store_id: String,
     writer: Writer,
     pending: Pending,
@@ -1806,7 +2052,6 @@ fn start_session(
     next_id: &mut u64,
     model: String,
 ) -> SessionState {
-    let id = format!("acp-{}", *next_id);
     // Permission/question request ids for this session are disjoint from
     // every other id.
     let req_id_seed = *next_id * 1_000_000;
@@ -1827,6 +2072,7 @@ fn start_session(
     SessionState {
         id,
         store_id,
+        cwd: std::path::PathBuf::new(),
         handle,
         drain,
         _lease: None,
@@ -2067,6 +2313,18 @@ async fn notify(writer: &Writer, session_id: &str, update: Value) {
         "jsonrpc": "2.0", "method": "session/update",
         "params": {"schemaVersion": UPDATE_SCHEMA_VERSION, "sessionId": session_id, "update": update},
     }))
+    .await;
+}
+
+async fn send_update(writer: &Writer, session_id: &str, update: SessionUpdate) {
+    let params = SessionNotification {
+        session_id: session_id.to_string(),
+        update,
+    };
+    send(
+        writer,
+        &json!({"jsonrpc": "2.0", "method": "session/update", "params": to_json(&params)}),
+    )
     .await;
 }
 
@@ -2476,14 +2734,14 @@ pub struct WorktreeInfo {
     pub branch: String,
 }
 
+pub const META_OPEN: &str = "hotl.dev/open";
+
 /// The `session/new` / `session/load` / fork result. Absent keys mean
 /// something different from `null` (probe failed / never set / same model).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionOpenResult {
-    pub session_id: String,
+pub struct SessionOpenExtras {
     pub name: Option<String>,
-    pub mode: String,
     pub plan: bool,
     pub default_effort: Option<String>,
     pub goal: Option<String>,
@@ -2782,7 +3040,12 @@ pub struct EgressReply {
 #[allow(dead_code)] // schema-only
 pub struct AcpPayloads {
     initialize: InitializeResponse,
-    session_open: SessionOpenResult,
+    new_session: NewSessionResponse,
+    load_session: LoadSessionResponse,
+    resume_session: ResumeSessionResponse,
+    list_sessions: ListSessionsResponse,
+    session_notification: SessionNotification,
+    session_open_extras: SessionOpenExtras,
     prompt_result: PromptResult,
     session_update: SessionUpdateParams,
     ack: Ack,

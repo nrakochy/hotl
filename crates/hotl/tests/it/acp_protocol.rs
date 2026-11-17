@@ -19,6 +19,18 @@ fn scripted_factory() -> acp::SessionFactory {
     scripted_factory_with_mode("ask")
 }
 
+fn new_params() -> Value {
+    json!({"cwd": std::env::temp_dir(), "mcpServers": []})
+}
+
+fn init_params() -> Value {
+    json!({"protocolVersion": 1, "clientCapabilities": {"_meta": {"hotl.dev/extensions": 1}}})
+}
+
+fn open_of(reply: &Value) -> &Value {
+    &reply["result"]["_meta"]["hotl.dev/open"]
+}
+
 /// What `serve` advertises when a test does not care about the values.
 fn server_info() -> acp::ServerInfo {
     acp::ServerInfo {
@@ -31,6 +43,7 @@ fn server_info() -> acp::ServerInfo {
         stream_idle_secs: 90,
         model_resolver: None,
         key_available: true,
+        sessions_dir: None,
         // Uncatalogued deliberately: matches `scripted_factory`'s session log
         // model ("m"), and keeps `cost_usd` absent for scenarios that don't
         // test pricing.
@@ -85,6 +98,7 @@ fn scripted_factory_recording(
             ScriptedProvider::text_reply("all done via acp"),
         ]));
         Ok(acp::SessionOpen {
+            history: Vec::new(),
             memory_mode: None,
             worktree: None,
             lease: None,
@@ -150,6 +164,7 @@ fn interrupted_factory(seen: Arc<std::sync::Mutex<Vec<String>>>) -> acp::Session
         let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         Ok(acp::SessionOpen {
+            history: Vec::new(),
             memory_mode: None,
             worktree: None,
             lease: None,
@@ -221,13 +236,13 @@ async fn a_fork_never_auto_continues_but_a_resume_still_does() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"S1"}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":"S1","cwd":std::env::temp_dir()}}),
     )
     .await;
     let text = next_matching(&mut lines, |m| {
@@ -256,14 +271,14 @@ async fn a_fork_never_auto_continues_but_a_resume_still_does() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/load",
-               "params":{"sessionId":"S1","fork":true,"keepTurns":2}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"_hotl/session/fork",
+               "params":{"sessionId":"S1","keepTurns":2}}),
     )
     .await;
     let opened = next_matching(&mut lines, |m| m["id"] == json!(2)).await;
@@ -271,7 +286,7 @@ async fn a_fork_never_auto_continues_but_a_resume_still_does() {
     assert_eq!(
         seen.lock().unwrap().clone(),
         ["fork:S1:Turns(2)"],
-        "`fork: true` plus `keepTurns` reaches the factory as a Fork spec"
+        "_hotl/session/fork with `keepTurns` reaches the factory as a Fork spec"
     );
     send(
         &mut cwrite,
@@ -307,7 +322,7 @@ async fn keep_params_are_rejected_without_a_fork_and_against_each_other() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
@@ -329,8 +344,8 @@ async fn keep_params_are_rejected_without_a_fork_and_against_each_other() {
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/load",
-               "params":{"sessionId":"S1","fork":true,"keepItems":4,"keepTurns":2}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/fork",
+               "params":{"sessionId":"S1","keepItems":4,"keepTurns":2}}),
     )
     .await;
     let err = next_matching(&mut lines, |m| m["id"] == json!(3)).await;
@@ -358,6 +373,7 @@ fn inherited_state_factory(effort: Option<Option<String>>) -> acp::SessionFactor
             ..Default::default()
         }];
         Ok(acp::SessionOpen {
+            history: Vec::new(),
             memory_mode: None,
             worktree: None,
             lease: None,
@@ -425,17 +441,17 @@ async fn the_open_reply_seeds_context_todos_and_effort() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let opened = read_until_id(&mut lines, 2).await;
-    let r = &opened["result"];
+    let r = open_of(&opened);
     assert!(
         r["contextTokens"].as_u64().unwrap_or(0) > 0,
         "seed items, system prompt and tool schemas occupy real tokens: {opened}"
@@ -462,17 +478,17 @@ async fn the_open_reply_seeds_context_todos_and_effort() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let opened = read_until_id(&mut lines, 2).await;
-    let r = &opened["result"];
+    let r = open_of(&opened);
     assert!(
         r.get("effort").is_none(),
         "never-set must stay absent, not null — collapsing the tri-state \
@@ -499,18 +515,18 @@ async fn a_cleared_inherited_effort_rides_as_null() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let opened = read_until_id(&mut lines, 2).await;
     assert_eq!(
-        opened["result"].get("effort"),
+        open_of(&opened).get("effort"),
         Some(&Value::Null),
         "cleared ≠ never-set: {opened}"
     );
@@ -535,6 +551,7 @@ async fn the_open_reply_carries_the_title_and_session_titled_is_broadcast() {
             ScriptedProvider::text_reply("Minted title"),
         ]));
         Ok(acp::SessionOpen {
+            history: Vec::new(),
             memory_mode: None,
             worktree: None,
             lease: None,
@@ -582,20 +599,20 @@ async fn the_open_reply_carries_the_title_and_session_titled_is_broadcast() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"S1"}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":"S1","cwd":std::env::temp_dir()}}),
     )
     .await;
     let open = next(&mut lines).await;
-    assert_eq!(open["result"]["title"], "Fix the auth flow");
+    assert_eq!(open_of(&open)["title"], "Fix the auth flow");
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":new_params()}),
     )
     .await;
     let open = next(&mut lines).await;
@@ -628,17 +645,17 @@ async fn the_open_reply_names_the_previous_model() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let opened = read_until_id(&mut lines, 2).await;
-    assert_eq!(opened["result"]["previousModel"], "old-m", "{opened}");
+    assert_eq!(open_of(&opened)["previousModel"], "old-m", "{opened}");
 
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
@@ -653,13 +670,13 @@ async fn the_open_reply_names_the_previous_model() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let opened = read_until_id(&mut lines, 2).await;
@@ -747,7 +764,7 @@ async fn session_workflows_returns_an_ack_and_broadcasts_a_report() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
@@ -766,7 +783,7 @@ async fn session_workflows_returns_an_ack_and_broadcasts_a_report() {
     );
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":{}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":new_params()}),
     )
     .await;
     next_matching(&mut lines, |m| m["id"] == json!(3)).await;
@@ -805,13 +822,13 @@ async fn session_context_returns_an_ack_and_broadcasts_a_report() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     next(&mut lines).await;
@@ -853,6 +870,7 @@ async fn session_aside_acks_then_broadcasts_the_answer() {
             "it returns a Result",
         )]));
         Ok(acp::SessionOpen {
+            history: Vec::new(),
             memory_mode: None,
             worktree: None,
             lease: None,
@@ -904,13 +922,13 @@ async fn session_aside_acks_then_broadcasts_the_answer() {
     );
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":new_params()}),
     )
     .await;
     next(&mut lines).await;
@@ -959,13 +977,13 @@ async fn session_fold_at_idle_acks_now_and_relays_the_outcome() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     next(&mut lines).await;
@@ -1030,13 +1048,13 @@ async fn session_fold_rejects_a_bad_focus() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     next(&mut lines).await;
@@ -1081,7 +1099,7 @@ async fn session_context_without_a_session_is_an_error() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
@@ -1117,13 +1135,13 @@ async fn the_context_report_kinds_are_snake_case() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     next(&mut lines).await;
@@ -1170,7 +1188,7 @@ async fn initialize_new_prompt_permission_and_result() {
     // 2. session/new → a session id.
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let new = next(&mut lines).await;
@@ -1251,6 +1269,7 @@ async fn overlapping_prompts_resolve_in_order() {
             ScriptedProvider::text_reply("second turn"),
         ]));
         Ok(acp::SessionOpen {
+            history: Vec::new(),
             memory_mode: None,
             worktree: None,
             lease: None,
@@ -1300,7 +1319,7 @@ async fn overlapping_prompts_resolve_in_order() {
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":new_params()}),
     )
     .await;
     read_until_id(&mut lines, 1).await;
@@ -1341,7 +1360,7 @@ async fn replacing_a_session_clears_parked_state() {
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":new_params()}),
     )
     .await;
     let first = read_until_id(&mut lines, 1).await;
@@ -1366,7 +1385,7 @@ async fn replacing_a_session_clears_parked_state() {
     // Replace the session while the ask is parked.
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":new_params()}),
     )
     .await;
     let second = read_until_id(&mut lines, 3).await;
@@ -1435,7 +1454,7 @@ async fn steer_is_acknowledged_and_reaches_engine() {
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     read_until_id(&mut lines, 2).await;
@@ -1474,6 +1493,7 @@ async fn prompt_images_are_validated_at_the_wire() {
         let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         Ok(acp::SessionOpen {
+            history: Vec::new(),
             memory_mode: None,
             worktree: None,
             lease: None,
@@ -1521,11 +1541,17 @@ async fn prompt_images_are_validated_at_the_wire() {
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":100,"method":"initialize","params":init_params()}),
+    )
+    .await;
+    read_until_id(&mut lines, 100).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":new_params()}),
     )
     .await;
     let opened = read_until_id(&mut lines, 1).await;
-    assert_eq!(opened["result"]["images"], json!(true));
+    assert_eq!(open_of(&opened)["images"], json!(true));
 
     // Bad base64 is rejected with a reason, before the log ever sees it.
     send(
@@ -1599,7 +1625,7 @@ async fn named_open_and_rename() {
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
@@ -1618,11 +1644,11 @@ async fn named_open_and_rename() {
     // open with a name (surrounding whitespace normalizes away).
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":{"name":"  fix-auth  "}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd": std::env::temp_dir(), "mcpServers": [], "_meta": {"hotl.dev/open": {"name":"  fix-auth  "}}}}),
     )
     .await;
     let open = next(&mut lines).await;
-    assert_eq!(open["result"]["name"], "fix-auth");
+    assert_eq!(open_of(&open)["name"], "fix-auth");
 
     // invalid rename → error; valid rename → ok.
     send(
@@ -1657,7 +1683,7 @@ async fn set_color_acks_a_known_name_or_null_and_refuses_the_rest() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
@@ -1672,7 +1698,7 @@ async fn set_color_acks_a_known_name_or_null_and_refuses_the_rest() {
     );
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":new_params()}),
     )
     .await;
     read_until_id(&mut lines, 3).await;
@@ -1735,6 +1761,7 @@ async fn ask_user_round_trip_via_session_request_question() {
             ScriptedProvider::text_reply("all done via acp"),
         ]));
         Ok(acp::SessionOpen {
+            history: Vec::new(),
             memory_mode: None,
             worktree: None,
             lease: None,
@@ -1791,7 +1818,7 @@ async fn ask_user_round_trip_via_session_request_question() {
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":new_params()}),
     )
     .await;
     let session_id = read_until_id(&mut lines, 1)
@@ -1854,7 +1881,7 @@ async fn set_mode_acks_and_rejects_unknown_modes() {
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
@@ -1872,7 +1899,7 @@ async fn set_mode_acks_and_rejects_unknown_modes() {
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":new_params()}),
     )
     .await;
     next(&mut lines).await;
@@ -1918,6 +1945,7 @@ async fn the_session_reports_its_effective_mode() {
             stream_idle_secs: 90,
             model_resolver: None,
             key_available: true,
+            sessions_dir: None,
             model: "m".into(),
         },
         None,
@@ -1942,16 +1970,17 @@ async fn the_session_reports_its_effective_mode() {
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let opened = read_until_id(&mut lines, 2).await;
     assert_eq!(
-        opened["result"]["mode"], "auto",
+        opened["result"]["modes"]["currentModeId"], "auto",
         "session/new must report the mode"
     );
     assert_eq!(
-        opened["result"]["defaultEffort"], "xhigh",
+        open_of(&opened)["defaultEffort"],
+        "xhigh",
         "session/new must report the resolved session default effort"
     );
 
@@ -2008,11 +2037,11 @@ async fn set_plan_is_its_own_axis_and_the_legacy_plan_mode_word_still_works() {
     );
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let opened = read_until_id(&mut lines, 2).await;
-    assert_eq!(opened["result"]["plan"], false, "session/new reports plan");
+    assert_eq!(open_of(&opened)["plan"], false, "session/new reports plan");
 
     // The dedicated method.
     send(
@@ -2106,6 +2135,7 @@ fn server_info_with_resolver() -> acp::ServerInfo {
     acp::ServerInfo {
         model_resolver: Some(test_resolver()),
         key_available: true,
+        sessions_dir: None,
         ..server_info()
     }
 }
@@ -2125,13 +2155,13 @@ async fn set_model_acks_applied_and_the_engine_broadcasts_model_changed() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     let _ = read_until_id(&mut lines, 1).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let _ = read_until_id(&mut lines, 2).await;
@@ -2178,13 +2208,13 @@ async fn set_model_during_a_turn_acks_queued_then_broadcasts_at_the_boundary() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     let _ = read_until_id(&mut lines, 1).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let _ = read_until_id(&mut lines, 2).await;
@@ -2229,13 +2259,13 @@ async fn set_model_rejects_an_unknown_provider_and_changes_nothing() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     let _ = read_until_id(&mut lines, 1).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let _ = read_until_id(&mut lines, 2).await;
@@ -2282,13 +2312,13 @@ async fn set_model_without_a_resolver_is_an_error_not_a_silent_no_op() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     let _ = read_until_id(&mut lines, 1).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let _ = read_until_id(&mut lines, 2).await;
@@ -2316,6 +2346,7 @@ async fn a_resumed_session_runs_its_last_model_set() {
         let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         Ok(acp::SessionOpen {
+            history: Vec::new(),
             memory_mode: None,
             worktree: None,
             lease: None,
@@ -2360,28 +2391,29 @@ async fn a_resumed_session_runs_its_last_model_set() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     let _ = read_until_id(&mut lines, 1).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"S1"}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":"S1","cwd":std::env::temp_dir()}}),
     )
     .await;
     let open = read_until_id(&mut lines, 2).await;
     assert_eq!(
-        open["result"]["model"], "openai-responses/gpt-5.6",
+        open_of(&open)["model"],
+        "openai-responses/gpt-5.6",
         "{open}"
     );
     assert!(open["result"].get("previousModel").is_none());
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":new_params()}),
     )
     .await;
     let open = read_until_id(&mut lines, 3).await;
-    assert_eq!(open["result"]["model"], server_info().model, "{open}");
+    assert_eq!(open_of(&open)["model"], server_info().model, "{open}");
 }
 
 #[tokio::test]
@@ -2400,13 +2432,13 @@ async fn set_effort_acks_broadcasts_and_rejects_unknown_levels() {
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     let _ = read_until_id(&mut lines, 1).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let _ = read_until_id(&mut lines, 2).await;
@@ -2483,18 +2515,18 @@ async fn set_goal_acks_relays_the_engine_broadcast_and_rejects_invalid_params() 
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     let _ = read_until_id(&mut lines, 1).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let opened = read_until_id(&mut lines, 2).await;
     assert_eq!(
-        opened["result"]["goal"],
+        open_of(&opened)["goal"],
         Value::Null,
         "a fresh session opens with no goal"
     );
@@ -2575,6 +2607,7 @@ async fn the_open_reply_carries_the_resumed_goal_and_a_forks_is_null() {
         let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         Ok(acp::SessionOpen {
+            history: Vec::new(),
             memory_mode: None,
             worktree: None,
             lease: None,
@@ -2623,35 +2656,47 @@ async fn the_open_reply_carries_the_resumed_goal_and_a_forks_is_null() {
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     let _ = read_until_id(&mut lines, 1).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"S1"}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":"S1","cwd":std::env::temp_dir()}}),
     )
     .await;
     let opened = read_until_id(&mut lines, 2).await;
     assert_eq!(
-        opened["result"]["goal"], "all tests pass",
+        open_of(&opened)["goal"],
+        "all tests pass",
         "resume must hand the restored goal to the client synchronously"
     );
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/load",
-               "params":{"sessionId":"S1","fork":true}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/fork",
+               "params":{"sessionId":"S1"}}),
     )
     .await;
     let forked = read_until_id(&mut lines, 3).await;
     assert_eq!(
-        forked["result"]["goal"],
+        open_of(&forked)["goal"],
         Value::Null,
         "a fork never inherits the goal"
     );
 }
 
 async fn next(lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>) -> Value {
+    loop {
+        let m = next_raw(lines).await;
+        if m["params"]["update"].get("sessionUpdate").is_none() {
+            return m;
+        }
+    }
+}
+
+async fn next_raw(
+    lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
+) -> Value {
     let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
         .await
         .expect("acp frame timeout")
@@ -2717,6 +2762,7 @@ async fn reload_config_swaps_the_engine_and_broadcasts_the_new_truth() {
         stream_idle_secs: 90,
         model_resolver: None,
         key_available: true,
+        sessions_dir: None,
         model: "m2".into(),
     };
     // What `SessionSpec::Load` the replacement factory is handed, so this test
@@ -2738,13 +2784,13 @@ async fn reload_config_swaps_the_engine_and_broadcasts_the_new_truth() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let opened = next(&mut lines).await;
@@ -2837,13 +2883,13 @@ async fn a_failed_reload_keeps_the_running_session_answering() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     next(&mut lines).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let opened = next(&mut lines).await;
@@ -2968,6 +3014,7 @@ fn memory_factory(
             hotl_engine::hooks::NotificationDrain::new(),
         );
         Ok(acp::SessionOpen {
+            history: Vec::new(),
             handle,
             name: None,
             mode: "ask".into(),
@@ -3004,13 +3051,13 @@ async fn open_memory_session(
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
     )
     .await;
     let _ = read_until_id(&mut lines, 1).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
     let opened = read_until_id(&mut lines, 2).await;
@@ -3027,7 +3074,7 @@ async fn remember_asks_via_request_permission_then_acks_and_broadcasts_memory_ch
         vec![],
     ))
     .await;
-    assert_eq!(opened["result"]["memoryMode"], "read-write");
+    assert_eq!(open_of(&opened)["memoryMode"], "read-write");
     send(
         &mut cwrite,
         json!({"jsonrpc":"2.0","id":3,"method":"session/remember",
@@ -3096,7 +3143,7 @@ async fn remember_bare_returns_a_memory_report() {
         vec![],
     ))
     .await;
-    assert_eq!(opened["result"]["memoryMode"], "read-only");
+    assert_eq!(open_of(&opened)["memoryMode"], "read-only");
     send(
         &mut cwrite,
         json!({"jsonrpc":"2.0","id":3,"method":"session/remember","params":{}}),
@@ -3202,6 +3249,7 @@ fn jobs_factory(command: &str) -> acp::SessionFactory {
             ScriptedProvider::text_reply("saw it end"),
         ]));
         Ok(acp::SessionOpen {
+            history: Vec::new(),
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider,
@@ -3442,6 +3490,7 @@ fn children_factory() -> acp::SessionFactory {
         let mut registry = Registry::builtin();
         registry.register(Box::new(RegisterChild));
         Ok(acp::SessionOpen {
+            history: Vec::new(),
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider,
@@ -3876,6 +3925,7 @@ async fn rpc_with_info(info: acp::ServerInfo, calls: Vec<Value>) -> Vec<Value> {
 fn no_key_info() -> acp::ServerInfo {
     acp::ServerInfo {
         key_available: false,
+        sessions_dir: None,
         ..server_info()
     }
 }
@@ -3886,8 +3936,10 @@ async fn session_new_without_a_key_is_auth_required() {
         no_key_info(),
         vec![
             json!({"method":"initialize","params":{"protocolVersion":1}}),
-            json!({"method":"session/new","params":{}}),
-            json!({"method":"session/load","params":{"sessionId":"01ABC"}}),
+            json!({"method":"session/new","params":new_params()}),
+            json!({"method":"session/load","params":{"sessionId":"01ABC","cwd":std::env::temp_dir()}}),
+            json!({"method":"session/resume","params":{"sessionId":"01ABC","cwd":std::env::temp_dir()}}),
+            json!({"method":"_hotl/session/fork","params":{"sessionId":"01ABC"}}),
         ],
     )
     .await;
@@ -3965,7 +4017,7 @@ async fn reload_with_a_live_session_after_the_key_vanishes_is_auth_required() {
         hook_to(no_key_info),
         vec![
             json!({"method":"initialize","params":{"protocolVersion":1}}),
-            json!({"method":"session/new","params":{}}),
+            json!({"method":"session/new","params":new_params()}),
             json!({"method":"session/reload_config","params":{}}),
         ],
     )
@@ -3981,13 +4033,507 @@ async fn authenticate_reloads_so_a_fresh_key_is_picked_up() {
         hook_to(server_info),
         vec![
             json!({"method":"initialize","params":{"protocolVersion":1}}),
-            json!({"method":"session/new","params":{}}),
+            json!({"method":"session/new","params":new_params()}),
             json!({"method":"authenticate","params":{"methodId":"hotl-key"}}),
-            json!({"method":"session/new","params":{}}),
+            json!({"method":"session/new","params":new_params()}),
         ],
     )
     .await;
     assert_eq!(r[1]["error"]["code"], -32000);
     assert_eq!(r[2]["result"], json!({}), "{}", r[2]);
     assert!(r[3]["result"]["sessionId"].is_string(), "{}", r[3]);
+}
+
+fn history_factory(
+    history: Vec<hotl_types::Item>,
+    replies: Vec<Vec<Result<hotl_provider::StreamEvent, hotl_provider::ProviderError>>>,
+) -> acp::SessionFactory {
+    let replies = Arc::new(std::sync::Mutex::new(Some(replies)));
+    Box::new(move |spec| {
+        let loaded = matches!(spec, acp::SessionSpec::Load { .. });
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
+        let items = if loaded { history.clone() } else { Vec::new() };
+        let turns = replies.lock().unwrap().take().unwrap_or_default();
+        Ok(acp::SessionOpen {
+            history: items.clone(),
+            memory_mode: None,
+            worktree: None,
+            lease: None,
+            color: None,
+            handle: spawn_session(SessionDeps {
+                concurrency: Default::default(),
+                provider: Arc::new(ScriptedProvider::new(turns)),
+                registry: Arc::new(Registry::builtin()),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: std::env::temp_dir(),
+                hooks: None,
+                initial_items: items,
+                initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
+                initial_goal: None,
+                config: EngineConfig {
+                    max_turns: 6,
+                    ..Default::default()
+                },
+            }),
+            name: None,
+            mode: "ask".into(),
+            plan: false,
+            default_effort: None,
+            effort_schedule: None,
+            goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
+            session_id,
+            warnings: Vec::new(),
+            title: None,
+            model: None,
+        })
+    })
+}
+
+fn finished_turn() -> Vec<hotl_types::Item> {
+    vec![
+        hotl_types::Item::User {
+            text: "list the files".into(),
+            synthetic: None,
+            images: Vec::new(),
+        },
+        hotl_types::Item::Assistant {
+            blocks: vec![
+                json!({"type":"text","text":"Looking."}),
+                json!({"type":"tool_use","id":"t1","name":"bash","input":{"command":"ls"}}),
+            ],
+            model: None,
+        },
+        hotl_types::Item::ToolResults {
+            results: vec![hotl_types::ToolResultItem {
+                tool_use_id: "t1".into(),
+                content: "a.txt".into(),
+                is_error: false,
+            }],
+        },
+        hotl_types::Item::Assistant {
+            blocks: vec![json!({"type":"text","text":"One file."})],
+            model: None,
+        },
+    ]
+}
+
+async fn connect(
+    factory: acp::SessionFactory,
+    info: acp::ServerInfo,
+) -> (
+    impl AsyncWriteExt + Unpin,
+    tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
+) {
+    let (client, server) = tokio::io::duplex(256 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(sread, swrite, factory, info, None));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init_params()}),
+    )
+    .await;
+    read_until_id(&mut lines, 1).await;
+    (cwrite, lines)
+}
+
+async fn frames_through_reply(
+    lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
+    id: u64,
+) -> (Vec<Value>, Value) {
+    let mut before = Vec::new();
+    loop {
+        let m = next_raw(lines).await;
+        if m["id"] == json!(id) {
+            return (before, m);
+        }
+        before.push(m);
+    }
+}
+
+fn session_updates(frames: &[Value]) -> Vec<&Value> {
+    frames
+        .iter()
+        .filter(|m| m["method"] == "session/update")
+        .map(|m| &m["params"]["update"])
+        .filter(|u| u.get("sessionUpdate").is_some())
+        .collect()
+}
+
+#[tokio::test]
+async fn new_requires_absolute_cwd() {
+    let (mut w, mut lines) = connect(scripted_factory(), server_info()).await;
+    let missing = std::env::temp_dir().join("hotl-no-such-dir-0081");
+    let bad = [
+        json!({"cwd": "rel", "mcpServers": []}),
+        json!({"cwd": missing, "mcpServers": []}),
+        json!({"mcpServers": []}),
+        json!({"cwd": std::env::temp_dir(), "mcpServers": "x"}),
+    ];
+    for (i, params) in bad.into_iter().enumerate() {
+        let id = 10 + i as u64;
+        send(
+            &mut w,
+            json!({"jsonrpc":"2.0","id":id,"method":"session/new","params":params}),
+        )
+        .await;
+        let r = read_until_id(&mut lines, id).await;
+        assert_eq!(r["error"]["code"], -32602, "{r}");
+    }
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":20,"method":"session/new","params":{
+            "cwd": std::env::temp_dir(),
+            "mcpServers": [{"name": "fs", "command": "/bin/echo", "args": [], "env": []}]
+        }}),
+    )
+    .await;
+    let r = read_until_id(&mut lines, 20).await;
+    assert!(r["result"]["sessionId"].is_string(), "{r}");
+    assert_eq!(r["result"]["modes"]["currentModeId"], "ask", "{r}");
+    assert_eq!(
+        r["result"]["modes"]["availableModes"][1],
+        json!({"id": "dontask", "name": "Don't ask", "description": "Deny anything that would ask"})
+    );
+}
+
+#[tokio::test]
+async fn a_plain_client_gets_no_hotl_meta_on_open() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut w) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}),
+    )
+    .await;
+    read_until_id(&mut lines, 1).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
+    )
+    .await;
+    let r = read_until_id(&mut lines, 2).await;
+    assert!(r["result"].get("_meta").is_none(), "{r}");
+    assert!(r["result"]["modes"].is_object(), "{r}");
+}
+
+#[tokio::test]
+async fn load_replays_before_it_replies() {
+    let (mut w, mut lines) = connect(history_factory(finished_turn(), vec![]), server_info()).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/load",
+               "params":{"sessionId":"S1","cwd":std::env::temp_dir(),"mcpServers":[]}}),
+    )
+    .await;
+    let (before, reply) = frames_through_reply(&mut lines, 2).await;
+    assert!(reply["result"].get("sessionId").is_none(), "{reply}");
+    assert_eq!(reply["result"]["modes"]["currentModeId"], "ask");
+    for m in &before {
+        assert_eq!(m["params"]["sessionId"], "S1", "{m}");
+    }
+    let kinds: Vec<&str> = session_updates(&before)
+        .iter()
+        .map(|u| u["sessionUpdate"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "user_message_chunk",
+            "agent_message_chunk",
+            "tool_call",
+            "agent_message_chunk"
+        ]
+    );
+    let tool = session_updates(&before)[2];
+    assert_eq!(tool["toolCallId"], "t1");
+    assert_eq!(tool["status"], "completed");
+    assert_eq!(tool["kind"], "execute");
+    assert_eq!(tool["content"][0]["content"]["text"], "a.txt");
+}
+
+#[tokio::test]
+async fn load_of_a_cut_off_tool_marks_it_failed_then_continues() {
+    let cut_off = vec![
+        hotl_types::Item::User {
+            text: "edit it".into(),
+            synthetic: None,
+            images: Vec::new(),
+        },
+        hotl_types::Item::Assistant {
+            blocks: vec![json!({"type":"tool_use","id":"t7","name":"edit","input":{}})],
+            model: None,
+        },
+    ];
+    let (mut w, mut lines) = connect(
+        history_factory(cut_off, vec![ScriptedProvider::text_reply("CONTINUED")]),
+        server_info(),
+    )
+    .await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/load",
+               "params":{"sessionId":"S1","cwd":std::env::temp_dir(),"mcpServers":[]}}),
+    )
+    .await;
+    let (before, _reply) = frames_through_reply(&mut lines, 2).await;
+    assert!(
+        !before
+            .iter()
+            .any(|m| m["params"]["update"]["type"] == "text_delta"),
+        "nothing continues before the reply: {before:?}"
+    );
+    let updates = session_updates(&before);
+    let last = updates.last().expect("replayed updates");
+    assert_eq!(last["sessionUpdate"], "tool_call");
+    assert_eq!(last["toolCallId"], "t7");
+    assert_eq!(last["status"], "failed");
+    let text = next_matching(&mut lines, |m| {
+        m["params"]["update"]["type"] == "text_delta"
+    })
+    .await;
+    assert_eq!(text["params"]["update"]["text"], "CONTINUED");
+}
+
+#[tokio::test]
+async fn resume_does_not_replay() {
+    let (mut w, mut lines) = connect(history_factory(finished_turn(), vec![]), server_info()).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/resume",
+               "params":{"sessionId":"S1","cwd":std::env::temp_dir()}}),
+    )
+    .await;
+    let (before, reply) = frames_through_reply(&mut lines, 2).await;
+    assert!(before.is_empty(), "{before:?}");
+    assert_eq!(reply["result"]["modes"]["currentModeId"], "ask", "{reply}");
+    assert!(open_of(&reply).is_object(), "{reply}");
+}
+
+#[tokio::test]
+async fn load_rejects_the_old_fork_flag() {
+    let (mut w, mut lines) = connect(scripted_factory(), server_info()).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/load",
+               "params":{"sessionId":"S1","cwd":std::env::temp_dir(),"fork":true}}),
+    )
+    .await;
+    let r = read_until_id(&mut lines, 2).await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("_hotl/session/fork"),
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn open_updates_follow_the_reply_in_order() {
+    let info = acp::ServerInfo {
+        skills: vec![acp::SkillInfo {
+            name: "run".into(),
+            description: "launch the app".into(),
+        }],
+        workflows: vec![acp::WorkflowInfo {
+            name: "review".into(),
+            description: "review then verify".into(),
+        }],
+        ..server_info()
+    };
+    let (mut w, mut lines) = connect(inherited_state_factory(None), info).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/resume",
+               "params":{"sessionId":"S1","cwd":std::env::temp_dir()}}),
+    )
+    .await;
+    read_until_id(&mut lines, 2).await;
+    let mut seen = Vec::new();
+    while seen.len() < 3 {
+        let m = next_raw(&mut lines).await;
+        if m["params"]["update"].get("sessionUpdate").is_some() {
+            seen.push(m["params"]["update"].clone());
+        }
+    }
+    assert_eq!(seen[0]["sessionUpdate"], "available_commands_update");
+    assert_eq!(
+        seen[0]["availableCommands"],
+        json!([
+            {"name": "run", "description": "launch the app", "input": {"hint": "optional arguments"}},
+            {"name": "review", "description": "review then verify", "input": {"hint": "optional arguments"}}
+        ])
+    );
+    assert_eq!(seen[1]["sessionUpdate"], "plan");
+    assert_eq!(seen[1]["entries"][0]["content"], "wire the gate");
+    assert_eq!(seen[2]["sessionUpdate"], "usage_update");
+    assert!(seen[2]["used"].as_u64().unwrap() > 0);
+    assert_eq!(seen[2]["size"], 200_000);
+}
+
+fn seed_sessions(dir: &std::path::Path, cwd: &str, count: usize, first_secs: u64) -> Vec<String> {
+    let mut ids = Vec::new();
+    for i in 0..count {
+        let path = {
+            let mut log = SessionLog::create(dir, "m", None, Masker::empty(), 0).unwrap();
+            log.append(
+                &hotl_types::EntryPayload::CwdSet {
+                    path: cwd.to_string(),
+                },
+                1,
+            )
+            .unwrap();
+            ids.push(log.session_id.clone());
+            log.path().to_path_buf()
+        };
+        let when =
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(first_secs + i as u64 * 10);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+    ids
+}
+
+#[tokio::test]
+async fn list_pages_newest_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = seed_sessions(dir.path(), "/work/a", 52, 1_700_000_000);
+    let b = seed_sessions(dir.path(), "/work/b", 1, 1_800_000_000);
+    SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).unwrap();
+    let info = acp::ServerInfo {
+        sessions_dir: Some(dir.path().to_path_buf()),
+        ..server_info()
+    };
+    let (mut w, mut lines) = connect(scripted_factory(), info).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/list","params":{"cwd":"/work/a"}}),
+    )
+    .await;
+    let page = read_until_id(&mut lines, 2).await;
+    let sessions = page["result"]["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 50, "{page}");
+    assert_eq!(sessions[0]["sessionId"], a[51].as_str());
+    assert_eq!(sessions[0]["cwd"], "/work/a");
+    assert_eq!(sessions[0]["updatedAt"], "2023-11-14T22:21:50Z");
+    assert_eq!(sessions[49]["sessionId"], a[2].as_str());
+    let cursor = page["result"]["nextCursor"].as_str().unwrap().to_string();
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/list",
+               "params":{"cwd":"/work/a","cursor":cursor}}),
+    )
+    .await;
+    let rest = read_until_id(&mut lines, 3).await;
+    let ids: Vec<&str> = rest["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["sessionId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [a[1].as_str(), a[0].as_str()]);
+    assert!(rest["result"].get("nextCursor").is_none(), "{rest}");
+
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/list","params":{}}),
+    )
+    .await;
+    let all = read_until_id(&mut lines, 4).await;
+    assert_eq!(all["result"]["sessions"][0]["sessionId"], b[0].as_str());
+    assert_eq!(all["result"]["sessions"].as_array().unwrap().len(), 50);
+
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":5,"method":"session/list","params":{"cursor":"nope"}}),
+    )
+    .await;
+    let bad = read_until_id(&mut lines, 5).await;
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
+}
+
+#[tokio::test]
+async fn close_is_idempotent() {
+    let (mut w, mut lines) = connect(scripted_factory(), server_info()).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 2).await;
+    let sid = opened["result"]["sessionId"].clone();
+    for (id, target) in [(3, sid.clone()), (4, sid), (5, json!("no-such-session"))] {
+        send(
+            &mut w,
+            json!({"jsonrpc":"2.0","id":id,"method":"session/close","params":{"sessionId":target}}),
+        )
+        .await;
+        let r = read_until_id(&mut lines, id).await;
+        assert_eq!(r["result"], json!({}), "{r}");
+    }
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":6,"method":"session/prompt","params":{"text":"hi"}}),
+    )
+    .await;
+    let r = read_until_id(&mut lines, 6).await;
+    assert_eq!(
+        r["error"]["code"], -32002,
+        "the closed session is gone: {r}"
+    );
+}
+
+#[tokio::test]
+async fn fork_returns_a_new_session_and_does_not_continue() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (mut w, mut lines) = connect(interrupted_factory(seen.clone()), server_info()).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"_hotl/session/fork",
+               "params":{"sessionId":"S1","cwd":std::env::temp_dir()}}),
+    )
+    .await;
+    let (before, reply) = frames_through_reply(&mut lines, 2).await;
+    assert!(before.is_empty(), "a fork replays nothing: {before:?}");
+    let sid = reply["result"]["sessionId"].as_str().unwrap();
+    assert_ne!(sid, "S1");
+    assert_eq!(reply["result"]["modes"]["currentModeId"], "auto");
+    assert_eq!(seen.lock().unwrap().clone(), ["fork:S1:All"]);
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"text":"go"}}),
+    )
+    .await;
+    let text = next_matching(&mut lines, |m| {
+        m["params"]["update"]["type"] == "text_delta"
+    })
+    .await;
+    assert_eq!(text["params"]["update"]["text"], "FIRST");
+    assert_eq!(text["params"]["sessionId"], sid);
 }

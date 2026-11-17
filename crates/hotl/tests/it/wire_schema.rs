@@ -22,6 +22,7 @@ fn server_info() -> acp::ServerInfo {
         stream_idle_secs: 90,
         model_resolver: None,
         key_available: true,
+        sessions_dir: None,
         model: "m".into(),
     }
 }
