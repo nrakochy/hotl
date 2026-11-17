@@ -29,7 +29,10 @@ pub const JOURNAL_FILE: &str = "journal.jsonl";
 /// A digest of the plan as written. Changing any part of it — a phase title,
 /// an agent's schema, the shape — makes an old run's journal inapplicable.
 pub fn recipe_sha256(plan: &Plan) -> String {
-    let canonical = serde_json::to_vec(plan).unwrap_or_default();
+    let canonical = serde_json::to_value(plan)
+        .map(hotl_types::sort_keys)
+        .and_then(|v| serde_json::to_vec(&v))
+        .unwrap_or_default();
     hex(&Sha256::digest(&canonical))
 }
 
@@ -43,7 +46,9 @@ pub fn content_key(phase: &str, label: &str, prompt: &str, schema: Option<&Value
         h.update(part.len().to_le_bytes());
         h.update(part.as_bytes());
     }
-    let schema = schema.map(|s| s.to_string()).unwrap_or_default();
+    let schema = schema
+        .map(|s| hotl_types::sort_keys(s.clone()).to_string())
+        .unwrap_or_default();
     h.update(schema.len().to_le_bytes());
     h.update(schema.as_bytes());
     hex(&h.finalize())
@@ -139,6 +144,16 @@ impl Journal {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_schemas_key_order_does_not_change_the_content_key() {
+        let one = json!({"type": "object", "required": ["a"]});
+        let two = json!({"required": ["a"], "type": "object"});
+        assert_eq!(
+            content_key("P", "l", "x", Some(&one)),
+            content_key("P", "l", "x", Some(&two))
+        );
+    }
 
     #[test]
     fn a_content_key_covers_every_part_and_cannot_be_confused_by_concatenation() {

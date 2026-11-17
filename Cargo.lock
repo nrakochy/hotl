@@ -1412,6 +1412,7 @@ version = "0.32.0"
 dependencies = [
  "futures-util",
  "hotl-provider",
+ "hotl-types",
  "jsonschema",
  "serde",
  "serde_json",

@@ -26,7 +26,7 @@ use acp_child::{AcpChild, AcpSpawn};
 const AGENT: &str = r#"#!/bin/sh
 log="$1"; outside="$2"; prompt_id=""
 while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9]*\),.*/\1/p')
+  id=$(printf '%s' "$line" | sed -n 's/.*[,{]"id":\([0-9]*\)[,}].*/\1/p')
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{}}}" ;;
