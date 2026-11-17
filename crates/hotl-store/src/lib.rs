@@ -153,6 +153,7 @@ pub enum EntryKind {
     /// 0065: the session's worktree. Log-only, last one wins.
     WorktreeSet,
     ColorSet,
+    CwdSet,
     Unknown,
 }
 
@@ -182,6 +183,7 @@ impl From<&EntryPayload> for EntryKind {
             EntryPayload::MemoryAppended { .. } => EntryKind::MemoryAppended,
             EntryPayload::WorktreeSet { .. } => EntryKind::WorktreeSet,
             EntryPayload::ColorSet { .. } => EntryKind::ColorSet,
+            EntryPayload::CwdSet { .. } => EntryKind::CwdSet,
             EntryPayload::Unknown => EntryKind::Unknown,
         }
     }
@@ -2016,7 +2018,9 @@ fn apply_log(
             // Log-only, last one wins (0065); the two-null tombstone clears.
             EntryPayload::WorktreeSet { path, branch } => *worktree = path.zip(branch),
             EntryPayload::ColorSet { color: c } => *color = c,
-            EntryPayload::Usage { .. } | EntryPayload::Cancelled { .. } => {}
+            EntryPayload::Usage { .. }
+            | EntryPayload::Cancelled { .. }
+            | EntryPayload::CwdSet { .. } => {}
             // `#[serde(other)]` keeps an old binary from crashing on a new
             // entry kind — but a dropped kind that *re-points* the projection
             // (the Compaction/BranchMove class) yields a silently wrong
@@ -2147,6 +2151,18 @@ pub fn session_worktree(path: &Path) -> Option<(String, String)> {
     found.flatten()
 }
 
+pub fn session_cwd(path: &Path) -> Option<String> {
+    label_in_tail(path, "\"cwd_set\"", cwd_of)
+        .or_else(|| label_by_full_scan(path, "\"cwd_set\"", cwd_of))
+}
+
+fn cwd_of(entry: Entry) -> Option<String> {
+    match entry.payload {
+        EntryPayload::CwdSet { path } => Some(path),
+        _ => None,
+    }
+}
+
 fn rename_of(entry: Entry) -> Option<String> {
     match entry.payload {
         EntryPayload::Rename { name } => Some(name),
@@ -2235,6 +2251,19 @@ pub fn list_sessions(dir: &Path) -> Vec<(String, PathBuf, std::time::SystemTime)
 mod tests {
     use super::*;
     use hotl_types::{Item, Todo, TodoStatus, ToolResultItem};
+
+    #[test]
+    fn session_cwd_is_the_last_one_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        assert_eq!(session_cwd(log.path()), None);
+        log.append(&EntryPayload::CwdSet { path: "/a".into() }, 2)
+            .unwrap();
+        log.append(&EntryPayload::CwdSet { path: "/b".into() }, 3)
+            .unwrap();
+        assert_eq!(session_cwd(log.path()).as_deref(), Some("/b"));
+        assert!(replay(log.path()).is_ok());
+    }
 
     #[test]
     fn log_appends_chain_and_masks_secrets() {

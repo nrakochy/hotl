@@ -597,6 +597,9 @@ pub enum EntryPayload {
     ColorSet {
         color: Option<String>,
     },
+    CwdSet {
+        path: String,
+    },
     #[serde(other)]
     Unknown,
 }
