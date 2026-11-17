@@ -719,6 +719,9 @@ pub enum EngineEvent {
         host: String,
         reply: oneshot::Sender<hotl_tools::net::EgressDecision>,
     },
+    TurnStarted {
+        tags: Vec<u64>,
+    },
     TurnDone {
         outcome: Outcome,
         usage: TokenUsage,
@@ -858,6 +861,7 @@ impl std::fmt::Debug for EngineEvent {
             Self::Ask { summary, .. } => write!(f, "Ask({summary})"),
             Self::Question { question, .. } => write!(f, "Question({})", question.header),
             Self::EgressAsk { host, .. } => write!(f, "EgressAsk({host})"),
+            Self::TurnStarted { tags } => write!(f, "TurnStarted({tags:?})"),
             Self::TurnDone { outcome, .. } => write!(f, "TurnDone({outcome:?})"),
             Self::TodosChanged { items } => write!(f, "TodosChanged(n={})", items.len()),
             Self::PlanPresented { nodes, .. } => write!(f, "PlanPresented(n={})", nodes.len()),
@@ -1172,6 +1176,10 @@ pub enum SessionCmd {
     Prompt {
         text: String,
         images: Vec<hotl_types::UserImage>,
+        tag: Option<u64>,
+    },
+    DropQueued {
+        reply: oneshot::Sender<Vec<u64>>,
     },
     /// A prompt whose committed item carries a provenance tag (T2: schema
     /// contract + validation-retry feedback ride in as tagged user items).
@@ -1530,7 +1538,43 @@ impl SessionHandle {
     /// A prompt carrying attached images (already validated and
     /// base64-encoded at the wire entry point).
     pub async fn prompt_with(&self, text: String, images: Vec<hotl_types::UserImage>) {
-        let _ = self.cmd.send(SessionCmd::Prompt { text, images }).await;
+        let _ = self
+            .cmd
+            .send(SessionCmd::Prompt {
+                text,
+                images,
+                tag: None,
+            })
+            .await;
+    }
+
+    pub async fn prompt_answering(
+        &self,
+        tag: u64,
+        text: String,
+        images: Vec<hotl_types::UserImage>,
+    ) {
+        let _ = self
+            .cmd
+            .send(SessionCmd::Prompt {
+                text,
+                images,
+                tag: Some(tag),
+            })
+            .await;
+    }
+
+    pub async fn drop_queued(&self) -> Vec<u64> {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .cmd
+            .send(SessionCmd::DropQueued { reply })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
     }
     /// A prompt whose committed user item carries a provenance tag (T2).
     pub async fn prompt_tagged(&self, text: String, synthetic: hotl_types::SyntheticReason) {

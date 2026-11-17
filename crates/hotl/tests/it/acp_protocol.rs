@@ -5142,6 +5142,15 @@ async fn next_matching_raw(
 type Script = Vec<Result<hotl_provider::StreamEvent, hotl_provider::ProviderError>>;
 
 fn provider_factory(provider: Arc<ScriptedProvider>, model: &'static str) -> acp::SessionFactory {
+    factory_with(provider, model, Vec::new(), None)
+}
+
+fn factory_with(
+    provider: Arc<ScriptedProvider>,
+    model: &'static str,
+    items: Vec<hotl_types::Item>,
+    goal: Option<String>,
+) -> acp::SessionFactory {
     Box::new(move |_spec| {
         let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
@@ -5162,11 +5171,11 @@ fn provider_factory(provider: Arc<ScriptedProvider>, model: &'static str) -> acp
                 system: "sys".into(),
                 cwd: std::env::temp_dir(),
                 hooks: None,
-                initial_items: Vec::new(),
+                initial_items: items.clone(),
                 initial_todos: Vec::new(),
                 initial_decisions: Vec::new(),
                 plan_files: None,
-                initial_goal: None,
+                initial_goal: goal.clone(),
                 config: EngineConfig {
                     model: model.into(),
                     max_turns: 6,
@@ -5178,7 +5187,7 @@ fn provider_factory(provider: Arc<ScriptedProvider>, model: &'static str) -> acp
             plan: false,
             default_effort: None,
             effort_schedule: None,
-            goal: None,
+            goal: goal.clone(),
             todos: Vec::new(),
             effort: None,
             previous_model: None,
@@ -5741,7 +5750,231 @@ async fn cancel_also_answers_the_queued_prompts_and_runs_none_of_them() {
 }
 
 #[tokio::test]
-async fn a_full_prompt_queue_refuses_instead_of_folding() {
+async fn prompts_past_the_engine_queue_cap_fold_and_every_id_is_answered() {
+    let mut scripts = vec![
+        ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
+        ScriptedProvider::text_reply("first"),
+    ];
+    for n in 0..70 {
+        scripts.push(ScriptedProvider::text_reply(&format!("queued {n}")));
+    }
+    let (_provider, sid, mut w, mut lines) = open_with(scripts, init_params()).await;
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "a"}])),
+    )
+    .await;
+    let ask = next_matching_raw(&mut lines, |m| m["method"] == "session/request_permission").await;
+    let last = 3 + 66;
+    for id in 4..=last {
+        send(
+            &mut w,
+            prompt_msg(
+                id,
+                &sid,
+                json!([{"type": "text", "text": format!("p{id}")}]),
+            ),
+        )
+        .await;
+    }
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"allow":true}}),
+    )
+    .await;
+    let got = stop_reasons_for(&mut lines, 3..last + 1).await;
+    assert_eq!(got.len(), 67);
+    assert!(got.values().all(|r| r == "end_turn"), "{got:?}");
+}
+
+#[tokio::test]
+async fn a_job_notice_turn_answers_no_prompt() {
+    let (_provider, sid, mut w, mut lines) = open_with(
+        vec![
+            ScriptedProvider::tool_call(
+                "bg",
+                "bash",
+                json!({"command": "sleep 0.2", "background": true}),
+            ),
+            ScriptedProvider::text_reply("three"),
+            ScriptedProvider::tool_call("n1", "bash", json!({"command": "echo noticed"})),
+            ScriptedProvider::text_reply("noticed"),
+            ScriptedProvider::text_reply("four"),
+            ScriptedProvider::text_reply("five"),
+        ],
+        init_params(),
+    )
+    .await;
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "p3"}])),
+    )
+    .await;
+    let (_, three) = answer_through_reply(&mut w, &mut lines, 3).await;
+    assert_eq!(
+        three["result"]["_meta"]["hotl.dev/turn"]["outcome"]["text"],
+        "three"
+    );
+    let ask = loop {
+        let m = next_raw(&mut lines).await;
+        if m["method"] == "session/request_permission" {
+            break m;
+        }
+    };
+    send(
+        &mut w,
+        prompt_msg(4, &sid, json!([{"type": "text", "text": "p4"}])),
+    )
+    .await;
+    send(
+        &mut w,
+        prompt_msg(5, &sid, json!([{"type": "text", "text": "p5"}])),
+    )
+    .await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"allow":true}}),
+    )
+    .await;
+    let (_, four) = answer_through_reply(&mut w, &mut lines, 4).await;
+    assert_eq!(
+        four["result"]["_meta"]["hotl.dev/turn"]["outcome"]["text"], "four",
+        "{four}"
+    );
+    let (_, five) = answer_through_reply(&mut w, &mut lines, 5).await;
+    assert_eq!(
+        five["result"]["_meta"]["hotl.dev/turn"]["outcome"]["text"], "five",
+        "{five}"
+    );
+}
+
+#[tokio::test]
+async fn a_queued_prompt_outranks_the_goal_loop() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
+        ScriptedProvider::text_reply("first"),
+        ScriptedProvider::text_reply("second"),
+        ScriptedProvider::text_reply("VERDICT: met\nREASON: done"),
+        ScriptedProvider::text_reply("VERDICT: met\nREASON: done"),
+        ScriptedProvider::text_reply("VERDICT: met\nREASON: done"),
+    ]));
+    let (mut w, mut lines) = connect_caps(
+        factory_with(provider, "m", Vec::new(), Some("ship it".into())),
+        init_params(),
+    )
+    .await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 2).await;
+    let sid = opened["result"]["sessionId"].as_str().unwrap().to_string();
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "a"}])),
+    )
+    .await;
+    let ask = next_matching_raw(&mut lines, |m| m["method"] == "session/request_permission").await;
+    send(
+        &mut w,
+        prompt_msg(4, &sid, json!([{"type": "text", "text": "b"}])),
+    )
+    .await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"allow":true}}),
+    )
+    .await;
+    let (before, first) = answer_through_reply(&mut w, &mut lines, 3).await;
+    assert_eq!(
+        first["result"]["_meta"]["hotl.dev/turn"]["outcome"]["text"],
+        "first"
+    );
+    assert!(
+        before
+            .iter()
+            .all(|m| m["params"]["update"]["type"] != "goal_evaluating"),
+        "the goal ran before the queued prompt: {before:?}"
+    );
+    let (_, second) = answer_through_reply(&mut w, &mut lines, 4).await;
+    assert_eq!(second["result"]["stopReason"], "end_turn", "{second}");
+}
+
+#[tokio::test]
+async fn a_prompt_during_the_resume_continuation_gets_its_own_reply() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
+        ScriptedProvider::text_reply("continued"),
+        ScriptedProvider::text_reply("mine"),
+    ]));
+    let (mut w, mut lines) = connect_caps(
+        factory_with(
+            provider,
+            "m",
+            vec![hotl_types::Item::User {
+                text: "unanswered".into(),
+                synthetic: None,
+                images: Vec::new(),
+            }],
+            None,
+        ),
+        init_params(),
+    )
+    .await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":"S1","cwd":std::env::temp_dir()}}),
+    )
+    .await;
+    let ask = next_matching_raw(&mut lines, |m| m["method"] == "session/request_permission").await;
+    send(
+        &mut w,
+        prompt_msg(3, "S1", json!([{"type": "text", "text": "p3"}])),
+    )
+    .await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"allow":true}}),
+    )
+    .await;
+    let (_, reply) = answer_through_reply(&mut w, &mut lines, 3).await;
+    assert_eq!(
+        reply["result"]["_meta"]["hotl.dev/turn"]["outcome"]["text"], "mine",
+        "{reply}"
+    );
+}
+
+#[tokio::test]
+async fn a_prompt_after_a_cancel_completes_normally() {
+    let (_provider, sid, mut w, mut lines) = open_with(
+        vec![hanging(), ScriptedProvider::text_reply("fine")],
+        init_params(),
+    )
+    .await;
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "a"}])),
+    )
+    .await;
+    wait_for_text(&mut lines).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId": sid}}),
+    )
+    .await;
+    send(
+        &mut w,
+        prompt_msg(4, &sid, json!([{"type": "text", "text": "b"}])),
+    )
+    .await;
+    let got = stop_reasons_for(&mut lines, 3..5).await;
+    assert_eq!(got[&3], "cancelled");
+    assert_eq!(got[&4], "end_turn");
+}
+
+#[tokio::test]
+async fn closing_the_session_answers_its_open_prompt_cancelled() {
     let (_provider, sid, mut w, mut lines) = open_with(vec![hanging()], init_params()).await;
     send(
         &mut w,
@@ -5749,30 +5982,13 @@ async fn a_full_prompt_queue_refuses_instead_of_folding() {
     )
     .await;
     wait_for_text(&mut lines).await;
-    let last = 4 + acp::PROMPT_QUEUE_MAX as u64;
-    for id in 4..=last {
-        send(
-            &mut w,
-            prompt_msg(id, &sid, json!([{"type": "text", "text": "more"}])),
-        )
-        .await;
-    }
-    let refused = read_until_id(&mut lines, last).await;
-    assert_eq!(refused["error"]["code"], -32603, "{refused}");
-    assert!(
-        refused["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("too many queued prompts"),
-        "{refused}"
-    );
     send(
         &mut w,
-        json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId": sid}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"session/close","params":{"sessionId": sid}}),
     )
     .await;
-    let got = stop_reasons_for(&mut lines, 3..last).await;
-    assert!(got.values().all(|r| r == "cancelled"), "{got:?}");
+    let got = stop_reasons_for(&mut lines, 3..4).await;
+    assert_eq!(got[&3], "cancelled");
 }
 
 #[tokio::test]

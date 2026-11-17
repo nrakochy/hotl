@@ -674,9 +674,6 @@ pub(crate) struct SharedDeps {
     /// Session-scoped, not per-turn: the cap exists so an unattended session
     /// cannot run forever, and a fresh turn is not a fresh budget.
     tool_calls: AtomicU64,
-    /// Session spend in micro-dollars, against `config.max_cost_usd`.
-    /// Integer so the running total is an atomic; the price of one turn is
-    /// far above a millionth of a dollar, so nothing meaningful rounds away.
     pub(crate) meter: crate::Meter,
     /// Which budget thresholds have already been announced (bit 0 = 50%,
     /// 1 = 80%, 2 = 100%), so each fires once per session.
@@ -1421,7 +1418,7 @@ pub(crate) async fn run(
             }
         };
         match cmd {
-            SessionCmd::Prompt { text, images } => {
+            SessionCmd::Prompt { text, images, tag } => {
                 running = admit_prompt(
                     &shared,
                     &mut log,
@@ -1434,6 +1431,7 @@ pub(crate) async fn run(
                         images,
                         synthetic: None,
                         output_format: None,
+                        tags: tag.into_iter().collect(),
                     },
                     &cmd_tx,
                     &events,
@@ -1459,6 +1457,7 @@ pub(crate) async fn run(
                         images: Vec::new(),
                         synthetic: Some(synthetic),
                         output_format,
+                        tags: Vec::new(),
                     },
                     &cmd_tx,
                     &events,
@@ -1467,8 +1466,22 @@ pub(crate) async fn run(
                 )
                 .await;
             }
+            SessionCmd::DropQueued { reply } => {
+                let mut dropped = Vec::new();
+                queue.retain(|q| {
+                    if q.tags.is_empty() {
+                        return true;
+                    }
+                    dropped.extend(q.tags.iter().copied());
+                    false
+                });
+                let _ = reply.send(dropped);
+            }
             SessionCmd::Continue => {
                 if !running && crate::needs_continuation(head.items()) {
+                    let _ = events
+                        .send(EngineEvent::TurnStarted { tags: Vec::new() })
+                        .await;
                     spawn_turn(&shared, &cmd_tx, &events, &current_turn, None, None);
                     running = true;
                 }
@@ -1533,6 +1546,7 @@ pub(crate) async fn run(
                             images: Vec::new(),
                             synthetic: Some(synthetic),
                             output_format: None,
+                            tags: Vec::new(),
                         },
                         &cmd_tx,
                         &events,
@@ -2800,11 +2814,13 @@ async fn on_turn_finished(
                                     images: Vec::new(),
                                     synthetic: Some(SyntheticReason::GoalGuidance),
                                     output_format: None,
+                                    tags: Vec::new(),
                                 },
                                 ctx.cmd_tx,
                                 ctx.events,
                                 ctx.current_turn,
                                 ctx.steers_held,
+                                false,
                             )
                             .await;
                             return;
@@ -3087,6 +3103,7 @@ async fn end_turn(
                 events,
                 current_turn,
                 steers_held,
+                true,
             )
             .await
         }
@@ -4044,6 +4061,7 @@ struct QueuedPrompt {
     synthetic: Option<SyntheticReason>,
     /// 0073 D8: the retry turn's schema; a folded prompt inherits the entry's.
     output_format: Option<Arc<serde_json::Value>>,
+    tags: Vec<u64>,
 }
 
 /// Start a turn now, or queue the prompt if one is running (one-at-a-time
@@ -4087,6 +4105,7 @@ async fn admit_prompt(
                     ));
                 }
                 fold_into(&mut last.text, &text, HELD_BYTES_MAX);
+                last.tags.extend(prompt.tags);
             }
             _ => queue.push_back(prompt),
         }
@@ -4103,6 +4122,7 @@ async fn admit_prompt(
         events,
         current_turn,
         steers_held,
+        true,
     )
     .await
 }
@@ -4139,7 +4159,15 @@ async fn start_turn(
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
     steers_held: bool,
+    announce: bool,
 ) -> bool {
+    if announce {
+        let _ = events
+            .send(EngineEvent::TurnStarted {
+                tags: prompt.tags.clone(),
+            })
+            .await;
+    }
     // Captured before `text` moves into the committed item — `UserPromptSubmit`
     // hooks (tier-1 gap #7) see the prompt exactly as submitted. Text only:
     // images are not exposed to hooks (v1) — the inline `[Image #N]` markers

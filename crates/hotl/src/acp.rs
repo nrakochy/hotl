@@ -8,7 +8,7 @@
 //! (Tier-1 stable, not a side-channel); permission asks are
 //! `session/request_permission` round-trips to the client.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
@@ -156,29 +156,34 @@ fn question_answer_from_result(result: Option<&Value>) -> hotl_types::QuestionAn
     hotl_types::QuestionAnswer::NoHuman
 }
 
-/// JSON-RPC ids of in-flight prompt requests, answered in order on TurnDone
-/// (the engine queues overlapping prompts and finishes them FIFO).
-type PendingPrompt = Arc<std::sync::Mutex<PromptQueue>>;
-
-pub const PROMPT_QUEUE_MAX: usize = 64;
+/// JSON-RPC ids of in-flight prompt requests, keyed by the tag the engine
+/// reports back in `TurnStarted`, and answered when that turn's `TurnDone`
+/// arrives.
+type PendingPrompt = Arc<std::sync::Mutex<PromptBook>>;
 
 #[derive(Default)]
-struct PromptQueue {
-    running: VecDeque<Value>,
-    waiting: VecDeque<WaitingPrompt>,
-    cancelled: bool,
+struct PromptBook {
+    next_tag: u64,
+    ids: HashMap<u64, Value>,
+    current: Vec<u64>,
+    cancelled: std::collections::HashSet<u64>,
 }
 
-struct WaitingPrompt {
-    id: Value,
-    text: String,
-    images: Vec<hotl_types::UserImage>,
-}
-
-fn lock_prompts(queue: &PendingPrompt) -> std::sync::MutexGuard<'_, PromptQueue> {
-    queue
-        .lock()
+fn lock_prompts(book: &PendingPrompt) -> std::sync::MutexGuard<'_, PromptBook> {
+    book.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+async fn reply_cancelled(writer: &Writer, id: Value) {
+    reply_ok(
+        writer,
+        id,
+        to_json(&PromptResponse {
+            stop_reason: crate::acp_types::StopReason::Cancelled,
+            meta: None,
+        }),
+    )
+    .await;
 }
 
 /// How much of a forked-from session's projection the fork keeps.
@@ -709,7 +714,8 @@ async fn handle_request(
                 &info.fallback_models,
                 client_caps.ext,
                 info.context_window,
-            );
+            )
+            .await;
             if let Some(state) = session.as_mut() {
                 state.mcp = mcp;
             }
@@ -869,12 +875,14 @@ async fn handle_request(
                 };
             if session.as_ref().is_some_and(|s| s.id == request.session_id) {
                 retire_session(
+                    writer,
                     session,
                     pending,
                     pending_questions,
                     pending_egress,
                     pending_prompt,
-                );
+                )
+                .await;
             }
             reply_ok(writer, id, json!({})).await;
         }
@@ -927,37 +935,14 @@ async fn handle_request(
                     .await
                 }
             };
-            let start = {
-                let mut queue = lock_prompts(pending_prompt);
-                if queue.running.is_empty() {
-                    queue.running.push_back(id.clone());
-                    Some(true)
-                } else if queue.waiting.len() >= PROMPT_QUEUE_MAX {
-                    Some(false)
-                } else {
-                    queue.waiting.push_back(WaitingPrompt {
-                        id: id.clone(),
-                        text: text.clone(),
-                        images: images.clone(),
-                    });
-                    None
-                }
+            let tag = {
+                let mut book = lock_prompts(pending_prompt);
+                book.next_tag += 1;
+                let tag = book.next_tag;
+                book.ids.insert(tag, id);
+                tag
             };
-            match start {
-                Some(true) => state.handle.prompt_with(text, images).await,
-                Some(false) => {
-                    reply_err(
-                        writer,
-                        id,
-                        codes::INTERNAL,
-                        &format!(
-                            "too many queued prompts (the limit is {PROMPT_QUEUE_MAX}); wait for a turn to end"
-                        ),
-                    )
-                    .await
-                }
-                None => {}
-            }
+            state.handle.prompt_answering(tag, text, images).await;
         }
         "session/rename" => {
             let Some(state) = session.as_ref() else {
@@ -1448,10 +1433,15 @@ async fn handle_request(
             if request.session_id.is_some_and(|s| s != state.id) {
                 return;
             }
+            let dropped_tags = state.handle.drop_queued().await;
             let dropped: Vec<Value> = {
-                let mut queue = lock_prompts(pending_prompt);
-                queue.cancelled = !queue.running.is_empty();
-                queue.waiting.drain(..).map(|w| w.id).collect()
+                let mut book = lock_prompts(pending_prompt);
+                let running = book.current.clone();
+                book.cancelled.extend(running);
+                dropped_tags
+                    .iter()
+                    .filter_map(|tag| book.ids.remove(tag))
+                    .collect()
             };
             state.handle.interrupt();
             for (_, reply) in pending
@@ -1476,15 +1466,7 @@ async fn handle_request(
                 let _ = reply.send(hotl_tools::net::EgressDecision::NoAnswer);
             }
             for prompt_id in dropped {
-                reply_ok(
-                    writer,
-                    prompt_id,
-                    to_json(&PromptResponse {
-                        stop_reason: crate::acp_types::StopReason::Cancelled,
-                        meta: None,
-                    }),
-                )
-                .await;
+                reply_cancelled(writer, prompt_id).await;
             }
         }
         // Re-read `config.toml` and rebuild the engine behind this connection,
@@ -1590,7 +1572,8 @@ async fn handle_request(
                         &info.fallback_models,
                         client_caps.ext,
                         info.context_window,
-                    );
+                    )
+                    .await;
                     if let Some(state) = session.as_mut() {
                         state.mcp = mcp;
                     }
@@ -2169,7 +2152,8 @@ fn keep_spec(msg: &Value) -> Result<KeepSpec, String> {
     }
 }
 
-fn retire_session(
+async fn retire_session(
+    writer: &Writer,
     session: &mut Option<SessionState>,
     pending: &Pending,
     pending_questions: &PendingQuestions,
@@ -2193,7 +2177,17 @@ fn retire_session(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
-    *lock_prompts(pending_prompt) = PromptQueue::default();
+    let outstanding: Vec<Value> = {
+        let mut book = lock_prompts(pending_prompt);
+        let mut ids: Vec<(u64, Value)> = std::mem::take(&mut book.ids).into_iter().collect();
+        ids.sort_by_key(|(tag, _)| *tag);
+        book.current.clear();
+        book.cancelled.clear();
+        ids.into_iter().map(|(_, id)| id).collect()
+    };
+    for id in outstanding {
+        reply_cancelled(writer, id).await;
+    }
 }
 
 fn lock_config(config: &SharedConfig) -> std::sync::MutexGuard<'_, crate::acp_map::ConfigState> {
@@ -2213,7 +2207,7 @@ fn lock_config(config: &SharedConfig) -> std::sync::MutexGuard<'_, crate::acp_ma
 /// Shared by `session/new`, `session/load` and `session/reload_config` so the
 /// three can never drift on what "retire the old session" means.
 #[allow(clippy::too_many_arguments)]
-fn install_session(
+async fn install_session(
     open: SessionOpen,
     id: String,
     cwd: std::path::PathBuf,
@@ -2231,12 +2225,14 @@ fn install_session(
     context_window: u64,
 ) {
     retire_session(
+        writer,
         session,
         pending,
         pending_questions,
         pending_egress,
         pending_prompt,
-    );
+    )
+    .await;
     let config = Arc::new(std::sync::Mutex::new(crate::acp_map::ConfigState {
         model: open.model.clone().unwrap_or_else(|| model.to_string()),
         plan: open.plan,
@@ -2292,7 +2288,6 @@ fn start_session(
     let drain_config = Arc::clone(&config);
     let link = EngineLink {
         meter: handle.meter(),
-        commands: handle.commands(),
     };
     let (go, held) = oneshot::channel::<()>();
     let drain = tokio::spawn(async move {
@@ -2328,7 +2323,6 @@ fn start_session(
 
 struct EngineLink {
     meter: hotl_engine::Meter,
-    commands: mpsc::WeakSender<hotl_engine::SessionCmd>,
 }
 
 /// Bounds one coalesced delta line's size; a burst that large is already a
@@ -2573,44 +2567,27 @@ async fn drain_events(
                     }),
                 )
                 .await;
-                let (prompt_id, cancelled, next) = {
-                    let mut queue = lock_prompts(&pending_prompt);
-                    let id = queue.running.pop_front();
-                    let cancelled = std::mem::take(&mut queue.cancelled);
-                    let next = match queue.running.is_empty() {
-                        true => queue.waiting.pop_front(),
-                        false => None,
-                    };
-                    if let Some(w) = &next {
-                        queue.running.push_back(w.id.clone());
-                    }
-                    (id, cancelled, next)
+                let answered: Vec<(Value, bool)> = {
+                    let mut book = lock_prompts(&pending_prompt);
+                    let tags = std::mem::take(&mut book.current);
+                    tags.into_iter()
+                        .filter_map(|tag| {
+                            let cancelled = book.cancelled.remove(&tag);
+                            book.ids.remove(&tag).map(|id| (id, cancelled))
+                        })
+                        .collect()
                 };
-                if let Some(id) = prompt_id {
-                    reply_turn_end(
-                        &writer,
-                        id,
-                        &outcome,
-                        cancelled,
-                        ext,
-                        TurnMeta {
-                            outcome: crate::wire::OutcomeFrame::of(&outcome),
-                            usage: frame,
-                            mispredictions: misses,
-                        },
-                    )
-                    .await;
+                let turn = TurnMeta {
+                    outcome: crate::wire::OutcomeFrame::of(&outcome),
+                    usage: frame,
+                    mispredictions: misses,
+                };
+                for (id, cancelled) in answered {
+                    reply_turn_end(&writer, id, &outcome, cancelled, ext, turn.clone()).await;
                 }
-                if let Some(next) = next {
-                    if let Some(tx) = link.commands.upgrade() {
-                        let _ = tx
-                            .send(hotl_engine::SessionCmd::Prompt {
-                                text: next.text,
-                                images: next.images,
-                            })
-                            .await;
-                    }
-                }
+            }
+            EngineEvent::TurnStarted { tags } => {
+                lock_prompts(&pending_prompt).current = tags;
             }
             other => {
                 if let Some(update) = update_payload(&other) {
@@ -2759,7 +2736,6 @@ mod drain_tests {
             })),
             EngineLink {
                 meter: hotl_engine::Meter::default(),
-                commands: mpsc::channel(1).0.downgrade(),
             },
         )
         .await;
@@ -2779,13 +2755,16 @@ mod drain_tests {
 
     #[tokio::test]
     async fn a_turn_cancelled_by_the_client_answers_cancelled_whatever_its_outcome() {
-        let queue = PendingPrompt::default();
+        let book = PendingPrompt::default();
         {
-            let mut q = lock_prompts(&queue);
-            q.running.push_back(json!(7));
-            q.cancelled = true;
+            let mut b = lock_prompts(&book);
+            b.ids.insert(1, json!(7));
+            b.cancelled.insert(1);
         }
         let (tx, rx) = mpsc::channel(4);
+        tx.send(EngineEvent::TurnStarted { tags: vec![1] })
+            .await
+            .unwrap();
         tx.send(EngineEvent::TurnDone {
             outcome: Outcome::Error {
                 message: "stream aborted".into(),
@@ -2796,17 +2775,41 @@ mod drain_tests {
         .await
         .unwrap();
         drop(tx);
-        let lines = drain_with_queue(rx, queue.clone()).await;
+        let lines = drain_with_queue(rx, book.clone()).await;
         let reply: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
         assert_eq!(
             reply,
             json!({"jsonrpc": "2.0", "id": 7, "result": {"stopReason": "cancelled"}})
         );
-        assert!(!lock_prompts(&queue).cancelled, "the flag is spent");
+        let b = lock_prompts(&book);
+        assert!(b.cancelled.is_empty() && b.ids.is_empty());
     }
 
-    /// 0033 Task 2: a burst already sitting in the queue folds into ONE
-    /// frame — one JSON line, one flush, one client parse.
+    #[tokio::test]
+    async fn a_turn_that_names_no_prompt_answers_nobody() {
+        let book = PendingPrompt::default();
+        lock_prompts(&book).ids.insert(1, json!(7));
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(EngineEvent::TurnStarted { tags: Vec::new() })
+            .await
+            .unwrap();
+        tx.send(EngineEvent::TurnDone {
+            outcome: Outcome::Done { text: "x".into() },
+            usage: TokenUsage::default(),
+            mispredictions: 0,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let lines = drain_with_queue(rx, book.clone()).await;
+        assert!(lines.iter().all(|l| !l.contains("\"id\":7")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("usage_update")),
+            "{lines:?}"
+        );
+        assert_eq!(lock_prompts(&book).ids.len(), 1);
+    }
+
     #[tokio::test]
     async fn queued_text_deltas_coalesce_into_one_update() {
         let (tx, rx) = mpsc::channel(64);

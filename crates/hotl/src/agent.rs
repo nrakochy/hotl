@@ -4110,6 +4110,7 @@ impl Surface {
             | EngineEvent::ToolInputProgress { .. }
             | EngineEvent::Compacting { .. }
             | EngineEvent::ToolQueued { .. }
+            | EngineEvent::TurnStarted { .. }
             | EngineEvent::GoalEvaluating { .. } => {}
             EngineEvent::ToolDenied { .. } => eprintln!("  (denied)"),
             EngineEvent::ToolAutoAllowed { name, rule, .. } => {
@@ -4426,6 +4427,7 @@ impl Surface {
                 self.turn_running = false;
                 event
             }
+            EngineEvent::TurnStarted { .. } => return,
             other => other,
         };
         println!("{}", crate::wire::json_frame(&event, &self.model));

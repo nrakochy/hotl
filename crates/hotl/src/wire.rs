@@ -612,6 +612,7 @@ impl Frame {
             // `EgressAsk` is a round-trip like `Ask`, and the JSON stream is
             // the headless surface, which has no human to answer it.
             | EngineEvent::EgressAsk { .. }
+            | EngineEvent::TurnStarted { .. }
             | EngineEvent::TurnDone { .. } => return None,
         })
     }
