@@ -81,6 +81,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: harness
+          workspaces: |
+            . -> target
+            conformance/acp -> target
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       # The grep tool spawns the `rg` binary, which the runner image does not
@@ -102,6 +105,11 @@ jobs:
         env:
           HOTL_TMUX_SMOKE: required
         run: cargo test ${{ env.HARNESS_EXCLUDE }} --locked --no-fail-fast
+      - name: ACP conformance (official SDK client)
+        run: |
+          cargo build -p hotl --bin hotl --locked
+          cargo build -p hotl-testkit --example fake_anthropic --locked
+          cargo test --manifest-path conformance/acp/Cargo.toml --locked
       # The Anthropic marker budget is enforced by a runtime compare, not the
       # `debug_assert` beside it; only a release build proves that, and only
       # the two `marker` tests exercise it. LTO is off: the assert is compiled

@@ -24,6 +24,7 @@ members = [
     "crates/hotl-testkit",
     "crates/hotl",
 ]
+exclude = ["conformance/acp"]
 
 [workspace.package]
 version = "0.32.0"
