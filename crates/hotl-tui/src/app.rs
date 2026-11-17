@@ -593,8 +593,6 @@ pub struct State {
     /// The git branch of the session's worktree (0065), from the open reply;
     /// rides the title so `hotl watch` can show it.
     pub session_branch: Option<String>,
-    /// The session's `/color` (0080): a canonical `SESSION_COLORS` name, or
-    /// `None` for the default border.
     pub session_color: Option<String>,
     /// A `/btw` in flight (0071 T5): the question and ticks since it was
     /// sent, for the strip's `aside · Ns` segment. `None` = none pending.
@@ -1082,7 +1080,6 @@ pub enum Cmd {
     /// mode, mouse. The runtime owns this one: `hotl-tui` never touches the
     /// filesystem.
     ReloadSettings,
-    /// `/color`: set (`Some`) or reset (`None`) the session's accent color.
     SetColor(Option<String>),
     /// `/resume [arg]`: switch this console to another saved session. The
     /// runtime owns it — the listing and the lookup read the sessions dir.
@@ -1122,7 +1119,6 @@ fn title(state: &State, suffix: &str) -> String {
         .as_deref()
         .map(|b| format!(" ⎇ {b}"))
         .unwrap_or_default();
-    // The color (0080) sits before the branch; watch reads it from here.
     let color = state
         .session_color
         .as_deref()
@@ -3164,8 +3160,6 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
             cmds.extend(title_cmds(state, suffix));
             cmds
         }
-        // 0080: bare lists the names and leaves `/color ` in the input; a
-        // name sets, `default` resets, anything else picks one at random.
         "color" => {
             if arg.is_empty() {
                 let names: Vec<&str> = hotl_theme::SESSION_COLORS.iter().map(|(n, _)| *n).collect();
@@ -7679,7 +7673,6 @@ mod tests {
     fn typing_a_slash_opens_the_popup_and_narrows_as_you_type() {
         let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/");
-        // Twenty-two built-ins plus the one skill.
         assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(23));
         type_str(&mut s, "re");
         assert_eq!(selected(&s), "reload");
@@ -7986,7 +7979,6 @@ mod tests {
         }
         assert!(n.contains("now: cyan"), "{n}");
         assert_eq!(s.editor.text(), "/color ");
-        // Typing a name and Enter finishes the job.
         let cmds = type_and_submit(&mut s, "pink");
         assert!(
             matches!(&cmds[..], [Cmd::SetColor(Some(c)), ..] if c == "pink"),

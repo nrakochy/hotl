@@ -1643,9 +1643,6 @@ async fn named_open_and_rename() {
     assert_eq!(next(&mut lines).await["result"]["ok"], true);
 }
 
-/// 0080: `session/set_color` takes one of the eight names (any case) or
-/// `null`, and refuses anything else — the TUI resolves a random pick before
-/// it sends, so an unknown name here is a client bug, not a request.
 #[tokio::test]
 async fn set_color_acks_a_known_name_or_null_and_refuses_the_rest() {
     let (client, server) = tokio::io::duplex(64 * 1024);

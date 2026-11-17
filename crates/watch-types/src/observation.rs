@@ -29,8 +29,6 @@ pub struct AgentObservation {
     /// pane title — the cwd column is tmux's, which is the main checkout for
     /// a hotl worktree session.
     pub branch: Option<String>,
-    /// The session's `/color` (0080), read from the pane title. A raw word;
-    /// the view draws only names it knows.
     pub color: Option<String>,
     pub status: Status,
     pub status_line: Option<String>,

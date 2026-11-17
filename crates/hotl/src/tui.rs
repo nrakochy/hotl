@@ -179,7 +179,6 @@ fn seed_state(state: &mut State, model: String, opened: Opened, first_run_hint: 
     state.session_name = session_name;
     state.session_title = title;
     state.session_branch = worktree.map(|(_, branch)| branch);
-    // An older server or an unknown word is no color, never a guess.
     state.session_color = color
         .as_deref()
         .and_then(hotl_theme::session_color)
@@ -408,7 +407,6 @@ struct Opened {
     title: Option<String>,
     /// The session's git worktree as `(path, branch)` (0065), when it has one.
     worktree: Option<(String, String)>,
-    /// The session's `/color` (0080), when it has one.
     color: Option<String>,
     /// The inherited todo list at open (0040): the engine injects it into
     /// every request, so the client renders it or lies by omission (§5.7).

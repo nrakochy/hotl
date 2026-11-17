@@ -108,8 +108,6 @@ pub fn parse_hex(s: &str) -> Option<[u8; 3]> {
     ])
 }
 
-/// `/color`'s names (Claude Code's eight) and their hex. Mid-saturation, so
-/// each reads on dark and light presets alike.
 pub const SESSION_COLORS: [(&str, &str); 8] = [
     ("red", "#e06c75"),
     ("blue", "#61afef"),
@@ -121,8 +119,6 @@ pub const SESSION_COLORS: [(&str, &str); 8] = [
     ("cyan", "#56b6c2"),
 ];
 
-/// The canonical name of a session color, case-insensitive. `default` and
-/// anything else is `None`. The one validator for the TUI, ACP and watch.
 pub fn session_color(name: &str) -> Option<&'static str> {
     SESSION_COLORS
         .iter()
@@ -307,7 +303,6 @@ mod palette {
         }
     }
 
-    /// A session color (`/color`) as a terminal color.
     pub fn session_color_rgb(name: &str) -> Option<Color> {
         let canon = super::session_color(name)?;
         let (_, hex) = super::SESSION_COLORS.iter().find(|(n, _)| *n == canon)?;

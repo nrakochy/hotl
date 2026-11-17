@@ -63,7 +63,6 @@ async fn rename_appends_a_durable_entry() {
         })
         .collect();
     assert_eq!(renames, vec!["fix-auth".to_string()]);
-    // `/color` (0080) rides the same actor-owned append path.
     let colors: Vec<Option<String>> = std::fs::read_to_string(&log_path)
         .expect("read log")
         .lines()

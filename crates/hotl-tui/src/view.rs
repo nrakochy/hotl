@@ -3421,7 +3421,6 @@ mod tests {
         rows_of(&render_at(state, &mut TranscriptCache::default(), w, h))
     }
 
-    /// 0080: the input box's border takes the session color, else `faint`.
     #[test]
     fn the_input_border_wears_the_session_color() {
         let corner_fg = |state: &State| {

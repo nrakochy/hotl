@@ -59,8 +59,6 @@ pub(crate) struct Resumed {
     /// child wins; 0065). Resume reopens it; a fork inherits it unless `-w`
     /// opens a new one.
     pub worktree: Option<(String, String)>,
-    /// The chain's `/color` (last `ColorSet`, child wins; 0080). Follows the
-    /// chain on resume and fork alike — replay walks the lineage anyway.
     pub color: Option<String>,
     /// The parent's last `EffortSet`, if any. Doubly optional like
     /// `hotl_store::Replayed::effort`: outer `None` = never set, inner `None`
@@ -5950,8 +5948,6 @@ mod fork_tests {
         assert_eq!(forked.items, replayed.items);
     }
 
-    /// 0080: `/color` follows the chain — `load_lineage` reports it, and a
-    /// resumed child's own replay still sees it without a copy-forward.
     #[test]
     fn a_resume_inherits_the_chains_color() {
         let dir = tempfile::tempdir().unwrap();

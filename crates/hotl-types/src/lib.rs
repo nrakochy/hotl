@@ -594,9 +594,6 @@ pub enum EntryPayload {
         path: Option<String>,
         branch: Option<String>,
     },
-    /// The session's accent color (`/color`, `session/set_color`; 0080): one
-    /// of `hotl_theme::SESSION_COLORS`' names. Log-only, last one wins, like
-    /// `Rename`; `None` is the reset to default.
     ColorSet {
         color: Option<String>,
     },
@@ -780,9 +777,6 @@ pub fn normalize_focus(raw: &str) -> Result<Option<String>, &'static str> {
     Ok(Some(t.to_string()))
 }
 
-/// A session display name: trimmed, 1–64 chars, free of `●`/`⎇` (the pane
-/// title's color and branch markers, which `hotl watch` parses). The one
-/// validator every entry point (CLI, ACP, TUI) funnels through.
 pub fn normalize_session_name(raw: &str) -> Option<String> {
     let name = raw.trim();
     (!name.is_empty() && name.chars().count() <= 64 && !name.contains(['●', '⎇']))
@@ -1370,8 +1364,6 @@ mod tests {
         assert_eq!(normalize_session_name(&long), None);
         let max = "é".repeat(64); // chars, not bytes
         assert_eq!(normalize_session_name(&max), Some(max.clone()));
-        // The pane title's color and branch markers (0080): a name carrying
-        // one would forge a token `hotl watch` parses.
         assert_eq!(normalize_session_name("x ● red"), None);
         assert_eq!(normalize_session_name("x ⎇ main"), None);
     }

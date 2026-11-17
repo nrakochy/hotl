@@ -1207,7 +1207,9 @@ pub enum SessionCmd {
     },
     /// Drop a held notification by key (0072 D5: a `wait` claimed the result
     /// the inbox was about to carry). A no-op once it has been released.
-    Unnotify { key: String },
+    Unnotify {
+        key: String,
+    },
     /// The sub-agent registry, read (`/agents`). Safe mid-turn.
     Children {
         reply: oneshot::Sender<Vec<hotl_tools::children::ChildRecord>>,
@@ -1228,7 +1230,6 @@ pub enum SessionCmd {
     },
     /// Set the session's display name (durable: appended to the log).
     Rename(String),
-    /// Set or reset (`None`) the session's `/color` (durable; 0080).
     SetColor(Option<String>),
     /// The auto-title task reporting back (0071 T4). `title` is already
     /// normalized; `None` = the model produced nothing usable, and only the
@@ -1239,7 +1240,9 @@ pub enum SessionCmd {
     },
     /// `/btw` (0071 T5): a side question sampled over the byte-identical
     /// cached prefix, never written to the log as an item. Allowed mid-turn.
-    Aside { question: String },
+    Aside {
+        question: String,
+    },
     /// The detached aside task reporting back: the answer (or why there is
     /// none) and what it cost.
     AsideResult {
@@ -1276,7 +1279,10 @@ pub enum SessionCmd {
     /// plus the summary and the `PlanPresented` event the surfaces turn into
     /// an approve/revise card. A separate command rather than a flag on
     /// `SetTodos`: only this one hands the turn back to the human.
-    PresentPlan { summary: String, nodes: Vec<Todo> },
+    PresentPlan {
+        summary: String,
+        nodes: Vec<Todo>,
+    },
     SetTodos {
         todos: Vec<Todo>,
         /// New decisions to append. Their `when_ms` arrives zero — the actor
@@ -1525,8 +1531,6 @@ impl SessionHandle {
     pub async fn rename(&self, name: String) {
         let _ = self.cmd.send(SessionCmd::Rename(name)).await;
     }
-    /// Set or reset the session's accent color (a `color_set` log entry;
-    /// last one wins). The caller validates the name.
     pub async fn set_color(&self, color: Option<String>) {
         let _ = self.cmd.send(SessionCmd::SetColor(color)).await;
     }

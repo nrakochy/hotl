@@ -152,7 +152,6 @@ pub enum EntryKind {
     MemoryAppended,
     /// 0065: the session's worktree. Log-only, last one wins.
     WorktreeSet,
-    /// 0080: the session's `/color`. Log-only, last one wins.
     ColorSet,
     Unknown,
 }
@@ -1587,8 +1586,6 @@ pub struct Replayed {
     /// the chain, child wins; 0065). A single `Option` like `goal`: the
     /// `--no-worktree` tombstone folds to plain `None`.
     pub worktree: Option<(String, String)>,
-    /// The session's `/color` (last `ColorSet` in the chain, child wins;
-    /// 0080). The reset tombstone folds to plain `None`.
     pub color: Option<String>,
     /// Integrity warnings (a broken `parent_id` chain — H-12). Empty is clean.
     /// Replay is defensive regardless (indices clamped, unknowns degraded), so
@@ -1994,7 +1991,6 @@ fn apply_log(
             EntryPayload::GoalSet { condition, .. } => *goal = condition,
             // Log-only, last one wins (0065); the two-null tombstone clears.
             EntryPayload::WorktreeSet { path, branch } => *worktree = path.zip(branch),
-            // Log-only, last one wins (0080); `None` is the reset.
             EntryPayload::ColorSet { color: c } => *color = c,
             EntryPayload::Usage { .. } | EntryPayload::Cancelled { .. } => {}
             // `#[serde(other)]` keeps an old binary from crashing on a new
@@ -2706,8 +2702,6 @@ mod tests {
         assert_eq!(replay(&path).unwrap().goal, None);
     }
 
-    /// 0080: `/color` rides the log like a name — last one wins, a later
-    /// `None` clears it, never a projection item, absent when never set.
     #[test]
     fn color_set_replays_last_one_wins_and_none_clears() {
         let dir = tempfile::tempdir().unwrap();

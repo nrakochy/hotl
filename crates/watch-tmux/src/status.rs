@@ -129,9 +129,6 @@ pub fn hotl_title_branch(title: &str) -> Option<String> {
     (!branch.is_empty()).then(|| branch.to_string())
 }
 
-/// The session color a hotl title carries (0080): `hotl · name ● red ⎇ b —
-/// working` → `red`. Unvalidated — this crate has no theme; the view draws
-/// only names it knows. `None` for any other title.
 pub fn hotl_title_color(title: &str) -> Option<String> {
     let t = title.trim();
     if t != "hotl" && !t.starts_with("hotl ") {
@@ -481,8 +478,6 @@ enter to select · esc to cancel · ↑↓ to navigate";
         assert_eq!(hotl_title_branch("vim ⎇ main"), None);
     }
 
-    /// 0080: the color sits before the branch; status and branch reads are
-    /// unchanged by it.
     #[test]
     fn hotl_title_color_parses_and_leaves_status_and_branch_alone() {
         for (title, color, branch, status) in [

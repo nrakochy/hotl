@@ -9,7 +9,6 @@ pub enum Row {
     Agent {
         glyph: String,
         name: String,
-        /// The session's `/color` (0080), raw from the title.
         color: Option<String>,
         subtitle: String,
         status: Status,
@@ -251,8 +250,6 @@ mod tests {
         o
     }
 
-    /// 0080: a known session color draws a `●` before the name; an unknown
-    /// or missing one draws nothing.
     #[test]
     fn a_session_color_draws_a_dot_before_the_name() {
         let p = Palette::default();

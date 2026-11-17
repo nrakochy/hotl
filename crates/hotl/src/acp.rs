@@ -235,8 +235,6 @@ pub struct SessionOpen {
     /// The worktree's lock, held for the session's life: dropping it on a
     /// clean close is what unlocks (0065 T7). `None` without a worktree.
     pub lease: Option<hotl_store::worktree::Leased>,
-    /// The session's `/color` at open (0080), inherited from the chain. The
-    /// open reply's `color`; absent when unset.
     pub color: Option<String>,
     /// This session's effective permission mode at open (inherited-and-coerced
     /// on resume, else the configured default).
@@ -751,8 +749,6 @@ async fn handle_request(
             state.handle.rename(name).await;
             reply_ok(writer, id, to_json(&Ack { ok: true })).await;
         }
-        // `{"color": "<name>" | null}` (0080). The TUI resolves a random
-        // pick before sending, so an unknown name is refused, never guessed.
         "session/set_color" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(writer, id, "no session — call session/new first").await;
@@ -2171,7 +2167,6 @@ pub struct SessionOpenResult {
     pub memory_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeInfo>,
-    /// The session's `/color` (0080); absent when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
 }

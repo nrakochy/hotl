@@ -198,8 +198,6 @@ fn watch_reads_the_phase_and_the_branch_of_a_worktree_session() {
     );
 }
 
-/// 0080: `/color red` typed into the console reaches watch's observation via
-/// the pane title, beside the branch, without disturbing the phase read.
 #[test]
 fn watch_reads_the_color_a_slash_color_sets() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
