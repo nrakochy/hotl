@@ -397,7 +397,14 @@ pub fn decode(msg: &Value) -> Option<ServerMsg> {
         Some("session/request_permission") => {
             let req_id = msg.get("id").and_then(Value::as_u64)?;
             let call = msg.pointer("/params/toolCall")?;
-            if let Some(egress) = call.pointer("/_meta/hotl.dev~1egress") {
+            let egress = call.pointer("/_meta/hotl.dev~1egress").or_else(|| {
+                let id = call.get("toolCallId").and_then(Value::as_str)?;
+                let fetch = call.get("kind").and_then(Value::as_str) == Some("fetch");
+                (fetch && id.starts_with("egress-"))
+                    .then(|| call.get("rawInput"))
+                    .flatten()
+            });
+            if let Some(egress) = egress {
                 return Some(ServerMsg::EgressRequest {
                     req_id,
                     host: egress

@@ -4056,7 +4056,9 @@ async fn every_handled_method_is_advertised_as_an_extension() {
             rest = &tail[end..];
         }
     }
-    assert!(src.contains("\"method\": \"_hotl/session/request_question\""));
+    assert!(src.contains(
+        "\"_hotl/session/request_question\",\n                to_json(&RequestQuestionParams"
+    ));
     handled.push("_hotl/session/request_question".to_string());
     assert!(src.contains("ext(\"session/update\")"));
     handled.push("_hotl/session/update".to_string());

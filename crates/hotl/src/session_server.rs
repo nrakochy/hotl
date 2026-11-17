@@ -271,7 +271,7 @@ impl AsyncWrite for ClientSlot {
 /// clients one at a time — the session lives across attach/detach.
 pub async fn serve_on(listener: Listener, served: Served, token: String) {
     let slot = ClientSlot::default();
-    let writer: crate::acp::Writer = Arc::new(tokio::sync::Mutex::new(Box::new(slot.clone())));
+    let writer = crate::acp::Writer::new(slot.clone());
     let connection = Connection::hosting(
         writer,
         served.info,
@@ -329,9 +329,22 @@ enum ClientAction {
     Shutdown,
 }
 
-async fn attach_writer(writer: &crate::acp::Writer, slot: &ClientSlot, write: Option<WriteHalf>) {
-    let _held = writer.lock().await;
-    *slot.lock() = write;
+async fn switch_client(
+    connection: &mut Connection,
+    slot: &ClientSlot,
+    write: Option<WriteHalf>,
+    caps: ClientCaps,
+) {
+    connection.set_client_caps(caps);
+    connection.forget_prompts();
+    let adopt = connection.caps_adopter();
+    let writer = connection.writer().clone();
+    writer
+        .next_client(|| {
+            adopt();
+            *slot.lock() = write;
+        })
+        .await;
 }
 
 /// Accepting stays live while a client is attached — a second `hotl attach`
@@ -376,11 +389,10 @@ async fn accept_loop(
                 let Some((new_reader, write, init)) = authenticate(stream, &token).await else {
                     continue;
                 };
-                attach_writer(connection.writer(), &slot, Some(write)).await;
+                let caps = crate::acp::caps_of_initialize(&init);
+                switch_client(&mut connection, &slot, Some(write), caps).await;
                 reader = Some(new_reader);
-                connection.forget_prompts();
                 connection.on_message(&init).await;
-                connection.adopt_client_caps();
             }
             // Lines::next_line is cancel-safe: a frame half-read when the
             // accept arm wins stays buffered.
@@ -393,8 +405,7 @@ async fn accept_loop(
                     ClientAction::Continue => {}
                     ClientAction::Detach => {
                         reader = None;
-                        attach_writer(connection.writer(), &slot, None).await;
-                        connection.forget_prompts();
+                        switch_client(&mut connection, &slot, None, detached_caps()).await;
                     }
                     ClientAction::Shutdown => break,
                 }
@@ -1022,6 +1033,241 @@ mod tests {
         assert_eq!(
             deny_rx.await.unwrap(),
             hotl_tools::net::EgressDecision::Deny
+        );
+    }
+
+    fn plain_caps() -> Value {
+        json!({})
+    }
+
+    async fn inject_ask(
+        events: &tokio::sync::mpsc::Sender<EngineEvent>,
+    ) -> tokio::sync::oneshot::Receiver<hotl_engine::AskReply> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        events
+            .send(EngineEvent::Ask {
+                summary: "bash: rm -rf build".into(),
+                protected_why: Some("touches the build dir".into()),
+                call_id: "c1".into(),
+                tool: "bash".into(),
+                input: json!({"command": "rm -rf build"}),
+                reply,
+            })
+            .await
+            .unwrap();
+        rx
+    }
+
+    async fn inject_question(
+        events: &tokio::sync::mpsc::Sender<EngineEvent>,
+    ) -> tokio::sync::oneshot::Receiver<hotl_types::QuestionAnswer> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        events
+            .send(EngineEvent::Question {
+                id: "q".into(),
+                question: hotl_types::Question {
+                    header: "Ship".into(),
+                    prompt: "now?".into(),
+                    options: vec![hotl_types::QuestionOption {
+                        label: "yes".into(),
+                        description: None,
+                    }],
+                    multi: false,
+                },
+                reply,
+            })
+            .await
+            .unwrap();
+        rx
+    }
+
+    async fn inject_egress(
+        events: &tokio::sync::mpsc::Sender<EngineEvent>,
+    ) -> tokio::sync::oneshot::Receiver<hotl_tools::net::EgressDecision> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        events
+            .send(EngineEvent::EgressAsk {
+                host: "example.com".into(),
+                reply,
+            })
+            .await
+            .unwrap();
+        rx
+    }
+
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    async fn drained(client: &mut Client) -> Vec<Value> {
+        let mut got = Vec::new();
+        while let Ok(Ok(Some(line))) = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            client.lines.next_line(),
+        )
+        .await
+        {
+            got.push(serde_json::from_str(&line).unwrap());
+        }
+        got
+    }
+
+    #[tokio::test]
+    async fn a_plain_client_resumes_to_standard_requests_only() {
+        let (handle, events) = injected();
+        let (id, _task) = start(handle, std::time::Duration::ZERO);
+        let _ask = inject_ask(&events).await;
+        let _question = inject_question(&events).await;
+        let _egress = inject_egress(&events).await;
+        settle().await;
+
+        let mut plain = Client::attach(&id, plain_caps()).await;
+        let got = drained(&mut plain).await;
+        let text = serde_json::to_string(&got).unwrap();
+        assert!(!text.contains("hotl.dev/"), "{text}");
+        assert!(
+            got.iter()
+                .all(|m| m["method"] == "session/request_permission"),
+            "only the two permission requests, nothing the client did not offer: {text}"
+        );
+        assert_eq!(got.len(), 2, "{text}");
+        drop(plain);
+        settle().await;
+
+        let mut hotl = Client::attach(
+            &id,
+            json!({"elicitation": {"form": {}}, "_meta": {"hotl.dev/extensions": 1}}),
+        )
+        .await;
+        let got = drained(&mut hotl).await;
+        let methods: Vec<&str> = got.iter().filter_map(|m| m["method"].as_str()).collect();
+        assert_eq!(
+            methods,
+            [
+                "session/request_permission",
+                "elicitation/create",
+                "session/request_permission"
+            ],
+            "the question stayed parked for a client that can answer it"
+        );
+        assert_eq!(
+            got[0]["params"]["toolCall"]["_meta"]["hotl.dev/ask"]["summary"],
+            "bash: rm -rf build"
+        );
+        assert_eq!(
+            got[2]["params"]["toolCall"]["_meta"]["hotl.dev/egress"]["host"],
+            "example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_question_raised_after_a_plain_client_left_still_parks() {
+        let (handle, events) = injected();
+        let (id, _task) = start(handle, std::time::Duration::ZERO);
+        drop(Client::attach(&id, plain_caps()).await);
+        settle().await;
+        let mut answer = inject_question(&events).await;
+        settle().await;
+        assert!(answer.try_recv().is_err(), "parked, not answered by nobody");
+        let mut hotl = Client::attach(
+            &id,
+            json!({"elicitation": {"form": {}}, "_meta": {"hotl.dev/extensions": 1}}),
+        )
+        .await;
+        let asked = hotl.next().await.expect("the parked question");
+        assert_eq!(asked["method"], "elicitation/create", "{asked}");
+    }
+
+    #[tokio::test]
+    async fn an_egress_raised_after_a_plain_client_left_is_still_an_egress() {
+        let (handle, events) = injected();
+        let (id, _task) = start(handle, std::time::Duration::ZERO);
+        drop(Client::attach(&id, plain_caps()).await);
+        settle().await;
+        let _egress = inject_egress(&events).await;
+        settle().await;
+        let mut hotl = Client::attach(&id, hotl_caps()).await;
+        let asked = hotl.next().await.expect("the parked egress ask");
+        assert!(
+            matches!(
+                hotl_tui::client::decode(&asked),
+                Some(hotl_tui::client::ServerMsg::EgressRequest { .. })
+            ),
+            "{asked}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ask_raised_before_resume_is_sent_once() {
+        let (handle, events) = injected();
+        let (id, _task) = start(handle, std::time::Duration::ZERO);
+        let mut client = Client::connect(&id).await;
+        let init = client.initialize(Some("tok"), hotl_caps()).await;
+        client.reply_to(init).await;
+        let _ask = inject_ask(&events).await;
+        settle().await;
+        client
+            .request(
+                "session/resume",
+                json!({"sessionId": "test", "cwd": std::env::temp_dir()}),
+            )
+            .await;
+        let got = drained(&mut client).await;
+        let asks = got
+            .iter()
+            .filter(|m| m["method"] == "session/request_permission")
+            .count();
+        assert_eq!(asks, 1, "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn the_next_client_never_gets_replies_owed_to_the_last_one() {
+        let (id, _task) = start(scripted_session(), std::time::Duration::ZERO);
+        let mut first = Client::attach(&id, hotl_caps()).await;
+        let prompt = first.prompt("go").await;
+        first.request_of("session/request_permission").await;
+        drop(first);
+        settle().await;
+        let mut second = Client::attach(&id, hotl_caps()).await;
+        let ask = second.request_of("session/request_permission").await;
+        second.allow(&ask["id"]).await;
+        let got = drained(&mut second).await;
+        assert!(
+            got.iter()
+                .all(|m| m.get("method").is_some() || m["id"] != json!(prompt)),
+            "{got:?}"
+        );
+        assert!(got
+            .iter()
+            .any(|m| m["params"]["update"]["sessionUpdate"] == "usage_update"));
+    }
+
+    #[tokio::test]
+    async fn approve_sees_a_question_first_sent_as_a_hotl_request() {
+        let (handle, events) = injected();
+        let (id, _task) = start(handle, std::time::Duration::ZERO);
+        let mut ext_only = Client::attach(&id, json!({"_meta": {"hotl.dev/extensions": 1}})).await;
+        let _answer = inject_question(&events).await;
+        let first = ext_only.next().await.expect("the question");
+        assert_eq!(first["method"], "_hotl/session/request_question");
+        drop(ext_only);
+        settle().await;
+
+        let (read, write) = tokio::io::split(hotl_platform::IPC.connect(&id).await.unwrap());
+        let mut client = hotl_tui::client::AcpClient::new(write);
+        let mut lines = BufReader::new(read).lines();
+        assert!(matches!(
+            crate::attach::open(&mut client, &mut lines, "test", "tok").await,
+            crate::attach::Opened::Attached
+        ));
+        let line = lines.next_line().await.unwrap().unwrap();
+        let msg: Value = serde_json::from_str(&line).unwrap();
+        assert!(
+            matches!(
+                hotl_tui::client::decode(&msg),
+                Some(hotl_tui::client::ServerMsg::QuestionRequest { .. })
+            ),
+            "{msg}"
         );
     }
 
