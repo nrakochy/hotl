@@ -166,10 +166,6 @@ impl OpenAiCompatProvider {
     /// `explicit` is the 0046 GPT-5.6 cache mode; the caller decides it
     /// (model gate, policy, probe latch), the renderer only obeys.
     fn body_for(req: &SamplingRequest, legacy: bool, explicit: bool) -> Value {
-        hotl_types::sort_keys(Self::render_body(req, legacy, explicit))
-    }
-
-    fn render_body(req: &SamplingRequest, legacy: bool, explicit: bool) -> Value {
         // Derived once per request from static catalog data. The compat
         // family is uncatalogued, so this fails open (images always sent) —
         // a non-vision server answers with its own 400, surfaced honestly.
@@ -1785,10 +1781,7 @@ mod tests {
                 {"role": "user", "content": "<turn-context now_unix_ms=\"1\"/>"},
             ],
         });
-        assert_eq!(
-            body.to_string(),
-            hotl_types::sort_keys(expected).to_string()
-        );
+        assert_eq!(body.to_string(), expected.to_string());
         assert!(!body.to_string().contains("prompt_cache_breakpoint"));
         assert!(body.get("prompt_cache_options").is_none());
     }

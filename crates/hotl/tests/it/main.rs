@@ -16,6 +16,9 @@ mod acp_child;
 #[path = "../../src/acp_ext.rs"]
 #[allow(dead_code)]
 mod acp_ext;
+#[path = "../../src/acp_types.rs"]
+#[allow(dead_code)]
+mod acp_types;
 #[path = "../../src/features.rs"]
 #[allow(dead_code)]
 mod features;

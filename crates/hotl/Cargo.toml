@@ -52,7 +52,6 @@ security-enforced = ["hotl-tools/security-enforced"]
 minify = ["hotl-mcp/minify", "hotl-retrieval/minify", "hotl-engine/minify", "hotl-tui/minify", "hotl-tools/minify"]
 
 [dependencies]
-agent-client-protocol-schema = { workspace = true }
 schemars = { workspace = true }
 dunce = { workspace = true }
 hotl_theme = { package = "hotl-theme", path = "../hotl-theme", version = "0.32.0", features = ["ratatui"] }

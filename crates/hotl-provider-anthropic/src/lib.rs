@@ -748,7 +748,7 @@ pub fn rejects_output_format(err: &ProviderError) -> bool {
 fn ttl_marker(ttl: CacheTtl) -> Value {
     match ttl {
         CacheTtl::FiveMinutes => json!({"type": "ephemeral"}),
-        CacheTtl::OneHour => json!({"ttl": "1h", "type": "ephemeral"}),
+        CacheTtl::OneHour => json!({"type": "ephemeral", "ttl": "1h"}),
     }
 }
 
@@ -1316,29 +1316,6 @@ mod tests {
 
     /// The live wire bytes, parsed — what the structural assertions below
     /// inspect, so they keep testing the real path.
-    fn sorted_value(v: Value) -> Value {
-        match v {
-            Value::Object(map) => {
-                let mut keys: Vec<String> = map.keys().cloned().collect();
-                keys.sort();
-                let mut out = serde_json::Map::new();
-                for k in keys {
-                    let inner = sorted_value(map[&k].clone());
-                    out.insert(k, inner);
-                }
-                Value::Object(out)
-            }
-            Value::Array(items) => Value::Array(items.into_iter().map(sorted_value).collect()),
-            other => other,
-        }
-    }
-
-    macro_rules! sj {
-        ($($t:tt)*) => {
-            sorted_value(json!($($t)*))
-        };
-    }
-
     fn body_json(req: &SamplingRequest) -> Value {
         serde_json::from_str(&wire_body(req)).expect("wire body is valid JSON")
     }
@@ -1385,10 +1362,10 @@ mod tests {
             corpus_user("hello with [Image #1]", 2),
             Item::Assistant {
                 blocks: vec![
-                    sj!({"type": "thinking", "thinking": "mm", "signature": "s1"}),
-                    sj!({"type": "reasoning", "encrypted_content": "foreign"}),
-                    sj!({"type": "text", "text": "calling tools"}),
-                    sj!({"type": "tool_use", "id": "tu-0", "name": "read", "input": {"path": "x"}}),
+                    json!({"type": "thinking", "thinking": "mm", "signature": "s1"}),
+                    json!({"type": "reasoning", "encrypted_content": "foreign"}),
+                    json!({"type": "text", "text": "calling tools"}),
+                    json!({"type": "tool_use", "id": "tu-0", "name": "read", "input": {"path": "x"}}),
                 ],
                 model: None,
             },
@@ -1396,7 +1373,7 @@ mod tests {
             Item::Unknown,
             corpus_user("follow-up", 0),
             Item::Assistant {
-                blocks: vec![sj!({"type": "text", "text": "more"})],
+                blocks: vec![json!({"type": "text", "text": "more"})],
                 model: None,
             },
             corpus_results(18, false),
@@ -1411,12 +1388,12 @@ mod tests {
             ToolDef {
                 name: "read".into(),
                 description: "read a file".into(),
-                input_schema: sj!({"type": "object", "properties": {"path": {"type": "string"}}}),
+                input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
             },
             ToolDef {
                 name: "bash".into(),
                 description: "run a command".into(),
-                input_schema: sj!({"type": "object"}),
+                input_schema: json!({"type": "object"}),
             },
         ];
         let full = SamplingRequest {
@@ -1463,7 +1440,7 @@ mod tests {
     fn wire_body_bytes_match_the_value_tree_reference() {
         for (name, req) in corpus() {
             let new = wire_body(&req);
-            let old = serde_json::to_string(&sorted_value(build_body_reference(&req))).unwrap();
+            let old = serde_json::to_string(&build_body_reference(&req)).unwrap();
             assert_eq!(new, old, "wire bytes diverged for corpus case `{name}`");
         }
         // 0073 D8: the same proof with `output_config.format` beside `effort`
@@ -1474,7 +1451,7 @@ mod tests {
         with_format.output_format = Some(schema());
         assert_eq!(
             wire_body(&with_format),
-            serde_json::to_string(&sorted_value(build_body_reference(&with_format))).unwrap(),
+            serde_json::to_string(&build_body_reference(&with_format)).unwrap(),
             "wire bytes diverged with output_config.format"
         );
         assert!(wire_body(&with_format).contains("\"json_schema\""));
@@ -1587,7 +1564,7 @@ mod tests {
     }
 
     fn schema() -> Arc<Value> {
-        Arc::new(sj!({
+        Arc::new(json!({
             "type": "object",
             "properties": {"name": {"type": "string"}},
             "required": ["name"],

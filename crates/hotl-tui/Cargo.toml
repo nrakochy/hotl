@@ -20,7 +20,6 @@ default = ["minify"]
 minify = ["hotl-tools/minify"]
 
 [dependencies]
-agent-client-protocol-schema = { workspace = true }
 hotl_theme = { package = "hotl-theme", path = "../hotl-theme", version = "0.32.0", features = ["ratatui"] }
 hotl-tools = { path = "../hotl-tools", version = "0.32.0", default-features = false }
 # A leaf crate with no I/O — added to *remove* a hand-copied

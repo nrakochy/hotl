@@ -20,6 +20,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::acp_ext::codes;
+use crate::acp_types::ErrorObject;
 
 /// Stable schema version of `session/update` / prompt-result payloads (an MD
 /// Tier-1 contract — bump only on a breaking change).
@@ -2041,7 +2042,7 @@ async fn reply_ok(writer: &Writer, id: Value, result: Value) {
 async fn reply_err(writer: &Writer, id: Value, code: i64, message: &str) {
     send(
         writer,
-        &json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}),
+        &json!({"jsonrpc": "2.0", "id": id, "error": ErrorObject::new(code, message)}),
     )
     .await;
 }

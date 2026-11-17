@@ -807,23 +807,6 @@ pub fn normalize_memory_note(raw: &str) -> Option<String> {
     (!note.is_empty() && note.chars().count() <= MEMORY_NOTE_MAX_CHARS).then_some(note)
 }
 
-pub fn sort_keys(value: Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut entries: Vec<(String, Value)> = map.into_iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            Value::Object(
-                entries
-                    .into_iter()
-                    .map(|(k, v)| (k, sort_keys(v)))
-                    .collect(),
-            )
-        }
-        Value::Array(items) => Value::Array(items.into_iter().map(sort_keys).collect()),
-        other => other,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,7 +890,7 @@ mod tests {
     #[test]
     fn an_assistant_item_without_a_model_serializes_as_before() {
         let item = Item::Assistant {
-            blocks: vec![serde_json::json!({"text": "hi", "type": "text"})],
+            blocks: vec![serde_json::json!({"type": "text", "text": "hi"})],
             model: None,
         };
         assert_eq!(
@@ -1534,20 +1517,5 @@ mod schema_tests {
         assert!(usage["properties"]["input_tokens"].is_object(), "{usage}");
         let q = serde_json::to_value(schemars::schema_for!(super::Question)).unwrap();
         assert!(q["properties"]["options"].is_object(), "{q}");
-    }
-}
-
-#[cfg(test)]
-mod sort_keys_tests {
-    use super::sort_keys;
-    use serde_json::json;
-
-    #[test]
-    fn keys_come_out_sorted_at_every_depth() {
-        let v = json!({"b": {"z": 1, "a": [{"y": 1, "x": 2}]}, "a": null});
-        assert_eq!(
-            sort_keys(v).to_string(),
-            r#"{"a":null,"b":{"a":[{"x":2,"y":1}],"z":1}}"#
-        );
     }
 }
