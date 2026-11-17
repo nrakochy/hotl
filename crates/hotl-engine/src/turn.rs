@@ -2047,6 +2047,7 @@ impl Turn {
                         lines,
                         bytes,
                         output: content.clone(),
+                        before: None,
                     })
                     .await;
                     return Gate::Resolved {
@@ -2252,6 +2253,7 @@ impl Turn {
             lines,
             bytes,
             output: outcome.content.clone(),
+            before: outcome.facts.before.clone(),
         })
         .await;
         // A tool that actually ran and failed is exactly what the budget is for.

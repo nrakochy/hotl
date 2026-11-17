@@ -2448,30 +2448,6 @@ async fn drain_events(
             .await;
             continue;
         }
-        if let EngineEvent::FallbackModel { model } = &event {
-            let config_options = {
-                let mut state = lock_config(&config);
-                state.model = model.clone();
-                crate::acp_map::config_options(&state)
-            };
-            let meta = caps.ext.then(|| {
-                let mut m = serde_json::Map::new();
-                if let Some(frame) = crate::wire::update_frame(&event) {
-                    m.insert(crate::acp_map::META_FRAME.into(), frame);
-                }
-                m
-            });
-            send_update(
-                &writer,
-                &session_id,
-                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate {
-                    config_options,
-                    meta,
-                }),
-            )
-            .await;
-            continue;
-        }
         match event {
             EngineEvent::Ask {
                 summary,
@@ -2574,6 +2550,7 @@ async fn drain_events(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .retain(|_, tx| !tx.is_closed());
+                calls.end_turn();
                 let misses = (mispredictions > 0).then_some(mispredictions);
                 let frame = crate::wire::UsageFrame::of(&model, &usage);
                 let (size, ext) = {
@@ -2754,9 +2731,28 @@ mod drain_tests {
         drain_with_queue(rx, PendingPrompt::default()).await
     }
 
+    fn test_config() -> SharedConfig {
+        Arc::new(std::sync::Mutex::new(crate::acp_map::ConfigState {
+            model: "test-model".into(),
+            plan: false,
+            effort: "default".into(),
+            models: Vec::new(),
+            ext: false,
+            context_window: 200_000,
+        }))
+    }
+
     async fn drain_with_queue(
         rx: mpsc::Receiver<EngineEvent>,
         queue: PendingPrompt,
+    ) -> Vec<String> {
+        drain_with(rx, queue, test_config()).await
+    }
+
+    async fn drain_with(
+        rx: mpsc::Receiver<EngineEvent>,
+        queue: PendingPrompt,
+        config: SharedConfig,
     ) -> Vec<String> {
         let (write, mut read) = tokio::io::duplex(1 << 20);
         let writer: Writer = Arc::new(Mutex::new(Box::new(write)));
@@ -2770,14 +2766,7 @@ mod drain_tests {
             "acp-test".into(),
             0,
             "test-model".into(),
-            Arc::new(std::sync::Mutex::new(crate::acp_map::ConfigState {
-                model: "test-model".into(),
-                plan: false,
-                effort: "default".into(),
-                models: Vec::new(),
-                ext: false,
-                context_window: 200_000,
-            })),
+            config,
             EngineLink {
                 meter: hotl_engine::Meter::default(),
             },
@@ -2857,6 +2846,33 @@ mod drain_tests {
             "{lines:?}"
         );
         assert_eq!(lock_prompts(&book).ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_fallback_lasts_one_turn_and_never_becomes_the_model_option() {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(EngineEvent::FallbackModel {
+            model: "backup".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(turn_done()).await.unwrap();
+        drop(tx);
+        let config = test_config();
+        let lines = drain_with(rx, PendingPrompt::default(), Arc::clone(&config)).await;
+        assert!(
+            lines.iter().all(|l| !l.contains("config_option_update")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("_hotl/session/update") && l.contains("fallback_model")),
+            "{lines:?}"
+        );
+        let options = crate::acp_map::config_options(&lock_config(&config));
+        let model = serde_json::to_value(&options[0]).unwrap();
+        assert_eq!(model["currentValue"], "test-model");
     }
 
     /// 0033 Task 2: a burst already sitting in the queue folds into ONE

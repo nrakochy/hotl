@@ -523,6 +523,7 @@ pub enum EngineEvent {
         lines: u64,
         bytes: u64,
         output: String,
+        before: Option<hotl_tools::Before>,
     },
     /// A goal evaluation is about to reach the model (0061 T18). A verdict a
     /// machine leaf settled needs no model and announces nothing — this

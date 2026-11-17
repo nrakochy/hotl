@@ -622,6 +622,7 @@ async fn run_prompt(
                 lines: 0,
                 bytes: 0,
                 output: String::new(),
+                before: None,
             })
             .await;
     }
@@ -764,6 +765,7 @@ async fn record_report(shared: &Arc<Shared>, text: &str, path: &Path) {
             lines: 0,
             bytes: 0,
             output: String::new(),
+            before: None,
         })
         .await;
 }
@@ -1013,6 +1015,7 @@ fn tool_done(id: String, name: String, ok: bool) -> EngineEvent {
         lines: 0,
         bytes: 0,
         output: String::new(),
+        before: None,
     }
 }
 

@@ -726,7 +726,13 @@ async fn write_in(
     if let Some(why) = hotl_own_dir_reason(path) {
         return Err(ToolOutcome::err(why));
     }
-    match write_target(root, extras, path) {
+    let target = write_target(root, extras, path);
+    let before = match &target {
+        WriteTarget::Workspace(rel) => before_beneath(root, rel),
+        WriteTarget::Extra(eroot, rel) => before_beneath(eroot, rel),
+        WriteTarget::OutsideApproved => before_plain(std::path::Path::new(path)),
+    };
+    match target {
         WriteTarget::Workspace(rel) => guarded_write_bytes(root, &rel, path, content)?,
         WriteTarget::Extra(eroot, rel) => guarded_write_bytes(&eroot, &rel, path, content)?,
         WriteTarget::OutsideApproved => {
@@ -744,10 +750,48 @@ async fn write_in(
                 .map_err(|e| ToolOutcome::err(format!("Could not write `{path}`: {e}.")))?;
         }
     }
-    Ok(ToolOutcome::ok(format!(
-        "Wrote {} bytes to {path}.",
-        content.len()
-    )))
+    Ok(
+        ToolOutcome::ok(format!("Wrote {} bytes to {path}.", content.len())).with_facts(
+            crate::OutcomeFacts {
+                before: Some(before),
+                ..Default::default()
+            },
+        ),
+    )
+}
+
+fn before_beneath(root: &std::path::Path, rel: &std::path::Path) -> crate::Before {
+    match fsguard::open_beneath(root, rel) {
+        Ok(file) => before_of(file),
+        Err(fsguard::GuardError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            crate::Before::Absent
+        }
+        Err(_) => crate::Before::Unshown,
+    }
+}
+
+fn before_plain(path: &std::path::Path) -> crate::Before {
+    match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => crate::Before::Absent,
+        Ok(meta) if meta.is_file() => match std::fs::File::open(path) {
+            Ok(file) => before_of(file),
+            Err(_) => crate::Before::Unshown,
+        },
+        _ => crate::Before::Unshown,
+    }
+}
+
+fn before_of(file: std::fs::File) -> crate::Before {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    let read = file.take(READ_MAX_BYTES as u64 + 1).read_to_end(&mut bytes);
+    if read.is_err() || bytes.len() > READ_MAX_BYTES || bytes.contains(&0) {
+        return crate::Before::Unshown;
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => crate::Before::Text(text),
+        Err(_) => crate::Before::Unshown,
+    }
 }
 
 /// The guarded create-and-write, shared by the workspace and extra-root arms.
@@ -2839,6 +2883,35 @@ mod tests {
         assert!(out.is_error, "{}", out.content);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "# original\n");
         assert!(out.content.contains("symlink"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn a_write_reports_what_the_file_held_before() {
+        let (_o, root, _home) = fsguard::tests::fixture();
+        std::fs::write(root.join("old.txt"), "was here\n").unwrap();
+        let write = |path: &str| {
+            let input = json!({"path": path, "content": "now\n"});
+            let root = root.clone();
+            async move { done(write_in(&root, &[], &input).await) }
+        };
+        let over = write("old.txt").await;
+        assert!(!over.is_error, "{}", over.content);
+        assert_eq!(
+            over.facts.before,
+            Some(crate::Before::Text("was here\n".into()))
+        );
+        let fresh = write("new/fresh.txt").await;
+        assert_eq!(fresh.facts.before, Some(crate::Before::Absent));
+        std::fs::write(root.join("huge.txt"), "x".repeat(READ_MAX_BYTES + 1)).unwrap();
+        assert_eq!(
+            write("huge.txt").await.facts.before,
+            Some(crate::Before::Unshown)
+        );
+        std::fs::write(root.join("bin.dat"), [0u8, 159, 146, 150]).unwrap();
+        assert_eq!(
+            write("bin.dat").await.facts.before,
+            Some(crate::Before::Unshown)
+        );
     }
 
     #[test]

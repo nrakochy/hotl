@@ -481,6 +481,7 @@ mod tests {
                 lines: 3,
                 bytes: 5,
                 output: String::new(),
+                before: None,
             },
             EngineEvent::ToolProgress {
                 id: "t1".into(),
@@ -627,6 +628,7 @@ mod tests {
             lines: 1,
             bytes: 4,
             output: String::new(),
+            before: None,
         })
         .unwrap();
         assert!(update_line(&failed).is_some(), "a tool error must be shown");

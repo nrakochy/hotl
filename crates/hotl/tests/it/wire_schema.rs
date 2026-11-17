@@ -107,6 +107,7 @@ fn every_pinned_frame_validates_against_the_published_schema() {
             lines: 3,
             bytes: 5,
             output: String::new(),
+            before: None,
         },
         EngineEvent::ChildTool {
             parent_id: "p".into(),

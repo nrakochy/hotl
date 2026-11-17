@@ -118,6 +118,14 @@ pub struct OutcomeFacts {
     /// `spawn`; the turn folds these into its per-turn `delegation` frame.
     /// Boxed: a `ToolOutcome` rides every `Result<_, ToolOutcome>` in here.
     pub delegation: Option<Box<DelegationFacts>>,
+    pub before: Option<Before>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Before {
+    Absent,
+    Text(String),
+    Unshown,
 }
 
 /// One `spawn` call's contribution to the turn's delegation summary.

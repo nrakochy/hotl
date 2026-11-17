@@ -35,6 +35,7 @@ pub enum Outgoing {
 pub struct ToolCalls {
     root: PathBuf,
     open: HashMap<String, Value>,
+    settled: std::collections::HashSet<String>,
     child_text: HashMap<String, String>,
     fold: Option<String>,
     folds: u64,
@@ -69,11 +70,17 @@ impl ToolCalls {
         }])
     }
 
-    fn diff(&self, name: &str, input: &Value) -> Option<ToolCallContent> {
+    fn diff(
+        &self,
+        name: &str,
+        input: &Value,
+        before: Option<&hotl_tools::Before>,
+    ) -> Option<ToolCallContent> {
         let text = |key: &str| input.get(key).and_then(Value::as_str).map(str::to_string);
-        let (old_text, new_text) = match name {
-            "edit" => (text("old_string"), text("new_string")?),
-            "write" => (None, text("content")?),
+        let (old_text, new_text) = match (name, before) {
+            ("edit", _) => (text("old_string"), text("new_string")?),
+            ("write", Some(hotl_tools::Before::Absent)) => (None, text("content")?),
+            ("write", Some(hotl_tools::Before::Text(old))) => (Some(old.clone()), text("content")?),
             _ => return None,
         };
         Some(ToolCallContent::Diff(Diff {
@@ -94,14 +101,17 @@ impl ToolCalls {
             fields.status,
             Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
         );
-        let known = self.open.contains_key(id);
+        let known = self.open.contains_key(id) || self.settled.contains(id);
         if settled {
             self.open.remove(id);
             self.child_text.remove(id);
-        } else if let Some(input) = &fields.raw_input {
-            self.open.insert(id.to_string(), input.clone());
-        } else {
-            self.open.entry(id.to_string()).or_insert(Value::Null);
+            self.settled.insert(id.to_string());
+        } else if !self.settled.contains(id) {
+            let input = fields.raw_input.clone();
+            let slot = self.open.entry(id.to_string()).or_insert(Value::Null);
+            if let Some(input) = input {
+                *slot = input;
+            }
         }
         if known {
             return SessionUpdate::ToolCallUpdate(ToolCallUpdate {
@@ -144,6 +154,13 @@ impl ToolCalls {
             },
             meta: None,
         }))
+    }
+
+    pub fn end_turn(&mut self) {
+        self.open.clear();
+        self.settled.clear();
+        self.child_text.clear();
+        self.fold = None;
     }
 
     fn fold_id(&mut self) -> String {
@@ -194,10 +211,7 @@ fn add_meta(update: &mut SessionUpdate, key: &str, value: Value) {
 }
 
 pub fn outgoing(event: &EngineEvent, caps: &ClientCaps, calls: &mut ToolCalls) -> Option<Outgoing> {
-    if matches!(
-        event,
-        EngineEvent::ModelChanged { .. } | EngineEvent::FallbackModel { .. }
-    ) {
+    if matches!(event, EngineEvent::ModelChanged { .. }) {
         return None;
     }
     let frame = crate::wire::update_frame(event)?;
@@ -274,10 +288,11 @@ fn standard(
             name,
             ok,
             output,
+            before,
             ..
         } => {
             let diff = match (ok, calls.open.get(id)) {
-                (true, Some(input)) => calls.diff(name, input),
+                (true, Some(input)) => calls.diff(name, input, before.as_ref()),
                 _ => None,
             };
             calls.touch(
@@ -383,6 +398,11 @@ fn standard(
             NoticeSeverity::Warning,
             format!("Retrying ({attempt}/{max})"),
             format!("{reason}; next try in {:.1}s", *delay_ms as f64 / 1000.0),
+        ),
+        EngineEvent::FallbackModel { model } if caps.notices => notice(
+            NoticeSeverity::Warning,
+            format!("Falling back to {model} for the rest of this turn"),
+            "The session's model was unavailable; the next turn starts on it again".into(),
         ),
         EngineEvent::BudgetNotice {
             pct,
@@ -1279,6 +1299,19 @@ mod tests {
             lines: 1,
             bytes: output.len() as u64,
             output: output.into(),
+            before: None,
+        }
+    }
+
+    fn wrote(id: &str, before: Option<hotl_tools::Before>) -> EngineEvent {
+        EngineEvent::ToolDone {
+            id: id.into(),
+            name: "write".into(),
+            ok: true,
+            lines: 1,
+            bytes: 5,
+            output: "wrote".into(),
+            before,
         }
     }
 
@@ -1390,24 +1423,35 @@ mod tests {
             edit["content"],
             json!([{"type": "diff", "path": at("a.rs"), "oldText": "let x = 1;", "newText": "let x = 2;"}])
         );
-        outgoing(
-            &start(
-                "w1",
-                "write",
-                json!({"path": "/abs/new.rs", "content": "fn main() {}\n"}),
-            ),
-            &plain(),
-            &mut calls,
-        );
-        let write = update_json(outgoing(
-            &done("w1", "write", true, "wrote"),
-            &plain(),
-            &mut calls,
-        ));
+        let path = std::path::Path::new("/abs/new.rs").display().to_string();
+        let write = |id: &str, before, calls: &mut ToolCalls| {
+            outgoing(
+                &start(
+                    id,
+                    "write",
+                    json!({"path": "/abs/new.rs", "content": "fn main() {}\n"}),
+                ),
+                &plain(),
+                calls,
+            );
+            update_json(outgoing(&wrote(id, before), &plain(), calls))
+        };
         assert_eq!(
-            write["content"],
-            json!([{"type": "diff", "path": std::path::Path::new("/abs/new.rs").display().to_string(), "newText": "fn main() {}\n"}])
+            write("w1", Some(hotl_tools::Before::Absent), &mut calls)["content"],
+            json!([{"type": "diff", "path": path, "newText": "fn main() {}\n"}])
         );
+        assert_eq!(
+            write(
+                "w2",
+                Some(hotl_tools::Before::Text("fn old() {}\n".into())),
+                &mut calls
+            )["content"],
+            json!([{"type": "diff", "path": path, "oldText": "fn old() {}\n", "newText": "fn main() {}\n"}])
+        );
+        let unshown = write("w3", Some(hotl_tools::Before::Unshown), &mut calls);
+        assert!(unshown.get("content").is_none(), "{unshown}");
+        let unknown = write("w4", None, &mut calls);
+        assert!(unknown.get("content").is_none(), "{unknown}");
         outgoing(
             &start(
                 "e2",
@@ -1475,6 +1519,82 @@ mod tests {
         let ext = update_json(outgoing(&child_tool, &opted_in(), &mut calls));
         assert_eq!(ext["toolCallId"], "s1");
         assert_eq!(ext["_meta"][META_CHILD]["id"], "c1");
+    }
+
+    #[test]
+    fn a_fallback_is_a_turn_notice_not_a_model_change() {
+        let fallback = EngineEvent::FallbackModel {
+            model: "anthropic/backup".into(),
+        };
+        let notices = ClientCaps {
+            notices: true,
+            ..ClientCaps::default()
+        };
+        let mut calls = ToolCalls::rooted(root());
+        let notice = update_json(outgoing(&fallback, &notices, &mut calls));
+        assert_eq!(notice["sessionUpdate"], "notice");
+        assert_eq!(notice["severity"], "warning");
+        assert!(
+            notice["title"]
+                .as_str()
+                .unwrap()
+                .contains("anthropic/backup"),
+            "{notice}"
+        );
+        assert_eq!(outgoing(&fallback, &plain(), &mut calls), None);
+        assert_eq!(
+            outgoing(&fallback, &opted_in(), &mut calls),
+            Some(Outgoing::Ext(crate::wire::update_frame(&fallback).unwrap()))
+        );
+    }
+
+    #[test]
+    fn a_flagged_denial_is_one_tool_call_then_updates() {
+        let mut calls = ToolCalls::rooted(root());
+        let flagged = update_json(outgoing(
+            &EngineEvent::ToolFlagged {
+                id: "f1".into(),
+                name: "write".into(),
+                summary: "write /etc/x".into(),
+                why: "outside".into(),
+                denied: true,
+            },
+            &opted_in(),
+            &mut calls,
+        ));
+        assert_eq!(flagged["sessionUpdate"], "tool_call");
+        assert_eq!(flagged["status"], "failed");
+        let denied = update_json(outgoing(
+            &EngineEvent::ToolDenied {
+                id: "f1".into(),
+                name: "write".into(),
+            },
+            &opted_in(),
+            &mut calls,
+        ));
+        assert_eq!(denied["sessionUpdate"], "tool_call_update", "{denied}");
+        assert_eq!(denied["toolCallId"], "f1");
+    }
+
+    #[test]
+    fn the_turn_end_forgets_calls_that_never_settled() {
+        let mut calls = ToolCalls::rooted(root());
+        outgoing(
+            &start("b1", "bash", json!({"command": "sleep"})),
+            &plain(),
+            &mut calls,
+        );
+        outgoing(&done("b2", "bash", true, "x"), &plain(), &mut calls);
+        calls.end_turn();
+        let progress = EngineEvent::ToolProgress {
+            id: "b1".into(),
+            name: "bash".into(),
+            tail: "late".into(),
+            lines: 1,
+            bytes: 4,
+        };
+        assert_eq!(outgoing(&progress, &plain(), &mut calls), None);
+        assert!(calls.open.is_empty() && calls.settled.is_empty());
     }
 
     #[test]
@@ -1886,7 +2006,7 @@ mod tests {
 
     #[test]
     fn every_frame_reaches_an_opted_in_client_exactly_once() {
-        let drained_elsewhere = ["ModelChanged", "FallbackModel"];
+        let drained_elsewhere = ["ModelChanged"];
         let mut calls = ToolCalls::rooted(root());
         for event in every_event() {
             let name = variant(&event);
