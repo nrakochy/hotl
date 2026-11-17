@@ -21,6 +21,7 @@ fn server_info() -> acp::ServerInfo {
         context_window: 200_000,
         stream_idle_secs: 90,
         model_resolver: None,
+        key_available: true,
         model: "m".into(),
     }
 }
@@ -208,7 +209,14 @@ fn acp_valid(def: &str, value: &Value) {
 fn every_acp_payload_validates_against_the_published_schema() {
     acp_valid(
         "InitializeResponse",
-        &serde_json::to_value(acp::initialize_response(&server_info(), true)).unwrap(),
+        &serde_json::to_value(acp::initialize_response(
+            &server_info(),
+            acp::ClientCaps {
+                ext: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap(),
     );
     acp_valid(
         "PromptResult",

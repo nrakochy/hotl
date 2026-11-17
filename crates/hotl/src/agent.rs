@@ -732,6 +732,7 @@ pub(crate) async fn build_acp() -> Result<
         stream_idle_secs: scaffold.stream_idle_secs,
         model: scaffold.model.clone(),
         model_resolver: Some(model_resolver()),
+        key_available: true,
     };
     let factory: crate::acp::SessionFactory = Box::new(move |spec| {
         // §S3.2 (TUI/ACP handshake trigger): the provider is process-wide

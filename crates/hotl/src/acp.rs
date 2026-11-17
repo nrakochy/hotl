@@ -21,8 +21,9 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::acp_ext::codes;
 use crate::acp_types::{
-    AgentCapabilities, ErrorObject, Implementation, InitializeRequest, InitializeResponse,
-    McpCapabilities, PromptCapabilities, SessionCapabilities,
+    AgentCapabilities, AuthMethod, AuthenticateRequest, ErrorObject, Implementation,
+    InitializeRequest, InitializeResponse, McpCapabilities, PromptCapabilities,
+    SessionCapabilities,
 };
 
 /// Stable schema version of `session/update` / prompt-result payloads (an MD
@@ -362,6 +363,7 @@ pub struct ServerInfo {
     pub stream_idle_secs: u64,
     /// How `session/set_model` resolves a spec (0067); `None` = unsupported.
     pub model_resolver: Option<ModelResolver>,
+    pub key_available: bool,
     /// The session's primary model — prices `turn_done`'s `usage.cost_usd`
     /// (Task 5 cost telemetry). One process serves one model for its whole
     /// lifetime (process-per-session), so this is fixed for every
@@ -520,11 +522,56 @@ async fn handle_request(
             reply_ok(
                 writer,
                 id,
-                to_json(&initialize_response(info, client_caps.ext)),
+                to_json(&initialize_response(info, *client_caps)),
             )
             .await;
         }
+        "authenticate" => {
+            let request: AuthenticateRequest = msg
+                .get("params")
+                .and_then(|p| serde_json::from_value(p.clone()).ok())
+                .unwrap_or_default();
+            match request.method_id.as_deref() {
+                Some(AUTH_METHOD_KEY) => {
+                    if key_available(info) {
+                        reply_ok(writer, id, json!({})).await;
+                    } else {
+                        reply_err(writer, id, codes::AUTH_REQUIRED, NO_KEY_MESSAGE).await;
+                    }
+                }
+                Some(AUTH_METHOD_SETUP) => {
+                    reply_err(
+                        writer,
+                        id,
+                        codes::INVALID_PARAMS,
+                        "hotl-setup is a terminal method — run `hotl setup` instead of sending authenticate",
+                    )
+                    .await
+                }
+                Some(other) => {
+                    reply_err(
+                        writer,
+                        id,
+                        codes::INVALID_PARAMS,
+                        &format!("unknown authentication method `{other}`"),
+                    )
+                    .await
+                }
+                None => {
+                    reply_err(
+                        writer,
+                        id,
+                        codes::INVALID_PARAMS,
+                        "authenticate requires params.methodId",
+                    )
+                    .await
+                }
+            }
+        }
         method @ ("session/new" | "session/load") => {
+            if !key_available(info) {
+                return reply_err(writer, id, codes::AUTH_REQUIRED, NO_KEY_MESSAGE).await;
+            }
             let name = match msg.pointer("/params/name") {
                 None | Some(Value::Null) => None,
                 Some(v) => match v.as_str().and_then(hotl_types::normalize_session_name) {
@@ -2335,9 +2382,38 @@ pub struct HotlInit {
     pub extensions: Vec<String>,
 }
 
+pub const AUTH_METHOD_KEY: &str = "hotl-key";
+pub const AUTH_METHOD_SETUP: &str = "hotl-setup";
+pub const NO_KEY_MESSAGE: &str = "no API key — run `hotl setup`";
+
+pub fn key_available(info: &ServerInfo) -> bool {
+    info.key_available
+}
+
+fn auth_methods(client_caps: ClientCaps) -> Vec<AuthMethod> {
+    let mut methods = vec![AuthMethod::Agent {
+        id: AUTH_METHOD_KEY.into(),
+        name: "API key from hotl config".into(),
+        description: Some("Uses the key hotl setup stored, or the provider's env var".into()),
+        meta: None,
+    }];
+    if client_caps.auth_terminal {
+        methods.push(AuthMethod::Terminal {
+            id: AUTH_METHOD_SETUP.into(),
+            name: "Run hotl setup".into(),
+            args: vec!["setup".into()],
+            env: None,
+            description: None,
+            meta: None,
+        });
+    }
+    methods
+}
+
 pub const META_INIT: &str = "hotl.dev/init";
 
-pub fn initialize_response(info: &ServerInfo, ext: bool) -> InitializeResponse {
+pub fn initialize_response(info: &ServerInfo, client_caps: ClientCaps) -> InitializeResponse {
+    let ext = client_caps.ext;
     let meta = ext.then(|| {
         let init = HotlInit {
             skills: skill_roster(info),
@@ -2373,7 +2449,7 @@ pub fn initialize_response(info: &ServerInfo, ext: bool) -> InitializeResponse {
             },
             meta,
         },
-        auth_methods: Vec::new(),
+        auth_methods: auth_methods(client_caps),
         agent_info: Implementation {
             name: "hotl".into(),
             title: Some("hotl".into()),

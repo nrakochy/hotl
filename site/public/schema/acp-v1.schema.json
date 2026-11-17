@@ -302,6 +302,92 @@
       ],
       "type": "object"
     },
+    "AuthMethod": {
+      "oneOf": [
+        {
+          "properties": {
+            "_meta": {
+              "additionalProperties": true,
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "const": "agent",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "name"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "_meta": {
+              "additionalProperties": true,
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "args": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "env": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "const": "terminal",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "name",
+            "args"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "Cancelled": {
       "properties": {
         "cancelled": {
@@ -1594,7 +1680,9 @@
           "$ref": "#/$defs/Implementation"
         },
         "authMethods": {
-          "items": true,
+          "items": {
+            "$ref": "#/$defs/AuthMethod"
+          },
           "type": "array"
         },
         "protocolVersion": {

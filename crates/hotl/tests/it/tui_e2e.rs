@@ -324,6 +324,7 @@ async fn start_with(factory: acp::SessionFactory) -> (Client, Reader) {
             context_window: 200_000,
             stream_idle_secs: 90,
             model_resolver: None,
+            key_available: true,
             model: "m".into(),
         },
         None,

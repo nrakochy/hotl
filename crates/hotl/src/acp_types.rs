@@ -26,7 +26,7 @@ impl ErrorObject {
 #[serde(rename_all = "camelCase")]
 pub struct InitializeRequest {
     #[serde(default)]
-    pub protocol_version: Option<u16>,
+    pub protocol_version: Option<Value>,
     #[serde(default)]
     pub client_capabilities: ClientCapabilities,
     #[serde(default)]
@@ -91,10 +91,41 @@ pub struct Implementation {
 pub struct InitializeResponse {
     pub protocol_version: u16,
     pub agent_capabilities: AgentCapabilities,
-    pub auth_methods: Vec<Value>,
+    pub auth_methods: Vec<AuthMethod>,
     pub agent_info: Implementation,
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum AuthMethod {
+    Agent {
+        id: String,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+        meta: Option<Meta>,
+    },
+    Terminal {
+        id: String,
+        name: String,
+        args: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        env: Option<std::collections::BTreeMap<String, String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+        meta: Option<Meta>,
+    },
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthenticateRequest {
+    #[serde(default)]
+    pub method_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]

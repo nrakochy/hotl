@@ -30,6 +30,7 @@ fn server_info() -> acp::ServerInfo {
         context_window: 200_000,
         stream_idle_secs: 90,
         model_resolver: None,
+        key_available: true,
         // Uncatalogued deliberately: matches `scripted_factory`'s session log
         // model ("m"), and keeps `cost_usd` absent for scenarios that don't
         // test pricing.
@@ -1159,7 +1160,6 @@ async fn initialize_new_prompt_permission_and_result() {
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
 
-    // 1. initialize.
     send(
         &mut cwrite,
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}),
@@ -1917,6 +1917,7 @@ async fn the_session_reports_its_effective_mode() {
             context_window: 1_000_000,
             stream_idle_secs: 90,
             model_resolver: None,
+            key_available: true,
             model: "m".into(),
         },
         None,
@@ -2104,6 +2105,7 @@ fn test_resolver() -> acp::ModelResolver {
 fn server_info_with_resolver() -> acp::ServerInfo {
     acp::ServerInfo {
         model_resolver: Some(test_resolver()),
+        key_available: true,
         ..server_info()
     }
 }
@@ -2714,6 +2716,7 @@ async fn reload_config_swaps_the_engine_and_broadcasts_the_new_truth() {
         context_window: 900_000,
         stream_idle_secs: 90,
         model_resolver: None,
+        key_available: true,
         model: "m2".into(),
     };
     // What `SessionSpec::Load` the replacement factory is handed, so this test
@@ -3587,15 +3590,13 @@ async fn session_children_stop_interrupts_by_id_and_unknown_ids_say_so() {
 }
 
 async fn initialize_with(params: Value) -> Value {
+    initialize_with_info(params, server_info()).await
+}
+
+async fn initialize_with_info(params: Value, info: acp::ServerInfo) -> Value {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(
-        sread,
-        swrite,
-        scripted_factory(),
-        server_info(),
-        None,
-    ));
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), info, None));
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
     send(
@@ -3613,7 +3614,15 @@ async fn initialize_answers_v1() {
     assert_eq!(r["agentInfo"]["name"], "hotl");
     assert_eq!(r["agentInfo"]["title"], "hotl");
     assert_eq!(r["agentInfo"]["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(r["authMethods"], json!([]));
+    assert_eq!(
+        r["authMethods"],
+        json!([{
+            "id": "hotl-key",
+            "name": "API key from hotl config",
+            "description": "Uses the key hotl setup stored, or the provider's env var",
+            "type": "agent"
+        }])
+    );
     let caps = &r["agentCapabilities"];
     assert_eq!(caps["loadSession"], true);
     assert_eq!(
@@ -3808,4 +3817,114 @@ async fn a_request_with_no_open_session_is_32002() {
 fn ext_names_carry_the_hotl_prefix() {
     assert_eq!(crate::acp_ext::ext("session/steer"), "_hotl/session/steer");
     assert_eq!(crate::acp_ext::META_EXT, "hotl.dev/extensions");
+}
+
+#[tokio::test]
+async fn auth_methods_list_agent_method() {
+    let r = initialize_with(json!({"protocolVersion": 1})).await;
+    let methods = r["authMethods"].as_array().unwrap();
+    assert_eq!(methods.len(), 1);
+    assert_eq!(methods[0]["id"], "hotl-key");
+    assert_eq!(methods[0]["type"], "agent");
+}
+
+#[tokio::test]
+async fn terminal_method_only_when_client_offers_it() {
+    let r = initialize_with(json!({
+        "protocolVersion": 1,
+        "clientCapabilities": {"auth": {"terminal": true}}
+    }))
+    .await;
+    let methods = r["authMethods"].as_array().unwrap();
+    assert_eq!(methods.len(), 2);
+    assert_eq!(
+        methods[1],
+        json!({"id": "hotl-setup", "name": "Run hotl setup", "type": "terminal", "args": ["setup"]})
+    );
+}
+
+#[tokio::test]
+async fn initialize_with_a_string_version_keeps_the_opt_in() {
+    for version in [json!("0.1"), json!(70000)] {
+        let r = initialize_with(json!({
+            "protocolVersion": version,
+            "clientCapabilities": {"_meta": {"hotl.dev/extensions": 1}}
+        }))
+        .await;
+        assert_eq!(r["protocolVersion"], json!(1));
+        assert!(r["agentCapabilities"]["_meta"]["hotl.dev/init"].is_object());
+    }
+}
+
+async fn rpc_with_info(info: acp::ServerInfo, calls: Vec<Value>) -> Vec<Value> {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), info, None));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    let mut out = Vec::new();
+    for (i, call) in calls.into_iter().enumerate() {
+        let mut call = call;
+        call["jsonrpc"] = json!("2.0");
+        call["id"] = json!(i + 1);
+        send(&mut cwrite, call).await;
+        out.push(read_until_id(&mut lines, i as u64 + 1).await);
+    }
+    out
+}
+
+fn no_key_info() -> acp::ServerInfo {
+    acp::ServerInfo {
+        key_available: false,
+        ..server_info()
+    }
+}
+
+#[tokio::test]
+async fn session_new_without_a_key_is_auth_required() {
+    let r = rpc_with_info(
+        no_key_info(),
+        vec![
+            json!({"method":"initialize","params":{"protocolVersion":1}}),
+            json!({"method":"session/new","params":{}}),
+            json!({"method":"session/load","params":{"sessionId":"01ABC"}}),
+        ],
+    )
+    .await;
+    for reply in &r[1..] {
+        assert_eq!(reply["error"]["code"], -32000, "{reply}");
+        assert_eq!(reply["error"]["message"], "no API key — run `hotl setup`");
+    }
+}
+
+#[tokio::test]
+async fn authenticate_checks_the_key() {
+    let ok = rpc_with_info(
+        server_info(),
+        vec![json!({"method":"authenticate","params":{"methodId":"hotl-key"}})],
+    )
+    .await;
+    assert_eq!(ok[0]["result"], json!({}));
+    let none = rpc_with_info(
+        no_key_info(),
+        vec![json!({"method":"authenticate","params":{"methodId":"hotl-key"}})],
+    )
+    .await;
+    assert_eq!(none[0]["error"]["code"], -32000);
+}
+
+#[tokio::test]
+async fn authenticate_rejects_unknown_and_terminal_methods() {
+    let r = rpc_with_info(
+        server_info(),
+        vec![
+            json!({"method":"authenticate","params":{"methodId":"nope"}}),
+            json!({"method":"authenticate","params":{"methodId":"hotl-setup"}}),
+            json!({"method":"authenticate","params":{}}),
+        ],
+    )
+    .await;
+    for reply in &r {
+        assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    }
 }
