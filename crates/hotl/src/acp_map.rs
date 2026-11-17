@@ -4,10 +4,10 @@ use serde_json::Value;
 use crate::acp::{SessionOpen, SessionOpenExtras, WorktreeInfo};
 use crate::acp_types::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, Content, ContentBlock,
-    ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionConfigBoolean,
-    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelect,
-    SessionConfigSelectOption, SessionMode, SessionModeState, SessionUpdate, ToolCall,
-    ToolCallContent, ToolCallStatus, ToolKind, UnstructuredCommandInput,
+    ContentChunk, McpServer, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    SessionConfigBoolean, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelect, SessionConfigSelectOption, SessionMode, SessionModeState, SessionUpdate,
+    ToolCall, ToolCallContent, ToolCallStatus, ToolKind, UnstructuredCommandInput,
 };
 
 pub fn tool_kind(name: &str) -> ToolKind {
@@ -280,6 +280,70 @@ pub fn available_commands<'a>(
     }
 }
 
+pub fn mcp_from_acp(servers: &[McpServer]) -> Result<Vec<hotl_mcp::config::ServerConfig>, String> {
+    servers
+        .iter()
+        .map(|server| match server {
+            McpServer::Stdio(s) => {
+                let command = s.command.display().to_string();
+                if command.trim().is_empty() {
+                    return Err(format!("mcpServers: `{}` has an empty command", s.name));
+                }
+                Ok(hotl_mcp::config::ServerConfig {
+                    description: "passed in by the client".into(),
+                    args: s.args.clone(),
+                    env: s
+                        .env
+                        .iter()
+                        .map(|e| (e.name.clone(), e.value.clone()))
+                        .collect(),
+                    ..hotl_mcp::config::ServerConfig::stdio(&s.name, &command, &[])
+                })
+            }
+            McpServer::Http(s) => {
+                hotl_tools::plugins::validate_remote_url(&s.url)
+                    .map_err(|e| format!("mcpServers: `{}`: {e}", s.name))?;
+                Ok(hotl_mcp::config::ServerConfig {
+                    description: "passed in by the client".into(),
+                    headers: s
+                        .headers
+                        .iter()
+                        .map(|h| (h.name.clone(), h.value.clone()))
+                        .collect(),
+                    ..hotl_mcp::config::ServerConfig::http(&s.name, &s.url)
+                })
+            }
+            McpServer::Sse(s) => Err(format!(
+                "mcpServers: `{}` uses SSE, which hotl does not support; use http or stdio",
+                s.name
+            )),
+        })
+        .collect()
+}
+
+pub fn merge_mcp(
+    configured: &[hotl_mcp::config::ServerConfig],
+    client: Vec<hotl_mcp::config::ServerConfig>,
+) -> (Vec<hotl_mcp::config::ServerConfig>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut merged: Vec<_> = configured
+        .iter()
+        .filter(|c| {
+            let clash = client.iter().any(|s| s.name == c.name);
+            if clash {
+                warnings.push(format!(
+                    "MCP server `{}` from the client replaces the configured server of the same name",
+                    c.name
+                ));
+            }
+            !clash
+        })
+        .cloned()
+        .collect();
+    merged.extend(client);
+    (merged, warnings)
+}
+
 pub fn rfc3339(time: std::time::SystemTime) -> String {
     let secs = time
         .duration_since(std::time::UNIX_EPOCH)
@@ -535,6 +599,25 @@ mod tests {
         .unwrap();
         assert_eq!(options["sessionUpdate"], "config_option_update");
         assert_eq!(options["configOptions"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_client_server_replaces_a_configured_one_of_the_same_name() {
+        use hotl_mcp::config::ServerConfig;
+        let configured = vec![
+            ServerConfig::stdio("fs", "/bin/a", &[]),
+            ServerConfig::stdio("git", "/bin/g", &[]),
+        ];
+        let client = vec![
+            ServerConfig::stdio("fs", "/bin/b", &[]),
+            ServerConfig::http("docs", "https://example.com/mcp"),
+        ];
+        let (merged, warnings) = merge_mcp(&configured, client);
+        let names: Vec<_> = merged.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["git", "fs", "docs"]);
+        assert_eq!(merged[1].command.as_deref(), Some("/bin/b"));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("`fs`"), "{warnings:?}");
     }
 
     #[test]

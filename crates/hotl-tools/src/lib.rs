@@ -352,6 +352,12 @@ impl Registry {
         let _ = self.try_register(tool);
     }
 
+    pub fn replace(&mut self, tool: Box<dyn Tool>) {
+        let name = tool.name();
+        self.tools.retain(|t| t.name() != name);
+        self.tools.push(Arc::from(tool));
+    }
+
     /// Same, reporting the clash so a caller that can surface it does. The
     /// existing registration is the one kept.
     pub fn try_register(&mut self, tool: Box<dyn Tool>) -> Result<(), String> {

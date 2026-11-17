@@ -794,19 +794,26 @@ pub(crate) async fn build_acp_with(
         // typing-time trigger (first composer keystroke) has no ACP signal
         // to hang off today — see the task report for that deferral.
         scaffold.provider.arm().detach();
+        let client_mcp;
         let (resumed, requested, is_fork, worktree_arg, no_worktree, base, replay) = match spec {
             crate::acp::SessionSpec::New {
                 name,
                 worktree,
                 cwd,
-            } => (None, name, false, worktree, false, cwd, false),
+                mcp,
+            } => {
+                client_mcp = mcp;
+                (None, name, false, worktree, false, cwd, false)
+            }
             crate::acp::SessionSpec::Load {
                 session_id: sid,
                 name,
                 no_worktree,
                 cwd,
                 replay,
+                mcp,
             } => {
+                client_mcp = mcp;
                 let resumed = load_lineage(&sessions_dir(), &sid, KeepSpec::All)?;
                 // An explicit rename-on-resume beats the inherited name.
                 let name = name.or_else(|| resumed.inherited_name.clone());
@@ -821,15 +828,19 @@ pub(crate) async fn build_acp_with(
                 name,
                 worktree,
                 cwd,
-            } => (
-                Some(load_lineage(&sessions_dir(), &sid, keep)?),
-                name,
-                true,
-                worktree,
-                false,
-                cwd,
-                false,
-            ),
+                mcp,
+            } => {
+                client_mcp = mcp;
+                (
+                    Some(load_lineage(&sessions_dir(), &sid, keep)?),
+                    name,
+                    true,
+                    worktree,
+                    false,
+                    cwd,
+                    false,
+                )
+            }
         };
         // The worktree (0065): a cheap refusal before any log is minted.
         if let Some(arg) = &worktree_arg {
@@ -1097,8 +1108,19 @@ pub(crate) async fn build_acp_with(
         let plan_artifact = plan_files
             .as_ref()
             .map(|f| f.dir.join("current.md").display().to_string());
+        let mut session_registry = scaffold.registry_rooted(root.as_deref());
+        let mcp_warnings = if client_mcp.is_empty() {
+            Vec::new()
+        } else {
+            let (merged, warnings) = crate::acp_map::merge_mcp(&scaffold.mcp_servers, client_mcp);
+            session_registry.replace(Box::new(hotl_mcp::McpTool::new(
+                merged,
+                hotl_mcp::trust::TrustStore::load(&scaffold.config_dir),
+            )));
+            warnings
+        };
         let handle = spawn_interactive_session(
-            scaffold.registry_rooted(root.as_deref()),
+            session_registry,
             Some(scaffold.spawn_registration(session_id.clone(), root.as_deref())),
             Some(scaffold.recall_registration(session_id.clone())),
             scaffold.hooks.clone(),
@@ -1152,6 +1174,7 @@ pub(crate) async fn build_acp_with(
             // `session/reload_config`) must name to replay this chain.
             session_id,
             warnings: notices,
+            mcp_warnings,
             title: inherited_title,
             model: open_model,
             history,
@@ -1307,6 +1330,7 @@ struct Scaffold {
     cwd: PathBuf,
     config: EngineConfig,
     registry: Arc<Registry>,
+    mcp_servers: Vec<hotl_mcp::config::ServerConfig>,
     /// Loadable skill names with descriptions, produced by the registry's
     /// own discovery walk so nothing walks the skill roots a second time.
     skills: Vec<(String, String)>,
@@ -1478,6 +1502,7 @@ async fn scaffold(
         warnings: discovery_warnings,
         retrieval,
         skill_paths,
+        mcp_servers,
     } = build_registry(
         &cfg,
         &config_dir,
@@ -1520,6 +1545,7 @@ async fn scaffold(
         cwd,
         config,
         registry,
+        mcp_servers,
         skills,
         hooks,
         initial_helper_key,
@@ -2768,6 +2794,7 @@ struct BuiltRegistry {
     retrieval: Vec<hotl_retrieval::config::BackendConfig>,
     /// Skills with `paths:` (0068 D3), for the session config.
     skill_paths: Vec<hotl_tools::skills::SkillPathRule>,
+    mcp_servers: Vec<hotl_mcp::config::ServerConfig>,
 }
 
 fn build_registry(
@@ -2801,7 +2828,7 @@ fn build_registry(
     discovery_warnings.extend(mcp_warnings);
     if !servers.is_empty() {
         let trust = hotl_mcp::trust::TrustStore::load(config_dir);
-        registry.register(Box::new(hotl_mcp::McpTool::new(servers, trust)));
+        registry.register(Box::new(hotl_mcp::McpTool::new(servers.clone(), trust)));
     }
     // Every skill root (0068 D1): hotl's own, the project walk from cwd,
     // plugins, marketplaces, and the user convention dirs — each optional
@@ -2899,6 +2926,7 @@ fn build_registry(
         warnings: discovery_warnings,
         retrieval,
         skill_paths,
+        mcp_servers: servers,
     }
 }
 

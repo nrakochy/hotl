@@ -24,10 +24,11 @@ use crate::acp_types::{
     AgentCapabilities, AuthMethod, AuthenticateRequest, CloseSessionRequest, ConfigOptionUpdate,
     CurrentModeUpdate, ErrorObject, Implementation, InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    McpCapabilities, NewSessionRequest, NewSessionResponse, PromptCapabilities,
-    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionInfo,
-    SessionInfoUpdate, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, UsageUpdate,
+    McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse, Notice, NoticeSeverity,
+    PromptCapabilities, ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities,
+    SessionInfo, SessionInfoUpdate, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    UsageUpdate,
 };
 
 /// Stable schema version of `session/update` / prompt-result payloads (an MD
@@ -213,6 +214,7 @@ pub enum SessionSpec {
         /// `-w [name]` (0065): open a git worktree for this session.
         worktree: Option<WorktreeArg>,
         cwd: std::path::PathBuf,
+        mcp: Vec<hotl_mcp::config::ServerConfig>,
     },
     Load {
         session_id: String,
@@ -222,6 +224,7 @@ pub enum SessionSpec {
         no_worktree: bool,
         cwd: std::path::PathBuf,
         replay: bool,
+        mcp: Vec<hotl_mcp::config::ServerConfig>,
     },
     /// A **new** session seeded with another's projection — optionally only a
     /// prefix of it — pinned to that session's fork-time tip. Unlike `Load`,
@@ -235,6 +238,7 @@ pub enum SessionSpec {
         /// inherit the parent's (0065).
         worktree: Option<WorktreeArg>,
         cwd: std::path::PathBuf,
+        mcp: Vec<hotl_mcp::config::ServerConfig>,
     },
 }
 
@@ -298,6 +302,7 @@ pub struct SessionOpen {
     /// 0070 T9). The open reply carries them as `warnings`; the client shows
     /// each as a notice.
     pub warnings: Vec<String>,
+    pub mcp_warnings: Vec<String>,
     /// The generated title a resume restored (0071 T4); the open reply
     /// carries it as `title` (absent when none). A name outranks it.
     pub title: Option<String>,
@@ -502,6 +507,7 @@ struct SessionState {
     /// `session/reload_config`) has to name.
     store_id: String,
     cwd: std::path::PathBuf,
+    mcp: Vec<hotl_mcp::config::ServerConfig>,
     handle: SessionHandle,
     config: SharedConfig,
     drain: tokio::task::JoinHandle<()>,
@@ -609,6 +615,7 @@ async fn handle_request(
                 kind,
                 client_id,
                 cwd,
+                mcp,
             } = match parse_open(method, msg) {
                 Ok(o) => o,
                 Err(e) => return reply_err(writer, id, codes::INVALID_PARAMS, &e).await,
@@ -652,6 +659,10 @@ async fn handle_request(
             let todos = open.todos.clone();
             let title = open.name.clone().or_else(|| open.title.clone());
             let mut extras = crate::acp_map::open_extras(&open, &info.model);
+            let mcp_warnings = std::mem::take(&mut open.mcp_warnings);
+            if !client_caps.notices {
+                extras.warnings.extend(mcp_warnings.iter().cloned());
+            }
             let sid = match (&kind, client_id) {
                 (OpenKind::Load | OpenKind::Resume, Some(client_id)) => client_id,
                 _ => open.session_id.clone(),
@@ -672,6 +683,9 @@ async fn handle_request(
                 &info.fallback_models,
                 client_caps.ext,
             );
+            if let Some(state) = session.as_mut() {
+                state.mcp = mcp;
+            }
             let context_tokens = match session.as_ref() {
                 Some(state) => state
                     .handle
@@ -716,6 +730,21 @@ async fn handle_request(
             reply_ok(writer, id, result).await;
             if let Some(state) = session.as_mut() {
                 state.release_drain();
+            }
+            if client_caps.notices {
+                for warning in mcp_warnings {
+                    send_update(
+                        writer,
+                        &sid,
+                        SessionUpdate::Notice(Notice {
+                            severity: NoticeSeverity::Warning,
+                            title: warning,
+                            description: None,
+                            meta: None,
+                        }),
+                    )
+                    .await;
+                }
             }
             let commands = info
                 .skills
@@ -1397,10 +1426,14 @@ async fn handle_request(
             *info = new_info;
             // No live session: the new factory is in place and the next
             // `session/new` gets the reloaded engine. Nothing to re-open.
-            let Some((client_id, store_id, cwd)) = session
-                .as_ref()
-                .map(|s| (s.id.clone(), s.store_id.clone(), s.cwd.clone()))
-            else {
+            let Some((client_id, store_id, cwd, mcp)) = session.as_ref().map(|s| {
+                (
+                    s.id.clone(),
+                    s.store_id.clone(),
+                    s.cwd.clone(),
+                    s.mcp.clone(),
+                )
+            }) else {
                 return reply_ok(
                     writer,
                     id,
@@ -1424,6 +1457,7 @@ async fn handle_request(
                 no_worktree: false,
                 cwd: cwd.clone(),
                 replay: false,
+                mcp: mcp.clone(),
             };
             match factory(spec) {
                 Ok(open) => {
@@ -1446,6 +1480,9 @@ async fn handle_request(
                         &info.fallback_models,
                         client_caps.ext,
                     );
+                    if let Some(state) = session.as_mut() {
+                        state.mcp = mcp;
+                    }
                     let skills = skill_roster(info);
                     let workflows = workflow_roster(info);
                     reply_ok(
@@ -1762,6 +1799,7 @@ struct Opening {
     kind: OpenKind,
     client_id: Option<String>,
     cwd: std::path::PathBuf,
+    mcp: Vec<hotl_mcp::config::ServerConfig>,
 }
 
 #[derive(Default)]
@@ -1809,11 +1847,14 @@ fn session_root(cwd: &std::path::Path) -> Result<std::path::PathBuf, String> {
     Ok(cwd.to_path_buf())
 }
 
-fn check_mcp_servers(msg: &Value) -> Result<(), String> {
-    match msg.pointer("/params/mcpServers") {
-        None | Some(Value::Null) | Some(Value::Array(_)) => Ok(()),
-        Some(_) => Err("params.mcpServers must be an array".into()),
-    }
+fn mcp_servers_param(msg: &Value) -> Result<Vec<hotl_mcp::config::ServerConfig>, String> {
+    let listed: Vec<McpServer> = match msg.pointer("/params/mcpServers") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v @ Value::Array(_)) => serde_json::from_value(v.clone())
+            .map_err(|e| format!("invalid params.mcpServers: {e}"))?,
+        Some(_) => return Err("params.mcpServers must be an array".into()),
+    };
+    crate::acp_map::mcp_from_acp(&listed)
 }
 
 fn parse_params<T: serde::de::DeserializeOwned>(method: &str, msg: &Value) -> Result<T, String> {
@@ -1832,7 +1873,7 @@ fn parse_open(method: &str, msg: &Value) -> Result<Opening, String> {
 }
 
 fn parse_new(method: &str, msg: &Value) -> Result<Opening, String> {
-    check_mcp_servers(msg)?;
+    let mcp = mcp_servers_param(msg)?;
     let request: NewSessionRequest = parse_params(method, msg)?;
     let cwd = session_root(&request.cwd)?;
     let meta = open_meta(request.meta.as_ref())?;
@@ -1844,10 +1885,12 @@ fn parse_new(method: &str, msg: &Value) -> Result<Opening, String> {
             name: meta.name,
             worktree: meta.worktree,
             cwd: cwd.clone(),
+            mcp: mcp.clone(),
         },
         kind: OpenKind::New,
         client_id: None,
         cwd,
+        mcp,
     })
 }
 
@@ -1859,7 +1902,7 @@ fn parse_load(method: &str, msg: &Value) -> Result<Opening, String> {
             ));
         }
     }
-    check_mcp_servers(msg)?;
+    let mcp = mcp_servers_param(msg)?;
     let (session_id, cwd, meta, kind) = if method == "session/load" {
         let r: LoadSessionRequest = parse_params(method, msg)?;
         (r.session_id, r.cwd, r.meta, OpenKind::Load)
@@ -1883,10 +1926,12 @@ fn parse_load(method: &str, msg: &Value) -> Result<Opening, String> {
             no_worktree: meta.no_worktree,
             cwd: cwd.clone(),
             replay: kind == OpenKind::Load,
+            mcp: mcp.clone(),
         },
         kind,
         client_id: Some(session_id),
         cwd,
+        mcp,
     })
 }
 
@@ -1895,6 +1940,7 @@ fn parse_fork(method: &str, msg: &Value) -> Result<Opening, String> {
         .pointer("/params/sessionId")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{method} requires params.sessionId"))?;
+    let mcp = mcp_servers_param(msg)?;
     let keep = keep_spec(msg)?;
     let name = session_name_param(msg.pointer("/params/name"), "params.name")?;
     let worktree = msg
@@ -1912,10 +1958,12 @@ fn parse_fork(method: &str, msg: &Value) -> Result<Opening, String> {
             name,
             worktree,
             cwd: cwd.clone(),
+            mcp: mcp.clone(),
         },
         kind: OpenKind::Fork,
         client_id: None,
         cwd,
+        mcp,
     })
 }
 
@@ -2154,6 +2202,7 @@ fn start_session(
         id,
         store_id,
         cwd: std::path::PathBuf::new(),
+        mcp: Vec::new(),
         handle,
         config,
         drain,

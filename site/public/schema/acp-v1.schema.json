@@ -1944,6 +1944,42 @@
       ],
       "type": "object"
     },
+    "Notice": {
+      "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "severity": {
+          "$ref": "#/$defs/NoticeSeverity"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "severity",
+        "title"
+      ],
+      "type": "object"
+    },
+    "NoticeSeverity": {
+      "enum": [
+        "info",
+        "warning",
+        "error"
+      ],
+      "type": "string"
+    },
     "OutcomeFrame": {
       "description": "A turn outcome, tagged by `kind`.",
       "oneOf": [
@@ -3035,6 +3071,19 @@
           "properties": {
             "sessionUpdate": {
               "const": "config_option_update",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/Notice",
+          "properties": {
+            "sessionUpdate": {
+              "const": "notice",
               "type": "string"
             }
           },

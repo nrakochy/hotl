@@ -77,6 +77,7 @@ fn memory_factory(mem: std::path::PathBuf) -> acp::SessionFactory {
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title: None,
             model: None,
         })
@@ -220,6 +221,7 @@ fn scripted_factory() -> acp::SessionFactory {
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title: None,
             model: None,
         })
@@ -300,6 +302,7 @@ fn scripted_ask_user_factory() -> acp::SessionFactory {
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title: None,
             model: None,
         })

@@ -138,6 +138,7 @@ fn scripted_factory_recording(
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title: None,
             model: None,
         })
@@ -209,6 +210,7 @@ fn interrupted_factory(seen: Arc<std::sync::Mutex<Vec<String>>>) -> acp::Session
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title: None,
             model: None,
         })
@@ -417,6 +419,7 @@ fn inherited_state_factory(effort: Option<Option<String>>) -> acp::SessionFactor
             previous_model: Some("old-m".into()),
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title: None,
             model: None,
         })
@@ -589,6 +592,7 @@ async fn the_open_reply_carries_the_title_and_session_titled_is_broadcast() {
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title,
             model: None,
         })
@@ -905,6 +909,7 @@ async fn session_aside_acks_then_broadcasts_the_answer() {
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title: None,
             model: None,
         })
@@ -1307,6 +1312,7 @@ async fn overlapping_prompts_resolve_in_order() {
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title: None,
             model: None,
         })
@@ -1531,6 +1537,7 @@ async fn prompt_images_are_validated_at_the_wire() {
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title: None,
             model: None,
         })
@@ -1806,6 +1813,7 @@ async fn ask_user_round_trip_via_session_request_question() {
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title: None,
             model: None,
         })
@@ -2464,6 +2472,7 @@ async fn a_resumed_session_runs_its_last_model_set() {
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title: None,
             model: switched.then(|| "openai-responses/gpt-5.6".to_string()),
         })
@@ -2768,6 +2777,7 @@ async fn the_open_reply_carries_the_resumed_goal_and_a_forks_is_null() {
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title: None,
             model: None,
         })
@@ -3169,6 +3179,7 @@ fn memory_factory(
             color: None,
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title: None,
             model: None,
         })
@@ -3424,6 +3435,7 @@ fn jobs_factory(command: &str) -> acp::SessionFactory {
             color: None,
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title: None,
             model: None,
         })
@@ -3665,6 +3677,7 @@ fn children_factory() -> acp::SessionFactory {
             color: None,
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title: None,
             model: None,
         })
@@ -4232,6 +4245,7 @@ fn history_factory(
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title: None,
             model: None,
         })
@@ -4738,6 +4752,7 @@ fn store_factory(
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
             title: None,
             model: None,
         })
@@ -4917,4 +4932,201 @@ async fn list_matches_a_cwd_by_its_real_path() {
         path.as_str(),
         "{listed}"
     );
+}
+
+type SeenMcp = Arc<std::sync::Mutex<Vec<(String, Vec<hotl_mcp::config::ServerConfig>)>>>;
+
+fn mcp_recording_factory(seen: SeenMcp, warnings: Vec<String>) -> acp::SessionFactory {
+    let mut inner = scripted_factory();
+    Box::new(move |spec| {
+        let (kind, mcp) = match &spec {
+            acp::SessionSpec::New { mcp, .. } => ("new", mcp.clone()),
+            acp::SessionSpec::Load { mcp, .. } => ("load", mcp.clone()),
+            acp::SessionSpec::Fork { mcp, .. } => ("fork", mcp.clone()),
+        };
+        seen.lock().unwrap().push((kind.to_string(), mcp));
+        let mut open = inner(spec)?;
+        open.mcp_warnings = warnings.clone();
+        Ok(open)
+    })
+}
+
+async fn connect_caps(
+    factory: acp::SessionFactory,
+    init: Value,
+) -> (
+    impl AsyncWriteExt + Unpin,
+    tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
+) {
+    let (client, server) = tokio::io::duplex(256 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(sread, swrite, factory, server_info(), None));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init}),
+    )
+    .await;
+    read_until_id(&mut lines, 1).await;
+    (cwrite, lines)
+}
+
+#[tokio::test]
+async fn session_new_connects_a_client_stdio_mcp_server() {
+    let seen: SeenMcp = Default::default();
+    let (mut w, mut lines) = connect_caps(
+        mcp_recording_factory(seen.clone(), Vec::new()),
+        init_params(),
+    )
+    .await;
+    let servers = json!([
+        {"name": "fs", "command": "/bin/echo", "args": ["a", "b"],
+         "env": [{"name": "TOKEN", "value": "x"}, {"name": "MODE", "value": "y"}]},
+        {"type": "http", "name": "docs", "url": "https://example.com/mcp",
+         "headers": [{"name": "X-Key", "value": "k"}]}
+    ]);
+    let calls = [
+        (
+            "session/new",
+            json!({"cwd": std::env::temp_dir(), "mcpServers": servers}),
+        ),
+        (
+            "session/load",
+            json!({"sessionId": "S1", "cwd": std::env::temp_dir(), "mcpServers": servers}),
+        ),
+        (
+            "session/resume",
+            json!({"sessionId": "S1", "cwd": std::env::temp_dir(), "mcpServers": servers}),
+        ),
+        (
+            "_hotl/session/fork",
+            json!({"sessionId": "S1", "cwd": std::env::temp_dir(), "mcpServers": servers}),
+        ),
+    ];
+    for (i, (method, params)) in calls.into_iter().enumerate() {
+        let id = 10 + i as u64;
+        send(
+            &mut w,
+            json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+        )
+        .await;
+        let r = read_until_id(&mut lines, id).await;
+        assert!(r.get("error").is_none(), "{method}: {r}");
+    }
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        ["new", "load", "load", "fork"]
+    );
+    for (_, mcp) in seen.iter() {
+        assert_eq!(mcp.len(), 2);
+        assert_eq!(mcp[0].name, "fs");
+        assert_eq!(mcp[0].command.as_deref(), Some("/bin/echo"));
+        assert_eq!(mcp[0].args, ["a", "b"]);
+        assert_eq!(
+            mcp[0].env,
+            [("TOKEN".into(), "x".into()), ("MODE".into(), "y".into())]
+        );
+        assert_eq!(mcp[1].name, "docs");
+        assert_eq!(mcp[1].url.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(mcp[1].headers, [("X-Key".into(), "k".into())]);
+    }
+}
+
+#[tokio::test]
+async fn sse_server_is_rejected() {
+    let seen: SeenMcp = Default::default();
+    let (mut w, mut lines) = connect_caps(
+        mcp_recording_factory(seen.clone(), Vec::new()),
+        init_params(),
+    )
+    .await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":10,"method":"session/new","params":{
+            "cwd": std::env::temp_dir(),
+            "mcpServers": [{"type": "sse", "name": "old", "url": "https://example.com/sse", "headers": []}]
+        }}),
+    )
+    .await;
+    let r = read_until_id(&mut lines, 10).await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn mcp_warnings_follow_what_the_client_can_show() {
+    let warning = "MCP server `fs` from the client replaces the configured one".to_string();
+    let noticed = json!({"protocolVersion": 1, "clientCapabilities": {
+        "_meta": {"hotl.dev/extensions": 1}, "session": {"notices": {}}}});
+    let (mut w, mut lines) = connect_caps(
+        mcp_recording_factory(Default::default(), vec![warning.clone()]),
+        noticed,
+    )
+    .await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":10,"method":"session/new","params":new_params()}),
+    )
+    .await;
+    let mut frames = Vec::new();
+    loop {
+        let m = next_raw(&mut lines).await;
+        let done = m.get("id") == Some(&json!(10));
+        frames.push(m);
+        if done {
+            break;
+        }
+    }
+    let reply = frames.last().unwrap();
+    assert!(
+        !open_of(reply)["warnings"].to_string().contains("replaces"),
+        "{reply}"
+    );
+    let notice = next_matching_raw(&mut lines, |m| {
+        m["params"]["update"]["sessionUpdate"] == "notice"
+    })
+    .await;
+    assert_eq!(notice["params"]["update"]["severity"], "warning");
+    assert_eq!(notice["params"]["update"]["title"], warning);
+
+    let (mut w, mut lines) = connect_caps(
+        mcp_recording_factory(Default::default(), vec![warning.clone()]),
+        init_params(),
+    )
+    .await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":10,"method":"session/new","params":new_params()}),
+    )
+    .await;
+    let r = read_until_id(&mut lines, 10).await;
+    assert_eq!(open_of(&r)["warnings"], json!([warning]), "{r}");
+
+    let (mut w, mut lines) = connect_caps(
+        mcp_recording_factory(Default::default(), vec![warning]),
+        json!({"protocolVersion": 1}),
+    )
+    .await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":10,"method":"session/new","params":new_params()}),
+    )
+    .await;
+    let r = read_until_id(&mut lines, 10).await;
+    assert!(r["result"].get("_meta").is_none(), "{r}");
+}
+
+async fn next_matching_raw(
+    lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
+    want: impl Fn(&Value) -> bool,
+) -> Value {
+    for _ in 0..12 {
+        let m = next_raw(lines).await;
+        if want(&m) {
+            return m;
+        }
+    }
+    panic!("no matching frame in 12 tries");
 }

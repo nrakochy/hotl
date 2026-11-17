@@ -353,6 +353,26 @@ pub enum SessionUpdate {
     SessionInfoUpdate(SessionInfoUpdate),
     CurrentModeUpdate(CurrentModeUpdate),
     ConfigOptionUpdate(ConfigOptionUpdate),
+    Notice(Notice),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Notice {
+    pub severity: NoticeSeverity,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
