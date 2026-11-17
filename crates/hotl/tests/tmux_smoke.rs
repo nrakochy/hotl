@@ -32,6 +32,8 @@ struct SmokeConfig {
     vim_mode: bool,
     extra_toml: &'static str,
     editor: Option<String>,
+    /// A headless `-p` run first, named `seeded`: a second session on disk.
+    seed_prompt: Option<&'static str>,
 }
 
 impl Default for SmokeConfig {
@@ -43,6 +45,7 @@ impl Default for SmokeConfig {
             vim_mode: false,
             extra_toml: "",
             editor: None,
+            seed_prompt: None,
         }
     }
 }
@@ -145,6 +148,15 @@ async fn launch(
     ];
     if let Some(editor) = &cfg.editor {
         env.push(("EDITOR".to_string(), editor.clone()));
+    }
+    if let Some(prompt) = cfg.seed_prompt {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_hotl"))
+            .args(["-n", "seeded", "-p", prompt])
+            .current_dir(&work)
+            .envs(env.iter().cloned())
+            .output()
+            .expect("seed run");
+        assert!(out.status.success(), "seed run failed: {out:?}");
     }
     // The TUI draws on stdout; startup warnings go to stderr, which would
     // land in the pane and corrupt every frame. A file keeps them readable.
@@ -750,4 +762,58 @@ async fn a_long_answer_wraps_inside_the_measure_on_160_columns() {
             "a prose row runs past the measure ({last} cols): {r}"
         );
     }
+}
+
+// --- /resume: switch sessions without leaving the console ---------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slash_resume_lists_sessions_and_switches_to_the_picked_one() {
+    let Some((smoke, _serial)) = launch(
+        SmokeConfig {
+            seed_prompt: Some("seed question"),
+            ..SmokeConfig::default()
+        },
+        Script::queue(vec![
+            fake::text("seeded answer").into(),
+            fake::text("resumed answer").into(),
+        ]),
+    )
+    .await
+    else {
+        return;
+    };
+    smoke.tmux.type_line("/resume");
+    let rows = smoke.wait_any_row("the session listing", "  seeded  ", s(5));
+    assert!(
+        rows.iter().any(|r| r.contains("saved sessions")),
+        "{rows:#?}"
+    );
+    // Pick by the number the listing gave the seeded session.
+    let row = rows.iter().find(|r| r.contains("  seeded  ")).unwrap();
+    let n: String = row
+        .split(')')
+        .next()
+        .unwrap()
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect();
+    smoke.tmux.type_line(&format!("/resume {n}"));
+    smoke.tmux.wait_for(
+        "the view cleared and the strip naming the seeded session",
+        |rows| {
+            !rows.iter().any(|r| r.contains("saved sessions"))
+                && strip_of(rows).is_some_and(|r| r.contains("seeded"))
+        },
+        s(10),
+    );
+    // The next prompt continues the seeded session's conversation.
+    smoke.tmux.type_line("next");
+    smoke.wait_any_row("the reply", "resumed answer", s(15));
+    smoke.wait_at_rest(s(10));
+    let reqs = smoke.fake.requests();
+    assert_eq!(reqs.len(), 2, "{reqs:#?}");
+    let sent = reqs[1]["messages"].to_string();
+    assert!(sent.contains("seed question"), "{sent}");
+    assert!(sent.contains("seeded answer"), "{sent}");
+    assert!(sent.contains("next"), "{sent}");
 }

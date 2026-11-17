@@ -27,7 +27,7 @@ pub struct Completion {
 
 /// The TUI's own commands, in `slash_command`'s dispatch order. Descriptions
 /// are hand-written here because built-ins have no roster to read them from.
-const BUILTINS: [(&str, &str); 20] = [
+const BUILTINS: [(&str, &str); 21] = [
     ("rename", "name this session"),
     ("plan", "toggle plan mode (file edits always ask)"),
     ("mode", "set the permission mode"),
@@ -52,6 +52,7 @@ const BUILTINS: [(&str, &str); 20] = [
         "second opinion on a diff, in a fresh read-only agent",
     ),
     ("clear", "clear the transcript view"),
+    ("resume", "switch to a saved session; bare lists them"),
     ("quit", "leave the console"),
     (
         "btw",
@@ -251,6 +252,7 @@ mod tests {
                 "effort",
                 "reload",
                 "rename",
+                "resume",
                 "review",
                 "status",
                 "compact",
@@ -278,6 +280,7 @@ mod tests {
             vec![
                 "reload",
                 "rename",
+                "resume",
                 "review",
                 "remember",
                 "refactor",

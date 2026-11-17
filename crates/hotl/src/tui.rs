@@ -115,21 +115,44 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     };
     let (mut client, mut reader, model, opened) = match opened {
         Ok(o) => o,
-        Err(OpenFail::Code(code)) => {
-            drop(guard);
-            // The factory's own diagnostics went to the (now discarded) alt
-            // screen; leave a pointer that survives the restore.
-            eprintln!(
-                "hotl: session startup failed — run `hotl doctor` (or `hotl -p \"hi\"`) to see the error"
-            );
-            return code;
-        }
-        Err(OpenFail::Msg(e)) => {
+        Err(e) => {
             drop(guard);
             eprintln!("hotl: {e}");
             return 1;
         }
     };
+    seed_state(&mut state, model, opened, first_run_hint);
+    // A prompt typed and entered during the open window fires now, through
+    // the normal submit path — exactly one SendPrompt, history included.
+    let initial: VecDeque<Cmd> = hotl_tui::app::fire_queued_submit(&mut state).into();
+    let result = run_loop(
+        &mut guard,
+        &mut client,
+        &mut reader,
+        keys,
+        &suspended,
+        state,
+        settings.palette,
+        history_store,
+        settings.copy_on_select,
+        cache,
+        initial,
+    )
+    .await;
+    drop(guard);
+    match result {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("hotl: {e}");
+            1
+        }
+    }
+}
+
+/// Point a fresh `State` at a just-opened session: server-side truth for
+/// the strip and title, then the notices the open produced. Startup and
+/// `/resume` both land here.
+fn seed_state(state: &mut State, model: String, opened: Opened, first_run_hint: Option<String>) {
     let Opened {
         name: session_name,
         skills,
@@ -205,46 +228,14 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
             .transcript
             .push(hotl_tui::app::TranscriptItem::Notice { text: w.into() });
     }
-    // A prompt typed and entered during the open window fires now, through
-    // the normal submit path — exactly one SendPrompt, history included.
-    let initial: VecDeque<Cmd> = hotl_tui::app::fire_queued_submit(&mut state).into();
-    let result = run_loop(
-        &mut guard,
-        &mut client,
-        &mut reader,
-        keys,
-        &suspended,
-        state,
-        settings.palette,
-        history_store,
-        settings.copy_on_select,
-        cache,
-        initial,
-    )
-    .await;
-    drop(guard);
-    match result {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("hotl: {e}");
-            1
-        }
-    }
 }
 
-/// How an [`open_session`] failure surfaces: the factory exits with a code
-/// (it printed its own diagnostics), the handshake with a message.
-enum OpenFail {
-    Code(i32),
-    Msg(String),
-}
-
-/// The whole open sequence — factory, in-process server, handshake — as one
-/// future the pre-open loop drives concurrently with typing (0033 Task 8b).
-async fn open_session(
-    tui_args: TuiArgs,
-) -> Result<(Client, ServerReader, String, Opened), OpenFail> {
-    let (factory, model, info) = crate::agent::acp_factory().await.map_err(OpenFail::Code)?;
+/// Build the engine and open the session. Runs with the screen already
+/// taken, so nothing here prints: startup warnings ride `Opened::warnings`
+/// into transcript notices and a failure comes back as its message.
+async fn open_session(tui_args: TuiArgs) -> Result<(Client, ServerReader, String, Opened), String> {
+    let (factory, info, startup_warnings) = crate::agent::build_acp().await?;
+    let model = info.model.clone();
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server_io);
     // `serve` with the reload hook: `/reload` asks the engine to rebuild
@@ -260,9 +251,8 @@ async fn open_session(
     let (cread, cwrite) = tokio::io::split(client_io);
     let mut reader = FrameReader::new(cread);
     let mut client = AcpClient::new(cwrite);
-    let opened = handshake(&mut client, &mut reader, tui_args)
-        .await
-        .map_err(OpenFail::Msg)?;
+    let mut opened = handshake(&mut client, &mut reader, tui_args).await?;
+    opened.warnings.splice(0..0, startup_warnings);
     Ok((client, reader, model, opened))
 }
 
@@ -581,6 +571,10 @@ async fn run_loop(
     let mut steer_ids: VecDeque<u64> = VecDeque::new();
     let mut model_ids: VecDeque<u64> = VecDeque::new();
     let mut remember_ids: VecDeque<u64> = VecDeque::new();
+    // What `/resume` re-seeds a switched-to session with: the process default
+    // model, and the ids its last listing numbered.
+    let default_model = state.model.clone();
+    let mut listed: Vec<String> = Vec::new();
     // The animation's own rate, armed only while a turn runs — idle schedules
     // no wakeups, which is also why the idle wave is a frozen frame.
     let mut ticker = tokio::time::interval(Duration::from_millis(1_000 / hotl_tui::anim::TICK_HZ));
@@ -674,6 +668,41 @@ async fn run_loop(
                             warnings: s.warnings,
                         },
                     ));
+                    needs_draw = true;
+                }
+                Cmd::Resume(arg) => {
+                    match resume_target(&arg, &mut listed) {
+                        Ok(ResumeTarget::Listing(lines)) => {
+                            for line in lines {
+                                push_notice(&mut state, line);
+                            }
+                        }
+                        Ok(ResumeTarget::Session(sid)) => {
+                            // The same open `-r` runs. A refused load leaves
+                            // the current session installed and untouched.
+                            match handshake(client, reader, TuiArgs::resume(sid)).await {
+                                Ok(opened) => {
+                                    let fresh = State::new(state.vim_mode, String::new());
+                                    let old = std::mem::replace(&mut state, fresh);
+                                    state.editor = old.editor;
+                                    state.density = old.density;
+                                    state.measure = old.measure;
+                                    seed_state(&mut state, default_model.clone(), opened, None);
+                                    cache = TranscriptCache::default();
+                                    // The server dropped the old session's
+                                    // pending requests with it.
+                                    prompt_ids.clear();
+                                    steer_ids.clear();
+                                    model_ids.clear();
+                                    remember_ids.clear();
+                                    listed.clear();
+                                    queue.extend(hotl_tui::app::opened_cmds(&state));
+                                }
+                                Err(e) => push_notice(&mut state, format!("/resume: {e}")),
+                            }
+                        }
+                        Err(e) => push_notice(&mut state, e),
+                    }
                     needs_draw = true;
                 }
                 Cmd::Quit => {
@@ -1155,6 +1184,21 @@ pub(crate) struct TuiArgs {
     pub no_worktree: bool,
 }
 
+impl TuiArgs {
+    /// A plain resume of `sid` — what `/resume` opens.
+    fn resume(sid: String) -> Self {
+        TuiArgs {
+            spec: Some(sid),
+            name: None,
+            fork_from: None,
+            keep: None,
+            keep_turns: None,
+            worktree: None,
+            no_worktree: false,
+        }
+    }
+}
+
 pub(crate) use crate::acp::WorktreeArg;
 
 impl WorktreeArg {
@@ -1396,17 +1440,86 @@ fn resolve_session_arg(
     arg: &str,
     sessions: &[(String, PathBuf, SystemTime)],
 ) -> Result<String, i32> {
-    // The picker list number is the console's own coordinate — it means
-    // nothing headless, so it lives here rather than in the shared resolver.
-    if let Ok(n) = arg.parse::<usize>() {
-        if (1..=sessions.len().min(20)).contains(&n) {
-            return Ok(sessions[n - 1].0.clone());
-        }
-    }
-    crate::agent::resolve_session_ref(arg, sessions).map_err(|e| {
+    session_arg(arg, &[], sessions).map_err(|e| {
         eprintln!("hotl: {e}");
         2
     })
+}
+
+/// The quiet half, shared with `/resume`. `listed` is the ids a `/resume`
+/// listing numbered; empty means the number counts newest-first, as `-r N`.
+fn session_arg(
+    arg: &str,
+    listed: &[String],
+    sessions: &[(String, PathBuf, SystemTime)],
+) -> Result<String, String> {
+    // The picker list number is the console's own coordinate — it means
+    // nothing headless, so it lives here rather than in the shared resolver.
+    if let Ok(n) = arg.parse::<usize>() {
+        if let Some(id) = n.checked_sub(1).and_then(|i| listed.get(i)) {
+            return Ok(id.clone());
+        }
+        if listed.is_empty() && (1..=sessions.len().min(PICKER_ROWS)).contains(&n) {
+            return Ok(sessions[n - 1].0.clone());
+        }
+    }
+    crate::agent::resolve_session_ref(arg, sessions)
+}
+
+/// What `/resume <arg>` asks for.
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeAsk {
+    /// Show the sessions, optionally only those mentioning the text.
+    List(Option<String>),
+    /// Switch to the one this names.
+    Pick(String),
+}
+
+fn parse_resume_arg(arg: &str) -> Result<ResumeAsk, String> {
+    let arg = arg.trim();
+    if let Some(rest) = arg.strip_prefix("--search") {
+        let needle = rest.trim();
+        if !needle.is_empty() && rest.starts_with(char::is_whitespace) {
+            return Ok(ResumeAsk::List(Some(needle.to_string())));
+        }
+    }
+    match arg {
+        "" => Ok(ResumeAsk::List(None)),
+        a if a.starts_with('-') => {
+            Err("usage: /resume [number | id-prefix | name | --search <text>]".to_string())
+        }
+        a => Ok(ResumeAsk::Pick(a.to_string())),
+    }
+}
+
+/// What a `/resume` came to: a listing to show, or a session id to open.
+enum ResumeTarget {
+    Listing(Vec<String>),
+    Session(String),
+}
+
+fn resume_target(arg: &str, listed: &mut Vec<String>) -> Result<ResumeTarget, String> {
+    match parse_resume_arg(arg)? {
+        ResumeAsk::List(search) => {
+            let rows = picker_rows(newest_first(), search.as_deref())?;
+            // One notice per line: a notice reflows its text as prose.
+            let mut lines = vec!["saved sessions — /resume <number> switches:".to_string()];
+            for (_, row) in &rows {
+                lines.extend(row.lines().map(String::from));
+            }
+            *listed = rows.into_iter().map(|(id, _)| id).collect();
+            Ok(ResumeTarget::Listing(lines))
+        }
+        ResumeAsk::Pick(arg) => {
+            session_arg(&arg, listed, &newest_first()).map(ResumeTarget::Session)
+        }
+    }
+}
+
+fn push_notice(state: &mut State, text: String) {
+    state
+        .transcript
+        .push(hotl_tui::app::TranscriptItem::Notice { text: text.into() });
 }
 
 fn by_prefix(prefix: &str) -> Result<String, i32> {
@@ -1465,20 +1578,23 @@ fn excerpt_line(excerpt: &str) -> String {
     cut
 }
 
-/// Plain pre-TUI list prompt (the in-TUI picker is a v1 cut). With a
-/// `search` filter, only matching sessions are listed, each with an excerpt.
-fn pick_session(search: Option<&str>) -> Result<String, i32> {
-    let sessions = newest_first();
+/// How many sessions a picker shows and numbers.
+const PICKER_ROWS: usize = 20;
+
+/// The picker's rows, newest first: each session id with its numbered line
+/// (and, under a `search` filter, the excerpt that matched below it).
+fn picker_rows(
+    sessions: Vec<(String, PathBuf, SystemTime)>,
+    search: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
     if sessions.is_empty() {
-        eprintln!("hotl: no sessions to resume");
-        return Err(2);
+        return Err("no sessions to resume".to_string());
     }
     let sessions: Vec<(String, PathBuf, SystemTime, Option<String>)> = match search {
         Some(needle) => {
             let found = filter_sessions(sessions, needle);
             if found.is_empty() {
-                eprintln!("hotl: no session mentions `{needle}`");
-                return Err(2);
+                return Err(format!("no session mentions `{needle}`"));
             }
             found
                 .into_iter()
@@ -1490,30 +1606,45 @@ fn pick_session(search: Option<&str>) -> Result<String, i32> {
             .map(|(id, p, t)| (id, p, t, None))
             .collect(),
     };
-    eprintln!("pick a session:");
-    for (i, (id, path, t, excerpt)) in sessions.iter().enumerate().take(20) {
-        // A header-only first-line read per row — cheap enough for a listing
-        // that already stats every file.
-        let from = hotl_store::session_parent(path)
-            .map(|p| format!("  ↳ from {}", &p[..p.len().min(8)]))
-            .unwrap_or_default();
-        eprintln!(
-            "{}",
-            picker_row(
+    Ok(sessions
+        .into_iter()
+        .take(PICKER_ROWS)
+        .enumerate()
+        .map(|(i, (id, path, t, excerpt))| {
+            // A header-only first-line read per row — cheap enough for a
+            // listing that already stats every file.
+            let from = hotl_store::session_parent(&path)
+                .map(|p| format!("  ↳ from {}", &p[..p.len().min(8)]))
+                .unwrap_or_default();
+            let mut row = picker_row(
                 i + 1,
-                id,
+                &id,
                 picker_label(
-                    hotl_store::session_name(path),
-                    hotl_store::session_title(path),
+                    hotl_store::session_name(&path),
+                    hotl_store::session_title(&path),
                 ),
-                hotl_store::session_worktree(path).map(|(_, b)| b),
-                &age(*t),
+                hotl_store::session_worktree(&path).map(|(_, b)| b),
+                &age(t),
                 &from,
-            )
-        );
-        if let Some(e) = excerpt {
-            eprintln!("      ↪ {}", excerpt_line(e));
-        }
+            );
+            if let Some(e) = excerpt {
+                row.push_str(&format!("\n      ↪ {}", excerpt_line(&e)));
+            }
+            (id, row)
+        })
+        .collect())
+}
+
+/// Plain pre-TUI list prompt. With a `search` filter, only matching sessions
+/// are listed, each with an excerpt. `/resume` shows the same rows in-session.
+fn pick_session(search: Option<&str>) -> Result<String, i32> {
+    let rows = picker_rows(newest_first(), search).map_err(|e| {
+        eprintln!("hotl: {e}");
+        2
+    })?;
+    eprintln!("pick a session:");
+    for (_, row) in &rows {
+        eprintln!("{row}");
     }
     eprint!("> ");
     let mut line = String::new();
@@ -1521,7 +1652,7 @@ fn pick_session(search: Option<&str>) -> Result<String, i32> {
         return Err(2);
     }
     match line.trim().parse::<usize>() {
-        Ok(n) if (1..=sessions.len().min(20)).contains(&n) => Ok(sessions[n - 1].0.clone()),
+        Ok(n) if (1..=rows.len()).contains(&n) => Ok(rows[n - 1].0.clone()),
         _ => {
             eprintln!("hotl: not a valid choice");
             Err(2)
@@ -1579,6 +1710,20 @@ mod tests {
     use std::time::SystemTime;
 
     use hotl_tui::paste::{ImageAttachment, PromptPayload};
+
+    /// `open_session` runs with the screen already taken (0033 Task 8b), so
+    /// the printing `acp_factory` wrapper would scribble startup warnings on it.
+    #[test]
+    fn open_session_never_prints_under_the_screen() {
+        let src = include_str!("tui.rs");
+        let start = src.find("async fn open_session").expect("open_session");
+        let end = start + src[start..].find("\n}\n").expect("open_session ends");
+        let body = &src[start..end];
+        assert!(
+            !body.contains("acp_factory") && !body.contains("eprintln!"),
+            "open_session prints directly — warnings belong in `Opened::warnings`"
+        );
+    }
 
     fn payload(text: &str, images: Vec<ImageAttachment>) -> PromptPayload {
         PromptPayload {
@@ -2254,6 +2399,98 @@ mod tests {
         assert_eq!(
             resolve_session_arg("fix-auth", &s),
             Ok(named.session_id.clone())
+        );
+    }
+
+    #[test]
+    fn resume_arguments_split_into_a_listing_or_a_pick() {
+        use super::{parse_resume_arg, ResumeAsk};
+        assert_eq!(parse_resume_arg(""), Ok(ResumeAsk::List(None)));
+        assert_eq!(
+            parse_resume_arg("--search  pelican brief"),
+            Ok(ResumeAsk::List(Some("pelican brief".into())))
+        );
+        assert_eq!(
+            parse_resume_arg("fix-auth"),
+            Ok(ResumeAsk::Pick("fix-auth".into()))
+        );
+        assert_eq!(parse_resume_arg("3"), Ok(ResumeAsk::Pick("3".into())));
+        for bad in ["--search", "--fork-from x", "-w"] {
+            let err = parse_resume_arg(bad).unwrap_err();
+            assert!(err.starts_with("usage: /resume"), "{bad}: {err}");
+        }
+    }
+
+    /// The session being left is still writing its log, so newest-first can
+    /// reorder between the listing and the pick: a number means the row the
+    /// user was shown.
+    #[test]
+    fn a_resume_number_means_the_row_the_listing_showed() {
+        use super::session_arg;
+        let s = sessions(&["01AAA", "01BBB", "01CCC"]);
+        let listed = vec!["01CCC".to_string(), "01AAA".to_string()];
+        assert_eq!(session_arg("1", &listed, &s), Ok("01CCC".to_string()));
+        assert_eq!(session_arg("2", &listed, &s), Ok("01AAA".to_string()));
+        // Nothing listed yet: the same coordinate `-r 2` uses.
+        assert_eq!(session_arg("2", &[], &s), Ok("01BBB".to_string()));
+        // Past the listing it is a prefix or a name, as ever — and quiet.
+        assert_eq!(session_arg("01B", &listed, &s), Ok("01BBB".to_string()));
+        assert_eq!(
+            session_arg("zzz", &listed, &s),
+            Err("no session matches `zzz`".to_string())
+        );
+    }
+
+    #[test]
+    fn picker_rows_number_the_sessions_and_keep_their_ids() {
+        use super::picker_rows;
+        let dir = tempfile::tempdir().unwrap();
+        let mut named =
+            hotl_store::SessionLog::create(dir.path(), "m", None, hotl_store::Masker::empty(), 1)
+                .unwrap();
+        named
+            .append(
+                &hotl_types::EntryPayload::Rename {
+                    name: "fix-auth".into(),
+                },
+                2,
+            )
+            .unwrap();
+        let plain =
+            hotl_store::SessionLog::create(dir.path(), "m", None, hotl_store::Masker::empty(), 3)
+                .unwrap();
+        let s = vec![
+            (
+                named.session_id.clone(),
+                named.path().to_path_buf(),
+                SystemTime::now(),
+            ),
+            (
+                plain.session_id.clone(),
+                plain.path().to_path_buf(),
+                SystemTime::now(),
+            ),
+        ];
+        let rows = picker_rows(s.clone(), None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, named.session_id);
+        assert!(
+            rows[0]
+                .1
+                .starts_with(&format!("  1) {}  fix-auth  ", named.session_id)),
+            "{}",
+            rows[0].1
+        );
+        assert!(rows[1]
+            .1
+            .starts_with(&format!("  2) {}  ", plain.session_id)));
+        assert_eq!(
+            picker_rows(Vec::new(), None).unwrap_err(),
+            "no sessions to resume"
+        );
+        assert_eq!(
+            picker_rows(s, Some("pelican")).unwrap_err(),
+            "no session mentions `pelican`"
         );
     }
 

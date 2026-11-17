@@ -1078,6 +1078,9 @@ pub enum Cmd {
     /// mode, mouse. The runtime owns this one: `hotl-tui` never touches the
     /// filesystem.
     ReloadSettings,
+    /// `/resume [arg]`: switch this console to another saved session. The
+    /// runtime owns it — the listing and the lookup read the sessions dir.
+    Resume(String),
     OpenEditor(String),
     SetTitle(String),
     /// Append a submitted prompt to the on-disk history file (the runtime
@@ -1098,6 +1101,11 @@ fn title_cmds(state: &State, suffix: &str) -> Vec<Cmd> {
         Cmd::SetTitle(title(state, suffix)),
         Cmd::ProgramStatus(crate::program_status::ProgramStatus::for_state(state)),
     ]
+}
+
+/// The idle title for a session the runtime just opened in place (`/resume`).
+pub fn opened_cmds(state: &State) -> Vec<Cmd> {
+    title_cmds(state, "")
 }
 
 fn title(state: &State, suffix: &str) -> String {
@@ -3516,6 +3524,18 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                     .into(),
             );
             Vec::new()
+        }
+        // `/resume [arg]` is `hotl -r [arg]` without leaving the console.
+        // Idle only: the switch interrupts the session being left.
+        "resume" => {
+            if state.phase != Phase::Idle {
+                notice(
+                    state,
+                    "a turn is running — press esc to stop it, then /resume".into(),
+                );
+                return Vec::new();
+            }
+            vec![Cmd::Resume(arg.to_string())]
         }
         "quit" => vec![Cmd::Quit],
         // `/btw <question>` (0071 T5): a side question over the cached
@@ -7609,13 +7629,13 @@ mod tests {
     fn typing_a_slash_opens_the_popup_and_narrows_as_you_type() {
         let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/");
-        // Twenty built-ins plus the one skill.
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(21));
+        // Twenty-one built-ins plus the one skill.
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(22));
         type_str(&mut s, "re");
         assert_eq!(selected(&s), "reload");
-        // `reload`, `rename`, `review` and `remember` prefix-match, then the
-        // `refactor` skill; no other built-in contains "re".
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(5));
+        // `reload`, `rename`, `resume`, `review` and `remember` prefix-match,
+        // then the `refactor` skill; no other built-in contains "re".
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(6));
     }
 
     #[test]
@@ -7836,6 +7856,41 @@ mod tests {
     fn type_and_submit(s: &mut State, text: &str) -> Vec<Cmd> {
         type_str(s, text);
         press(s, KeyCode::Enter)
+    }
+
+    #[test]
+    fn slash_resume_hands_its_argument_to_the_runtime_only_when_idle() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/resume");
+        assert!(
+            matches!(&cmds[..], [Cmd::Resume(a)] if a.is_empty()),
+            "{cmds:?}"
+        );
+        let cmds = type_and_submit(&mut s, "/resume  fix-auth ");
+        assert!(
+            matches!(&cmds[..], [Cmd::Resume(a)] if a == "fix-auth"),
+            "{cmds:?}"
+        );
+
+        // Mid-turn it would kill the running turn without a word.
+        let mut s = State::test_default();
+        s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+        let cmds = slash(&mut s, "resume 3");
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(
+            last_notice(&s).contains("a turn is running"),
+            "{}",
+            last_notice(&s)
+        );
+    }
+
+    #[test]
+    fn opened_cmds_title_the_tab_after_the_session() {
+        let mut s = State::test_default();
+        s.session_name = Some("fix-auth".into());
+        assert!(
+            matches!(&opened_cmds(&s)[..], [Cmd::SetTitle(t), Cmd::ProgramStatus(_)] if t == "hotl · fix-auth"),
+        );
     }
 
     #[test]

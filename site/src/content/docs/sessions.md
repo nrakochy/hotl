@@ -27,6 +27,9 @@ hotl resume [arg]       # the subcommand spelling of -r
 
 A resumed session that was interrupted mid-turn finishes that turn on load.
 
+Inside the console, `/resume` does the same without leaving: bare lists the
+sessions, `/resume <n|id|name>` switches to one.
+
 The picker's label is the session's name, else a generated title marked
 `(auto)`: after an unnamed console session's first completed turn, a
 ~50-token call on the utility model names it in at most six words. Names

@@ -6,6 +6,21 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- `/resume` in the TUI: switch to another saved session without leaving the
+  console. Bare lists the 20 newest (`--search <text>` filters them);
+  `/resume <number|id-prefix|name>` picks one, as `hotl -r` does.
+
+### Fixed
+
+- A Claude plugin skill whose `SKILL.md` says `name: <plugin>:<skill>` loads
+  as `<skill>` (and `<plugin>:<skill>`) instead of warning and falling back
+  to its directory name.
+- The TUI shows startup warnings as transcript notices. They were printed
+  over the screen it had already drawn; a startup failure now prints its
+  own message after the screen is restored.
+
 ## [0.31.0] - 2026-10-23
 
 ### Fixed
