@@ -170,6 +170,10 @@ impl ToolCalls {
         }))
     }
 
+    pub fn announced(&self, id: &str) -> bool {
+        self.open.contains_key(id) || self.settled.contains(id)
+    }
+
     pub fn end_turn(&mut self) {
         self.open.clear();
         self.settled.clear();
@@ -325,6 +329,41 @@ pub fn ask_reply(
     }
 }
 
+pub fn announce(call: &ToolCallUpdate) -> SessionUpdate {
+    let fields = call.fields.clone();
+    SessionUpdate::ToolCall(ToolCall {
+        tool_call_id: call.tool_call_id.clone(),
+        title: fields.title.unwrap_or_default(),
+        kind: fields.kind.unwrap_or(ToolKind::Other),
+        status: ToolCallStatus::Pending,
+        content: fields.content.unwrap_or_default(),
+        locations: fields.locations.unwrap_or_default(),
+        raw_input: fields.raw_input,
+        raw_output: None,
+        meta: None,
+    })
+}
+
+pub fn settled(tool_call_id: String, done: bool) -> SessionUpdate {
+    SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+        tool_call_id,
+        fields: ToolCallUpdateFields {
+            status: Some(if done {
+                ToolCallStatus::Completed
+            } else {
+                ToolCallStatus::Failed
+            }),
+            ..ToolCallUpdateFields::default()
+        },
+        meta: None,
+    })
+}
+
+pub fn synthetic_ask(call_id: &str, tool: &str) -> bool {
+    (tool.is_empty() && call_id.starts_with("loop-"))
+        || (tool == "remember" && call_id.starts_with("remember-"))
+}
+
 pub const RESERVED_CALL_PREFIXES: &[&str] = &["egress-", "loop-", "remember-", "tool-"];
 
 pub fn wire_id(id: &str) -> String {
@@ -447,7 +486,8 @@ pub fn egress_decision(outcome: &RequestPermissionOutcome) -> hotl_tools::net::E
         RequestPermissionOutcome::Selected(s) if s.option_id == OPTION_ALLOW => {
             EgressDecision::Allow
         }
-        _ => EgressDecision::Deny,
+        RequestPermissionOutcome::Selected(s) if s.option_id == OPTION_DENY => EgressDecision::Deny,
+        _ => EgressDecision::NoAnswer,
     }
 }
 
@@ -2604,10 +2644,13 @@ mod tests {
         use hotl_tools::net::EgressDecision;
         assert_eq!(egress_decision(&selected("allow")), EgressDecision::Allow);
         assert_eq!(egress_decision(&selected("deny")), EgressDecision::Deny);
-        assert_eq!(egress_decision(&selected("other")), EgressDecision::Deny);
+        assert_eq!(
+            egress_decision(&selected("other")),
+            EgressDecision::NoAnswer
+        );
         assert_eq!(
             egress_decision(&RequestPermissionOutcome::Cancelled),
-            EgressDecision::Deny
+            EgressDecision::NoAnswer
         );
     }
 

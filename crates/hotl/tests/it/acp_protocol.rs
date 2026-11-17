@@ -1242,11 +1242,12 @@ async fn initialize_new_prompt_permission_and_result() {
     assert_eq!(
         kinds,
         [
+            ("tool_call", "pending"),
             ("request_permission", "pending"),
             ("tool_call_update", "in_progress"),
             ("tool_call_update", "completed")
         ],
-        "the ask announces the call, then updates follow"
+        "the call is announced, then asked about, then updated"
     );
 
     // 4. unknown method → JSON-RPC error, no crash.
@@ -5678,10 +5679,27 @@ async fn a_plain_client_gets_a_standard_permission_request_and_one_tool_call() {
         prompt_msg(3, &sid, json!([{"type": "text", "text": "go"}])),
     )
     .await;
-    let ask = next_matching_raw(&mut lines, |m| m["method"] == "session/request_permission").await;
+    let mut announced = Vec::new();
+    let ask = loop {
+        let m = next_raw(&mut lines).await;
+        if m["method"] == "session/request_permission" {
+            break m;
+        }
+        announced.push(m);
+    };
     let params = &ask["params"];
     assert_eq!(params["sessionId"], sid);
     assert_eq!(params["toolCall"]["toolCallId"], "t1");
+    let first: Vec<&Value> = session_updates(&announced)
+        .into_iter()
+        .filter(|u| u["toolCallId"] == "t1")
+        .collect();
+    assert_eq!(first.len(), 1, "{announced:?}");
+    assert_eq!(first[0]["sessionUpdate"], "tool_call");
+    assert_eq!(first[0]["status"], "pending");
+    assert_eq!(first[0]["kind"], "execute");
+    assert_eq!(first[0]["rawInput"], json!({"command": "echo hi"}));
+    assert!(first[0].get("_meta").is_none(), "{announced:?}");
     assert_eq!(params["toolCall"]["kind"], "execute");
     assert_eq!(params["toolCall"]["status"], "pending");
     assert_eq!(
@@ -5713,7 +5731,7 @@ async fn a_plain_client_gets_a_standard_permission_request_and_one_tool_call() {
         for_t1
             .iter()
             .all(|u| u["sessionUpdate"] == "tool_call_update"),
-        "the ask announced t1, so no second tool_call: {for_t1:?}"
+        "t1 was announced once, so no second tool_call: {for_t1:?}"
     );
     assert!(
         for_t1.iter().any(|u| u["status"] == "completed"),
@@ -6456,4 +6474,284 @@ async fn cancel_during_a_goal_evaluation_answers_at_once() {
         "the cancel waited on the engine: {:?}",
         started.elapsed()
     );
+}
+
+fn worktree_factory(worktree: std::path::PathBuf) -> acp::SessionFactory {
+    Box::new(move |_spec| {
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
+        Ok(acp::SessionOpen {
+            history: Vec::new(),
+            memory_mode: None,
+            worktree: Some((worktree.display().to_string(), "side".into())),
+            lease: None,
+            color: None,
+            handle: spawn_session(SessionDeps {
+                concurrency: Default::default(),
+                provider: Arc::new(ScriptedProvider::new(vec![
+                    ScriptedProvider::tool_call(
+                        "w1",
+                        "write",
+                        json!({"path": "f.txt", "content": "NEW TEXT\n"}),
+                    ),
+                    ScriptedProvider::text_reply("done"),
+                ])),
+                registry: Arc::new(Registry::builtin()),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: worktree.clone(),
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
+                initial_goal: None,
+                config: EngineConfig {
+                    max_turns: 6,
+                    ..Default::default()
+                },
+            }),
+            name: None,
+            mode: "ask".into(),
+            plan: false,
+            default_effort: None,
+            effort_schedule: None,
+            goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
+            session_id,
+            warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
+            title: None,
+            model: None,
+        })
+    })
+}
+
+#[tokio::test]
+async fn a_worktree_session_shows_the_worktree_file_in_a_write_ask() {
+    let main = tempfile::tempdir().unwrap();
+    let side = tempfile::tempdir().unwrap();
+    std::fs::write(main.path().join("f.txt"), "MAIN CHECKOUT TEXT\n").unwrap();
+    std::fs::write(side.path().join("f.txt"), "WORKTREE TEXT\n").unwrap();
+    let (mut w, mut lines) =
+        connect(worktree_factory(side.path().to_path_buf()), server_info()).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new",
+               "params":{"cwd": main.path(), "mcpServers": []}}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 2).await;
+    let sid = opened["result"]["sessionId"].as_str().unwrap().to_string();
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "go"}])),
+    )
+    .await;
+    let ask = next_matching_raw(&mut lines, |m| m["method"] == "session/request_permission").await;
+    let call = &ask["params"]["toolCall"];
+    let diff = &call["content"][0];
+    assert_eq!(diff["type"], "diff", "{ask}");
+    assert_eq!(diff["oldText"], "WORKTREE TEXT\n", "{ask}");
+    let in_worktree = side.path().join("f.txt").display().to_string();
+    assert_eq!(diff["path"], in_worktree.as_str(), "{ask}");
+    assert_eq!(call["locations"][0]["path"], in_worktree.as_str(), "{ask}");
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"outcome":{"outcome":"selected","optionId":"deny"}}}),
+    )
+    .await;
+    read_until_id(&mut lines, 3).await;
+}
+
+#[tokio::test]
+async fn list_keeps_a_chain_whose_continuation_names_no_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let s1 = logged_turn(dir.path(), None, false, "first ask", 1_700_000_000);
+    {
+        let mut log = SessionLog::create(
+            dir.path(),
+            "m",
+            Some(hotl_store::ParentRef {
+                session_id: s1.clone(),
+                tip_entry_id: None,
+            }),
+            Masker::empty(),
+            0,
+        )
+        .unwrap();
+        log.append(
+            &hotl_types::EntryPayload::Item {
+                item: hotl_types::Item::User {
+                    text: "a headless resume".into(),
+                    synthetic: None,
+                    images: Vec::new(),
+                },
+            },
+            2,
+        )
+        .unwrap();
+    }
+    let info = acp::ServerInfo {
+        sessions_dir: Some(dir.path().to_path_buf()),
+        fallback_models: Vec::new(),
+        ..server_info()
+    };
+    let (mut w, mut lines) = connect(scripted_factory(), info).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/list","params":{"cwd":"/work/chain"}}),
+    )
+    .await;
+    let listed = read_until_id(&mut lines, 2).await;
+    let ids: Vec<&str> = listed["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["sessionId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [s1.as_str()], "{listed}");
+}
+
+#[tokio::test]
+async fn a_synthetic_ask_is_announced_then_settled_by_its_answer() {
+    for (option, status) in [("allow", "completed"), ("deny", "failed")] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut cwrite, mut lines, _) = open_memory_session(memory_factory(
+            hotl_engine::MemoryMode::ReadWrite,
+            dir.path().join("memory/proj"),
+            vec![],
+        ))
+        .await;
+        send(
+            &mut cwrite,
+            json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/remember",
+                   "params":{"note":"tests need nextest"}}),
+        )
+        .await;
+        let mut before = Vec::new();
+        let ask = loop {
+            let m = next_raw(&mut lines).await;
+            if m["method"] == "session/request_permission" {
+                break m;
+            }
+            before.push(m);
+        };
+        let call = ask["params"]["toolCall"]["toolCallId"].clone();
+        assert!(
+            call.as_str().unwrap().starts_with("tool-remember-"),
+            "{ask}"
+        );
+        let announced: Vec<&Value> = session_updates(&before)
+            .into_iter()
+            .filter(|u| u["toolCallId"] == call)
+            .collect();
+        assert_eq!(announced.len(), 1, "{before:?}");
+        assert_eq!(announced[0]["sessionUpdate"], "tool_call");
+        assert_eq!(announced[0]["status"], "pending");
+        assert_eq!(announced[0]["title"], ask["params"]["toolCall"]["title"]);
+        send(
+            &mut cwrite,
+            json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"outcome":{"outcome":"selected","optionId":option}}}),
+        )
+        .await;
+        let settled =
+            next_matching_raw(&mut lines, |m| m["params"]["update"]["toolCallId"] == call).await;
+        assert_eq!(
+            settled["params"]["update"]["sessionUpdate"], "tool_call_update",
+            "{settled}"
+        );
+        assert_eq!(settled["params"]["update"]["status"], status, "{settled}");
+    }
+}
+
+struct Trickle<W>(W);
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Trickle<W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let n = buf.len().min(64);
+        std::pin::Pin::new(&mut self.0).poll_write(cx, &buf[..n])
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test]
+async fn replacing_a_session_never_cuts_a_line_in_half() {
+    let big = "x".repeat(200 * 1024);
+    let provider = Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
+        &big,
+    )]));
+    let (client, server) = tokio::io::duplex(1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        Trickle(swrite),
+        provider_factory(provider, "m"),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}),
+    )
+    .await;
+    read_until_id(&mut lines, 1).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 2).await;
+    let sid = opened["result"]["sessionId"].as_str().unwrap().to_string();
+    send(
+        &mut cwrite,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "go"}])),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/new","params":new_params()}),
+    )
+    .await;
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
+            .await
+            .expect("acp frame timeout")
+            .expect("io")
+            .expect("eof");
+        let m: Value = serde_json::from_str(&line).unwrap_or_else(|e| {
+            panic!(
+                "a torn line: {e}: {}…",
+                line.chars().take(120).collect::<String>()
+            )
+        });
+        if m["id"] == json!(4) {
+            break;
+        }
+    }
 }

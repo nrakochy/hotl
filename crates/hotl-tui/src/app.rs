@@ -1053,14 +1053,14 @@ pub enum Cmd {
         selected: Vec<String>,
         free_text: Option<String>,
     },
-    /// Send `_hotl/session/reload_config` (fire-and-forget; the engine broadcasts
+    /// Send `_hotl/session/reload_config` (fire-and-forget; the reply is
     /// `config_reloaded`, which is what the client actually acts on).
     ReloadConfig,
-    /// Send `_hotl/session/context` (fire-and-forget; the ack is noise — the engine
-    /// broadcasts `context_report`, which is what the client acts on).
+    /// Send `_hotl/session/context` (fire-and-forget; the reply is the
+    /// `context_report`, which is what the client acts on).
     RequestContext,
     /// Send `_hotl/session/workflows` (0044; same fire-and-forget shape — the
-    /// engine broadcasts `workflows_report`).
+    /// reply is the `workflows_report`).
     RequestWorkflows,
     /// Send `_hotl/session/jobs` (0064); the report comes back as `jobs_report`.
     RequestJobs,
@@ -2133,9 +2133,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 text_of("reason")
             ),
         ),
-        // The answer to `/context`. Arrives as a broadcast, so it can land on
-        // a surface that never asked — harmless, it is read-only information
-        // about a session both surfaces share.
+        // The answer to `/context`.
         "context_report" => push_context_report(state, v),
         "workflows_report" => push_workflows_report(state, v),
         // Jobs (0064): the chip counts, a finished job is one notice line.
@@ -9402,7 +9400,7 @@ mod tests {
 
     // --- /context (plan 0028) ------------------------------------------
 
-    /// The report the engine broadcasts, as JSON. Rows not named here are
+    /// The report the engine sends, as JSON. Rows not named here are
     /// absent, which is a shape the client must tolerate even though the real
     /// engine always emits all twelve.
     fn context_report(window: u64, rows: &[(&str, u64)]) -> Value {
@@ -9428,7 +9426,7 @@ mod tests {
         assert_eq!(cmds, vec![Cmd::RequestContext]);
         assert!(
             s.transcript.is_empty(),
-            "the report is the broadcast's job, not the command's"
+            "the report is the reply's job, not the command's"
         );
     }
 

@@ -1037,8 +1037,42 @@ mod tests {
             .await;
         assert_eq!(
             deny_rx.await.unwrap(),
-            hotl_tools::net::EgressDecision::Deny
+            hotl_tools::net::EgressDecision::NoAnswer
         );
+    }
+
+    #[tokio::test]
+    async fn an_egress_ask_is_announced_before_the_request_and_settled_after_it() {
+        let (handle, events) = injected();
+        let (id, _task) = start(handle, std::time::Duration::ZERO);
+        let mut client = Client::attach(&id, plain_caps()).await;
+        for (option, status, decision) in [
+            ("allow", "completed", hotl_tools::net::EgressDecision::Allow),
+            ("deny", "failed", hotl_tools::net::EgressDecision::Deny),
+        ] {
+            let rx = inject_egress(&events).await;
+            let announced = client
+                .until(|m| m["params"]["update"]["sessionUpdate"] == "tool_call")
+                .await;
+            let call = announced["params"]["update"]["toolCallId"].clone();
+            assert_eq!(announced["params"]["update"]["status"], "pending");
+            assert_eq!(announced["params"]["update"]["kind"], "fetch");
+            let asked = client.next().await.expect("the egress request");
+            assert_eq!(asked["method"], "session/request_permission", "{asked}");
+            assert_eq!(asked["params"]["toolCall"]["toolCallId"], call);
+            client
+                .send(json!({"jsonrpc": "2.0", "id": asked["id"], "result": {"outcome": {"outcome": "selected", "optionId": option}}}))
+                .await;
+            assert_eq!(rx.await.unwrap(), decision);
+            let settled = client
+                .until(|m| m["params"]["update"]["toolCallId"] == call)
+                .await;
+            assert_eq!(
+                settled["params"]["update"]["sessionUpdate"], "tool_call_update",
+                "{settled}"
+            );
+            assert_eq!(settled["params"]["update"]["status"], status, "{settled}");
+        }
     }
 
     fn plain_caps() -> Value {

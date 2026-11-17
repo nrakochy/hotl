@@ -25,12 +25,15 @@ impl ErrorObject {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeRequest {
+    #[allow(dead_code)]
     #[serde(default)]
     pub protocol_version: Option<Value>,
     #[serde(default)]
     pub client_capabilities: ClientCapabilities,
+    #[allow(dead_code)]
     #[serde(default)]
     pub client_info: Option<Implementation>,
+    #[allow(dead_code)]
     #[serde(default, rename = "_meta")]
     pub meta: Option<Meta>,
 }
@@ -38,6 +41,7 @@ pub struct InitializeRequest {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientCapabilities {
+    #[allow(dead_code)]
     #[serde(default)]
     pub terminal: bool,
     #[serde(default)]
@@ -71,6 +75,7 @@ pub struct ClientAuthCapabilities {
 pub struct ElicitationCapabilities {
     #[serde(default)]
     pub form: Option<Meta>,
+    #[allow(dead_code)]
     #[serde(default)]
     pub url: Option<Meta>,
 }
@@ -172,6 +177,7 @@ pub struct SessionCapabilities {
 #[serde(rename_all = "camelCase")]
 pub struct NewSessionRequest {
     pub cwd: std::path::PathBuf,
+    #[allow(dead_code)]
     #[serde(default)]
     pub mcp_servers: Option<Vec<McpServer>>,
     #[serde(default, rename = "_meta")]
@@ -183,6 +189,7 @@ pub struct NewSessionRequest {
 pub struct LoadSessionRequest {
     pub session_id: String,
     pub cwd: std::path::PathBuf,
+    #[allow(dead_code)]
     #[serde(default)]
     pub mcp_servers: Option<Vec<McpServer>>,
     #[serde(default, rename = "_meta")]
@@ -194,6 +201,7 @@ pub struct LoadSessionRequest {
 pub struct ResumeSessionRequest {
     pub session_id: String,
     pub cwd: std::path::PathBuf,
+    #[allow(dead_code)]
     #[serde(default)]
     pub mcp_servers: Option<Vec<McpServer>>,
     #[serde(default, rename = "_meta")]
@@ -207,6 +215,7 @@ pub struct ListSessionsRequest {
     pub cwd: Option<std::path::PathBuf>,
     #[serde(default)]
     pub cursor: Option<String>,
+    #[allow(dead_code)]
     #[serde(default, rename = "_meta")]
     pub meta: Option<Meta>,
 }
@@ -215,6 +224,7 @@ pub struct ListSessionsRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CloseSessionRequest {
     pub session_id: String,
+    #[allow(dead_code)]
     #[serde(default, rename = "_meta")]
     pub meta: Option<Meta>,
 }
@@ -472,6 +482,7 @@ pub struct PromptRequest {
     #[serde(default)]
     pub session_id: Option<String>,
     pub prompt: Vec<ContentBlock>,
+    #[allow(dead_code)]
     #[serde(default, rename = "_meta")]
     pub meta: Option<Meta>,
 }
@@ -499,6 +510,7 @@ pub enum StopReason {
 pub struct CancelNotification {
     #[serde(default)]
     pub session_id: Option<String>,
+    #[allow(dead_code)]
     #[serde(default, rename = "_meta")]
     pub meta: Option<Meta>,
 }
@@ -563,12 +575,15 @@ pub struct ToolCallLocation {
 pub enum ToolKind {
     Read,
     Edit,
+    #[allow(dead_code)]
     Delete,
+    #[allow(dead_code)]
     Move,
     Search,
     Execute,
     Think,
     Fetch,
+    #[allow(dead_code)]
     SwitchMode,
     Other,
 }
@@ -620,8 +635,10 @@ pub struct PlanEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanEntryPriority {
+    #[allow(dead_code)]
     High,
     Medium,
+    #[allow(dead_code)]
     Low,
 }
 
@@ -688,7 +705,9 @@ pub struct SessionInfoUpdate {
 pub enum CompactionStatus {
     InProgress,
     Completed,
+    #[allow(dead_code)]
     Failed,
+    #[allow(dead_code)]
     Cancelled,
 }
 
@@ -733,8 +752,10 @@ pub struct SessionConfigOption {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionConfigOptionCategory {
+    #[allow(dead_code)]
     Mode,
     Model,
+    #[allow(dead_code)]
     ModelConfig,
     ThoughtLevel,
 }

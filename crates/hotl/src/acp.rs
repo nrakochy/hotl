@@ -255,7 +255,7 @@ fn ask_reply_of(msg: &Value, slot: &AskSlot) -> AskReply {
 fn egress_decision_of(msg: &Value) -> hotl_tools::net::EgressDecision {
     match permission_response(msg) {
         Some(r) => crate::acp_map::egress_decision(&r.outcome),
-        None => hotl_tools::net::EgressDecision::Deny,
+        None => hotl_tools::net::EgressDecision::NoAnswer,
     }
 }
 
@@ -1602,7 +1602,7 @@ async fn handle_request(
                 .await;
             };
             // `null` clears; a string must survive `normalize_goal`. No
-            // bespoke broadcast, unlike `set_effort`: the engine emits
+            // bespoke broadcast: the engine emits
             // `GoalChanged`, which the drain's catch-all relays to every
             // attached surface — and that path also covers the clears the
             // engine initiates itself (met/impossible verdicts), which a
@@ -1641,7 +1641,7 @@ async fn handle_request(
         // is in flight — a client that answers permission requests needs
         // nothing new — then replies `{"ok": true}` or the refusal text as an
         // error (read-only, declined, over the cap). Without a note: a
-        // `memory_report` notification with the dial, the file and its
+        // `memory_report` reply with the dial, the file and its
         // entries. The write itself reaches every surface as `memory_changed`.
         "_hotl/session/remember" => {
             let Some(state) = session.as_ref() else {
@@ -1994,9 +1994,6 @@ async fn handle_request(
                 }
             }
         }
-        // What currently fills the context window, by source. A read: it
-        // appends nothing and publishes nothing, so unlike `reload_config`
-        // there is no idle guard and no session rebuild.
         // `/btw` (0071 T5): ack, then the engine broadcasts `aside_result`
         // (or `aside_failed`) through the update stream like any event.
         "_hotl/session/aside" => {
@@ -2452,7 +2449,7 @@ fn list_sessions(
         .collect();
     let continued: std::collections::HashSet<&str> = logs
         .iter()
-        .filter(|(.., head)| !head.fork)
+        .filter(|(.., head)| !head.fork && head.cwd.is_some())
         .filter_map(|(.., head)| head.parent.as_deref())
         .collect();
     let mut sessions: Vec<SessionInfo> = logs
@@ -2513,11 +2510,15 @@ async fn retire_session(
     pending_questions: &PendingQuestions,
     pending_egress: &PendingEgress,
 ) {
-    let Some(old) = session.take() else {
+    let Some(mut old) = session.take() else {
         return;
     };
     old.handle.interrupt();
-    old.drain.abort();
+    {
+        let _line = writer.sink.lock().await;
+        old.drain.abort();
+        let _ = (&mut old.drain).await;
+    }
     pending
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2593,7 +2594,11 @@ async fn install_session(
         open.handle,
         config,
         caps,
-        crate::acp_map::ToolCalls::rooted(&cwd),
+        crate::acp_map::ToolCalls::rooted(
+            open.worktree
+                .as_ref()
+                .map_or_else(|| cwd.clone(), |(path, _)| path.into()),
+        ),
         id,
         open.session_id,
         writer.clone(),
@@ -2680,6 +2685,36 @@ fn start_session(
 
 struct EngineLink {
     meter: hotl_engine::Meter,
+}
+
+fn settle_on_answer<T: Send + 'static>(
+    reply: oneshot::Sender<T>,
+    writer: Writer,
+    session_id: String,
+    tool_call_id: String,
+    allowed: fn(&T) -> bool,
+) -> oneshot::Sender<T> {
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut reply = reply;
+        tokio::select! {
+            answer = rx => {
+                let Ok(answer) = answer else {
+                    return;
+                };
+                let done = allowed(&answer);
+                let _ = reply.send(answer);
+                send_update(
+                    &writer,
+                    &session_id,
+                    crate::acp_map::settled(tool_call_id, done),
+                )
+                .await;
+            }
+            () = reply.closed() => {}
+        }
+    });
+    tx
 }
 
 /// Bounds one coalesced delta line's size; a burst that large is already a
@@ -2823,8 +2858,26 @@ async fn drain_events(
                     summary: &summary,
                     protected_why: protected_why.as_deref(),
                 };
+                let announced = calls.announced(&call_id);
                 let ext = calls.ask(&view, &ClientCaps { ext: true, ..caps });
                 let plain = calls.ask(&view, &ClientCaps { ext: false, ..caps });
+                if !announced {
+                    let shown = if caps.ext { &ext } else { &plain };
+                    send_update(&out, &session_id, crate::acp_map::announce(shown)).await;
+                }
+                let reply = if crate::acp_map::synthetic_ask(&call_id, &tool) {
+                    settle_on_answer(
+                        reply,
+                        writer.clone(),
+                        session_id.clone(),
+                        plain.tool_call_id.clone(),
+                        |r: &AskReply| {
+                            matches!(r, AskReply::Allow | AskReply::AllowWithSecretReads)
+                        },
+                    )
+                } else {
+                    reply
+                };
                 let options = crate::acp_map::ask_options(&summary);
                 let what = Request::Ask {
                     session_id: session_id.clone(),
@@ -2884,6 +2937,17 @@ async fn drain_events(
             // editor integration with no in-protocol recourse.
             EngineEvent::EgressAsk { host, reply } => {
                 req_id += 1;
+                let call = crate::acp_map::egress_tool_call(req_id, &host, &caps);
+                send_update(&out, &session_id, crate::acp_map::announce(&call)).await;
+                let reply = settle_on_answer(
+                    reply,
+                    writer.clone(),
+                    session_id.clone(),
+                    call.tool_call_id,
+                    |d: &hotl_tools::net::EgressDecision| {
+                        *d == hotl_tools::net::EgressDecision::Allow
+                    },
+                );
                 let what = Request::Egress {
                     session_id: session_id.clone(),
                     host,
@@ -3608,22 +3672,32 @@ mod ask_reply_tests {
     }
 
     #[test]
-    fn an_egress_reply_allows_only_on_allow() {
+    fn an_egress_reply_allows_on_allow_denies_on_deny_and_is_no_answer_otherwise() {
         use hotl_tools::net::EgressDecision;
         let decide = |result: Value| egress_decision_of(&json!({"id": 1, "result": result}));
         assert_eq!(
             decide(json!({"outcome": {"outcome": "selected", "optionId": "allow"}})),
             EgressDecision::Allow
         );
+        assert_eq!(
+            decide(json!({"outcome": {"outcome": "selected", "optionId": "deny"}})),
+            EgressDecision::Deny
+        );
         for result in [
-            json!({"outcome": {"outcome": "selected", "optionId": "deny"}}),
             json!({"outcome": {"outcome": "selected", "optionId": "allow-secret-reads"}}),
             json!({"outcome": {"outcome": "cancelled"}}),
             json!({"allow": true}),
         ] {
-            assert_eq!(decide(result.clone()), EgressDecision::Deny, "{result}");
+            assert_eq!(decide(result.clone()), EgressDecision::NoAnswer, "{result}");
         }
-        assert_eq!(egress_decision_of(&json!({"id": 1})), EgressDecision::Deny);
+        assert_eq!(
+            egress_decision_of(&json!({"id": 1})),
+            EgressDecision::NoAnswer
+        );
+        assert_eq!(
+            egress_decision_of(&json!({"id": 1, "error": {"code": -32603, "message": "x"}})),
+            EgressDecision::NoAnswer
+        );
     }
 }
 
