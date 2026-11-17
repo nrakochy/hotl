@@ -763,8 +763,6 @@ pub fn bare_model(model: &str) -> &str {
     model.split_once('/').map_or(model, |(_, rest)| rest)
 }
 
-/// A session display name: trimmed, non-empty, at most 64 chars.
-/// The one validator every entry point (CLI, ACP, TUI) funnels through.
 /// Longest focus a human fold may carry (the `session/set_goal` bound; 0066).
 pub const FOCUS_MAX: usize = 4000;
 
@@ -782,9 +780,13 @@ pub fn normalize_focus(raw: &str) -> Result<Option<String>, &'static str> {
     Ok(Some(t.to_string()))
 }
 
+/// A session display name: trimmed, 1–64 chars, free of `●`/`⎇` (the pane
+/// title's color and branch markers, which `hotl watch` parses). The one
+/// validator every entry point (CLI, ACP, TUI) funnels through.
 pub fn normalize_session_name(raw: &str) -> Option<String> {
     let name = raw.trim();
-    (!name.is_empty() && name.chars().count() <= 64).then(|| name.to_string())
+    (!name.is_empty() && name.chars().count() <= 64 && !name.contains(['●', '⎇']))
+        .then(|| name.to_string())
 }
 
 /// A `/goal` condition may run to a paragraph, hence the roomier bound.
@@ -1368,6 +1370,10 @@ mod tests {
         assert_eq!(normalize_session_name(&long), None);
         let max = "é".repeat(64); // chars, not bytes
         assert_eq!(normalize_session_name(&max), Some(max.clone()));
+        // The pane title's color and branch markers (0080): a name carrying
+        // one would forge a token `hotl watch` parses.
+        assert_eq!(normalize_session_name("x ● red"), None);
+        assert_eq!(normalize_session_name("x ⎇ main"), None);
     }
 
     #[test]

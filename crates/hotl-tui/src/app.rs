@@ -1082,6 +1082,8 @@ pub enum Cmd {
     /// mode, mouse. The runtime owns this one: `hotl-tui` never touches the
     /// filesystem.
     ReloadSettings,
+    /// `/color`: set (`Some`) or reset (`None`) the session's accent color.
+    SetColor(Option<String>),
     /// `/resume [arg]`: switch this console to another saved session. The
     /// runtime owns it — the listing and the lookup read the sessions dir.
     Resume(String),
@@ -1120,9 +1122,15 @@ fn title(state: &State, suffix: &str) -> String {
         .as_deref()
         .map(|b| format!(" ⎇ {b}"))
         .unwrap_or_default();
+    // The color (0080) sits before the branch; watch reads it from here.
+    let color = state
+        .session_color
+        .as_deref()
+        .map(|c| format!(" ● {c}"))
+        .unwrap_or_default();
     match state.session_name.as_ref().or(state.session_title.as_ref()) {
-        Some(n) => format!("hotl · {n}{branch}{suffix}"),
-        None => format!("hotl{branch}{suffix}"),
+        Some(n) => format!("hotl · {n}{color}{branch}{suffix}"),
+        None => format!("hotl{color}{branch}{suffix}"),
     }
 }
 
@@ -3153,6 +3161,44 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                 " — working"
             };
             let mut cmds = vec![Cmd::Rename(name)];
+            cmds.extend(title_cmds(state, suffix));
+            cmds
+        }
+        // 0080: bare lists the names and leaves `/color ` in the input; a
+        // name sets, `default` resets, anything else picks one at random.
+        "color" => {
+            if arg.is_empty() {
+                let names: Vec<&str> = hotl_theme::SESSION_COLORS.iter().map(|(n, _)| *n).collect();
+                let now = state.session_color.as_deref().unwrap_or("default");
+                notice(
+                    state,
+                    format!("colors: {}, default (now: {now})", names.join(", ")),
+                );
+                state.editor.set_text("/color ");
+                return Vec::new();
+            }
+            let color = if arg.eq_ignore_ascii_case("default") {
+                notice(state, "session color: default".into());
+                None
+            } else if let Some(c) = hotl_theme::session_color(arg) {
+                notice(state, format!("session color: {c}"));
+                Some(c)
+            } else {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(0);
+                let c = hotl_theme::SESSION_COLORS[nanos as usize % 8].0;
+                notice(state, format!("no color \"{arg}\" — picked {c}"));
+                Some(c)
+            };
+            state.session_color = color.map(String::from);
+            let suffix = if state.phase == Phase::Idle {
+                ""
+            } else {
+                " — working"
+            };
+            let mut cmds = vec![Cmd::SetColor(state.session_color.clone())];
             cmds.extend(title_cmds(state, suffix));
             cmds
         }
@@ -7633,8 +7679,8 @@ mod tests {
     fn typing_a_slash_opens_the_popup_and_narrows_as_you_type() {
         let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/");
-        // Twenty-one built-ins plus the one skill.
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(22));
+        // Twenty-two built-ins plus the one skill.
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(23));
         type_str(&mut s, "re");
         assert_eq!(selected(&s), "reload");
         // `reload`, `rename`, `resume`, `review` and `remember` prefix-match,
@@ -7894,6 +7940,72 @@ mod tests {
         s.session_name = Some("fix-auth".into());
         assert!(
             matches!(&opened_cmds(&s)[..], [Cmd::SetTitle(t), Cmd::ProgramStatus(_)] if t == "hotl · fix-auth"),
+        );
+    }
+
+    #[test]
+    fn slash_color_sets_resets_and_titles_the_tab() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/color RED");
+        assert_eq!(s.session_color.as_deref(), Some("red"));
+        assert!(
+            matches!(&cmds[..], [Cmd::SetColor(Some(c)), Cmd::SetTitle(t), Cmd::ProgramStatus(_)]
+                if c == "red" && t == "hotl ● red"),
+            "got {cmds:?}"
+        );
+        assert_eq!(last_notice(&s), "session color: red");
+
+        s.session_name = Some("fix-auth".into());
+        s.session_branch = Some("feat".into());
+        assert_eq!(
+            title(&s, " — working"),
+            "hotl · fix-auth ● red ⎇ feat — working"
+        );
+
+        let cmds = type_and_submit(&mut s, "/color DEFAULT");
+        assert_eq!(s.session_color, None);
+        assert!(
+            matches!(&cmds[..], [Cmd::SetColor(None), Cmd::SetTitle(t), _] if t == "hotl · fix-auth ⎇ feat"),
+            "got {cmds:?}"
+        );
+        assert_eq!(last_notice(&s), "session color: default");
+    }
+
+    #[test]
+    fn bare_slash_color_lists_the_names_and_fills_the_input() {
+        let mut s = State::test_default();
+        s.session_color = Some("cyan".into());
+        let cmds = type_and_submit(&mut s, "/color");
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert_eq!(s.session_color.as_deref(), Some("cyan"), "sets nothing");
+        let n = last_notice(&s);
+        for name in [
+            "red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan", "default",
+        ] {
+            assert!(n.contains(name), "{name} in {n}");
+        }
+        assert!(n.contains("now: cyan"), "{n}");
+        assert_eq!(s.editor.text(), "/color ");
+        // Typing a name and Enter finishes the job.
+        let cmds = type_and_submit(&mut s, "pink");
+        assert!(
+            matches!(&cmds[..], [Cmd::SetColor(Some(c)), ..] if c == "pink"),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_color_picks_one_of_the_eight() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/color surprise");
+        let Some(Cmd::SetColor(Some(c))) = cmds.first() else {
+            panic!("{cmds:?}");
+        };
+        assert_eq!(hotl_theme::session_color(c), Some(c.as_str()));
+        assert_eq!(s.session_color.as_deref(), Some(c.as_str()));
+        assert_eq!(
+            last_notice(&s),
+            format!("no color \"surprise\" — picked {c}")
         );
     }
 

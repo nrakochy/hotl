@@ -2658,7 +2658,12 @@ fn input_height(state: &State, area: Rect) -> u16 {
 }
 
 fn render_input(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
-    let mut block = Block::bordered().border_style(Style::new().fg(p.faint));
+    let border = state
+        .session_color
+        .as_deref()
+        .and_then(hotl_theme::session_color_rgb)
+        .unwrap_or(p.faint);
+    let mut block = Block::bordered().border_style(Style::new().fg(border));
     if state.vim_mode {
         let mode = match state.editor.mode() {
             Mode::Insert => "-- INSERT --",
@@ -3414,6 +3419,31 @@ mod tests {
     /// The rows exactly as rendered — for the anchoring tests.
     fn draw_raw(state: &State, w: u16, h: u16) -> Vec<String> {
         rows_of(&render_at(state, &mut TranscriptCache::default(), w, h))
+    }
+
+    /// 0080: the input box's border takes the session color, else `faint`.
+    #[test]
+    fn the_input_border_wears_the_session_color() {
+        let corner_fg = |state: &State| {
+            let buf = draw_buffer(state);
+            let area = buf.area;
+            (0..area.height)
+                .rev()
+                .find_map(|y| {
+                    (0..area.width).find_map(|x| {
+                        let c = &buf[(x, y)];
+                        (c.symbol() == "┌").then_some(c.fg)
+                    })
+                })
+                .expect("the input box has a top-left corner")
+        };
+        let mut s = State::test_default();
+        assert_eq!(corner_fg(&s), Palette::default().faint);
+        s.session_color = Some("pink".into());
+        assert_eq!(
+            corner_fg(&s),
+            hotl_theme::session_color_rgb("pink").unwrap()
+        );
     }
 
     /// The 80×24 buffer, transcript normalized, for cell-level assertions.

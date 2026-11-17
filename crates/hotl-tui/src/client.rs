@@ -444,6 +444,11 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
                 .request("session/rename", json!({"name": name}))
                 .await?;
         }
+        Cmd::SetColor(color) => {
+            client
+                .request("session/set_color", json!({"color": color}))
+                .await?;
+        }
         Cmd::SetMode(mode) => {
             client
                 .request("session/set_mode", json!({"mode": mode}))
