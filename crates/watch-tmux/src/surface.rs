@@ -43,6 +43,7 @@ pub fn observations(
             cwd: pane.current_path.clone(),
             branch: crate::status::hotl_title_branch(&pane.title),
             color: crate::status::hotl_title_color(&pane.title),
+            session_name: crate::status::hotl_title_name(&pane.title),
             status,
             status_line: status_line(&tail),
             prompt,

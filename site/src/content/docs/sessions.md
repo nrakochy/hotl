@@ -116,7 +116,7 @@ the model reads shows the worktree's branch and status, and sub-agents
 spawned from the session merge back into **it**. The first transcript line
 says `working in worktree .git/hotl-worktrees/fix-auth on branch fix-auth`;
 the terminal title reads `hotl · fix-auth ⎇ fix-auth`, and `hotl watch`
-shows the branch. `-w name` also names the session (`-n name`) unless you
+shows the session's name and branch (`fix-auth · proj ⎇ fix-auth`). `-w name` also names the session (`-n name`) unless you
 pass `-n` yourself; a bare `-w` names nothing.
 
 Rules worth knowing:

@@ -68,6 +68,7 @@ mod tests {
             cwd: cwd.into(),
             branch: None,
             color: None,
+            session_name: None,
             status: Status::Idle,
             status_line: None,
             prompt: None,

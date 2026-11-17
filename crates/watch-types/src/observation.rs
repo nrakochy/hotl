@@ -30,6 +30,7 @@ pub struct AgentObservation {
     /// a hotl worktree session.
     pub branch: Option<String>,
     pub color: Option<String>,
+    pub session_name: Option<String>,
     pub status: Status,
     pub status_line: Option<String>,
     /// The question the pane is currently putting to the human (an agent's
@@ -59,6 +60,7 @@ mod tests {
             cwd: "/tmp/proj".into(),
             branch: None,
             color: None,
+            session_name: None,
             status: Status::Idle,
             status_line: None,
             prompt: None,

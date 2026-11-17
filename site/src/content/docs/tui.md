@@ -30,7 +30,8 @@ Two things, both for the terminal's own chrome:
 - **The title.** `hotl · <name> — working` / `— waiting on you`, or bare
   `hotl` when idle. The name is the session's `-n`/`/rename` name, else its
   generated title ([sessions.md](../sessions/#resuming)). A `/color` adds
-  ` ● <color>` after the name, which `hotl watch` reads.
+  ` ● <color>` after the name. `hotl watch` reads the name, color and branch
+  from it.
 - **OSC 7501 program status.** `working`, `blocked` (with `kind=permission`
   or `kind=question`), `done`, `error`, `idle`, and `clear` on quit — the
   vocabulary Ghostty's proposal, Pi and Claude Code share, so a terminal that

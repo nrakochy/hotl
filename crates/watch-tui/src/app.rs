@@ -238,6 +238,7 @@ mod tests {
             cwd: format!("/tmp/{pane}"),
             branch: None,
             color: None,
+            session_name: None,
             status,
             status_line: None,
             prompt: None,

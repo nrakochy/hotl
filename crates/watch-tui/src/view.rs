@@ -59,9 +59,15 @@ pub fn rows(agents: &[AgentObservation], cursor: usize, tick: u32) -> Vec<Row> {
             glyph: glyph_for(o.status, tick),
             // The worktree branch (0065) rides after the project: the cwd is
             // the main checkout for a hotl worktree session.
-            name: match &o.branch {
-                Some(b) => format!("{} ⎇ {b}", project_name(&o.cwd)),
-                None => project_name(&o.cwd),
+            name: {
+                let place = match &o.branch {
+                    Some(b) => format!("{} ⎇ {b}", project_name(&o.cwd)),
+                    None => project_name(&o.cwd),
+                };
+                match &o.session_name {
+                    Some(n) => format!("{n} · {place}"),
+                    None => place,
+                }
             },
             color: o.color.clone(),
             subtitle: o
@@ -221,6 +227,7 @@ mod tests {
             cwd: cwd.into(),
             branch: None,
             color: None,
+            session_name: None,
             status,
             status_line: None,
             prompt: None,
@@ -248,6 +255,22 @@ mod tests {
         let mut o = obs(group, sub, cwd, status);
         o.status_line = sl.map(|s| s.to_string());
         o
+    }
+
+    #[test]
+    fn a_session_name_leads_the_row_beside_the_folder() {
+        let mut o = obs("s", "w", "/tmp/proj", Status::Idle);
+        o.session_name = Some("fix-auth".into());
+        o.branch = Some("feat".into());
+        let name = |o: &AgentObservation| match &rows(std::slice::from_ref(o), 0, 0)[0] {
+            Row::Agent { name, .. } => name.clone(),
+            Row::Spacer => unreachable!(),
+        };
+        assert_eq!(name(&o), "fix-auth · proj ⎇ feat");
+        o.branch = None;
+        assert_eq!(name(&o), "fix-auth · proj");
+        o.session_name = None;
+        assert_eq!(name(&o), "proj");
     }
 
     #[test]

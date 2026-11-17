@@ -12,19 +12,33 @@ semver promise of their own.
   console. Bare lists the 20 newest (`--search <text>` filters them);
   `/resume <number|id-prefix|name>` picks one, as `hotl -r` does.
 - `/color` in the TUI: give a session one of eight accent colors (`red`,
-  `blue`, `green`, `yellow`, `purple`, `orange`, `pink`, `cyan`) so side-by-side
-  sessions are easy to tell apart. It colors the input border, rides the
-  terminal title, survives a resume, and shows as a dot in `hotl watch`.
-  Bare `/color` lists the names; `default` resets. ACP clients get
-  `session/set_color` and a `color` key on the open reply.
+  `blue`, `green`, `yellow`, `purple`, `orange`, `pink`, `cyan`) so sessions
+  running side by side are easy to tell apart. The color draws the input
+  box's border, rides the terminal title as ` ● <color>`, and shows as a
+  colored dot on the session's row in `hotl watch`. It is saved with the
+  session: a resume or a fork keeps it, however long the resume chain.
+  Bare `/color` lists the names and leaves `/color ` in the input for you to
+  finish; `default` resets; any other word picks one at random. ACP clients
+  get `session/set_color` (a name or `null`; an unknown name is an error)
+  and a `color` key on the open reply.
 
 ### Changed
 
-- Session names may no longer contain `●` or `⎇`, the terminal title's color
-  and branch markers.
+- `hotl watch` labels a hotl pane with its session name (or, for an unnamed
+  session, its generated title) beside the project folder:
+  `fix-auth · proj ⎇ feat`. Rows used to show only the folder, so several
+  sessions in one repository looked identical. A session with neither a
+  name nor a title still shows just the folder. Watch reads the name from
+  the pane title, the same place it reads the branch and color.
+- Session names may no longer contain `●` or `⎇`. Both are markers in the
+  terminal title that `hotl watch` reads, and a name carrying one could fake
+  a color or a branch. Generated titles follow the same rule.
 
 ### Fixed
 
+- `hotl -r` titles the terminal as soon as the session opens. The name,
+  branch and color used to appear only after the first prompt, so
+  `hotl watch` could not label a freshly resumed session.
 - A Claude plugin skill whose `SKILL.md` says `name: <plugin>:<skill>` loads
   as `<skill>` (and `<plugin>:<skill>`) instead of warning and falling back
   to its directory name.

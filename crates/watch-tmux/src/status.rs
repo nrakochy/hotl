@@ -139,6 +139,22 @@ pub fn hotl_title_color(title: &str) -> Option<String> {
     (!color.is_empty()).then(|| color.to_string())
 }
 
+pub fn hotl_title_name(title: &str) -> Option<String> {
+    let t = title.trim();
+    let t = t
+        .strip_suffix(" — working")
+        .or_else(|| t.strip_suffix(" — waiting on you"))
+        .unwrap_or(t);
+    let rest = t.strip_prefix("hotl · ")?;
+    let end = [" ● ", " ⎇ "]
+        .iter()
+        .filter_map(|m| rest.find(m))
+        .min()
+        .unwrap_or(rest.len());
+    let name = rest[..end].trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 pub struct HotlDetector;
 impl StatusDetector for HotlDetector {
     fn classify(&self, sig: &Signals) -> Status {
@@ -476,6 +492,23 @@ enter to select · esc to cancel · ↑↓ to navigate";
         );
         assert_eq!(hotl_title_branch("hotl · fix-auth — working"), None);
         assert_eq!(hotl_title_branch("vim ⎇ main"), None);
+    }
+
+    #[test]
+    fn hotl_title_name_reads_the_name_or_title_before_every_token() {
+        for (title, name) in [
+            ("hotl · fix-auth ● red ⎇ feat — working", Some("fix-auth")),
+            ("hotl · Fix the auth flow ⎇ feat", Some("Fix the auth flow")),
+            ("hotl · a — b — waiting on you", Some("a — b")),
+            ("hotl · a — b", Some("a — b")),
+            ("hotl · fix-auth", Some("fix-auth")),
+            ("hotl ● red ⎇ feat — working", None),
+            ("hotl — working", None),
+            ("hotl", None),
+            ("vim · notes", None),
+        ] {
+            assert_eq!(hotl_title_name(title).as_deref(), name, "{title}");
+        }
     }
 
     #[test]

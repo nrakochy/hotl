@@ -216,11 +216,19 @@ fn watch_reads_the_color_a_slash_color_sets() {
         watch_tmux::hotl_title_branch(&title).as_deref(),
         Some("feat")
     );
+    assert_eq!(
+        watch_tmux::hotl_title_name(&title).as_deref(),
+        Some("fix-auth")
+    );
     assert_eq!(seen_by_watch(&state, &cmds), Status::Idle);
     let cmds = ask(&mut state);
     assert_eq!(
         watch_tmux::hotl_title_color(&pane_title(&cmds)).as_deref(),
         Some("red")
+    );
+    assert_eq!(
+        watch_tmux::hotl_title_name(&pane_title(&cmds)).as_deref(),
+        Some("fix-auth")
     );
     assert_eq!(seen_by_watch(&state, &cmds), Status::Blocked);
 }
