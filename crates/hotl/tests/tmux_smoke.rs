@@ -817,3 +817,27 @@ async fn slash_resume_lists_sessions_and_switches_to_the_picked_one() {
     assert!(sent.contains("seeded answer"), "{sent}");
     assert!(sent.contains("next"), "{sent}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slash_color_completes_and_colors_the_pane_title() {
+    let Some((smoke, _serial)) = launch(SmokeConfig::default(), Script::default()).await else {
+        return;
+    };
+    smoke.tmux.type_text("/col");
+    smoke.tmux.send_keys(&["Tab"]);
+    smoke.wait_any_row("the completed command", "/color", s(5));
+    smoke.tmux.send_keys(&["C-a", "C-k"]);
+    smoke.tmux.type_line("/color red");
+    smoke.wait_any_row("the notice", "session color: red", s(5));
+    let deadline = std::time::Instant::now() + s(5);
+    let title = loop {
+        let t = smoke.tmux.pane_title();
+        if t.contains("● red") || std::time::Instant::now() > deadline {
+            break t;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(title.contains("● red"), "{title}");
+    assert_eq!(watch_tmux::hotl_title_color(&title).as_deref(), Some("red"));
+    assert_eq!(smoke.fake.request_count(), 0);
+}

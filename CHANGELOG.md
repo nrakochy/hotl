@@ -11,6 +11,17 @@ semver promise of their own.
 - `/resume` in the TUI: switch to another saved session without leaving the
   console. Bare lists the 20 newest (`--search <text>` filters them);
   `/resume <number|id-prefix|name>` picks one, as `hotl -r` does.
+- `/color` in the TUI: give a session one of eight accent colors (`red`,
+  `blue`, `green`, `yellow`, `purple`, `orange`, `pink`, `cyan`) so side-by-side
+  sessions are easy to tell apart. It colors the input border, rides the
+  terminal title, survives a resume, and shows as a dot in `hotl watch`.
+  Bare `/color` lists the names; `default` resets. ACP clients get
+  `session/set_color` and a `color` key on the open reply.
+
+### Changed
+
+- Session names may no longer contain `●` or `⎇`, the terminal title's color
+  and branch markers.
 
 ### Fixed
 

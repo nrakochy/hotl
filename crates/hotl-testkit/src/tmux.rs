@@ -135,6 +135,24 @@ impl TmuxSession {
         let _ = tmux(&panes::send_keys_argv(&self.socket, &self.name, &[s], true));
     }
 
+    pub fn pane_title(&self) -> String {
+        let argv: Vec<String> = [
+            "-L",
+            &self.socket,
+            "display-message",
+            "-p",
+            "-t",
+            &self.name,
+            "#{pane_title}",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        tmux(&argv)
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
+            .unwrap_or_default()
+    }
+
     pub fn type_line(&self, s: &str) {
         self.type_text(s);
         self.send_keys(&["Enter"]);

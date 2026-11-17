@@ -29,7 +29,8 @@ Two things, both for the terminal's own chrome:
 
 - **The title.** `hotl · <name> — working` / `— waiting on you`, or bare
   `hotl` when idle. The name is the session's `-n`/`/rename` name, else its
-  generated title ([sessions.md](../sessions/#resuming)).
+  generated title ([sessions.md](../sessions/#resuming)). A `/color` adds
+  ` ● <color>` after the name, which `hotl watch` reads.
 - **OSC 7501 program status.** `working`, `blocked` (with `kind=permission`
   or `kind=question`), `done`, `error`, `idle`, and `clear` on quit — the
   vocabulary Ghostty's proposal, Pi and Claude Code share, so a terminal that
@@ -309,7 +310,8 @@ own.
 
 | Command | Effect |
 |---|---|
-| `/rename <name>` | Rename the session (1–64 chars); the badge and terminal title follow. |
+| `/rename <name>` | Rename the session (1–64 chars, no `●` or `⎇`); the badge and terminal title follow. |
+| `/color [name\|default]` | Color this session's input border, so side-by-side sessions are easy to tell apart: `red`, `blue`, `green`, `yellow`, `purple`, `orange`, `pink` or `cyan`; `default` resets it. Bare `/color` lists them and leaves `/color ` in the input to finish; a word that is none of them picks one at random. Saved with the session, so a resume keeps it, and `hotl watch` shows it as a dot. |
 | `/plan [on\|off]` | Toggle plan mode: `write`/`edit` always ask, everything else follows the mode (see [permissions-and-sandbox.md](../permissions-and-sandbox/)). Bare `/plan` toggles; `on`/`off` are for scripted input. |
 | `/mode <ask\|bypass\|dontask>` | Switch to that permission mode. An unknown name prints usage and changes nothing; `/mode plan` points you at `/plan`. |
 | `/effort [level]` | Set the reasoning depth: `low` \| `medium` \| `high` \| `xhigh` \| `max`, or `default` to hand it back to the provider. Bare `/effort` reports the current rung rather than cycling — five rungs are not a toggle. Recorded durably, so `hotl resume` keeps it. See [configuration.md](../configuration/#reasoning-effort-provider-effort). |
@@ -446,6 +448,9 @@ or orchestrator embedding hotl gets it too. Likewise `/compact` is
 turn is running. `/model` is `session/set_model` with a `model`; its reply
 carries `applied` (false while a turn runs) and the engine's `model_changed`
 notification is the only thing that moves a client's model display.
+`/color` is `session/set_color` with a `color` name or `null`; an unknown name
+is an error (the console resolves its random pick before it sends), and the
+open reply carries the session's `color` when it has one.
 `/remember` is `session/remember`: with a `note` the confirm arrives as the
 ordinary `session/request_permission` while the request is in flight and the
 reply is `{"ok": true}` or the refusal; without one a `memory_report`

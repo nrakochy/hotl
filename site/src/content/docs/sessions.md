@@ -47,6 +47,7 @@ machine can serve it; otherwise it falls back to the configured model with a
 warning naming the one it could not run. If the model changed since the
 session last ran — by config or by `/model` — a one-line transcript notice
 names the switch: the inherited transcript was produced by the previous model.
+A session's `/color` comes back with it, on a resume and on a fork.
 
 ## Forking
 
