@@ -436,10 +436,22 @@ async fn handshake(
     args: TuiArgs,
 ) -> Result<Opened, String> {
     let init = client
-        .request("initialize", Value::Null)
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientInfo": {"name": "hotl-tui", "version": env!("CARGO_PKG_VERSION")},
+                "clientCapabilities": {"_meta": {"hotl.dev/extensions": 1}}
+            }),
+        )
         .await
         .map_err(|e| e.to_string())?;
-    let hello = wait_response(reader, init).await?;
+    let reply = wait_response(reader, init).await?;
+    let hello = reply
+        .pointer("/agentCapabilities/_meta")
+        .and_then(|m| m.get("hotl.dev/init"))
+        .cloned()
+        .unwrap_or(Value::Null);
     let skills = hotl_tui::client::parse_skills(&hello);
     let workflows = hotl_tui::client::parse_workflows(&hello);
     let TuiArgs {

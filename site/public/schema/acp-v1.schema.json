@@ -273,34 +273,32 @@
       "description": "Any `session/update` body: a stream frame or an ACP-only kind. The\n`workflows_report` body is the workflow registry's own JSON (untyped here)."
     },
     "AgentCapabilities": {
-      "description": "Upstream ACP's capability object; hotl's own facts ride under `_meta`, the\nspec's place for extensions (0076 D6). No upstream capability is claimed.",
       "properties": {
         "_meta": {
-          "$ref": "#/$defs/CapabilitiesMeta"
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "loadSession": {
+          "type": "boolean"
+        },
+        "mcpCapabilities": {
+          "$ref": "#/$defs/McpCapabilities"
+        },
+        "promptCapabilities": {
+          "$ref": "#/$defs/PromptCapabilities"
+        },
+        "sessionCapabilities": {
+          "$ref": "#/$defs/SessionCapabilities"
         }
       },
       "required": [
-        "_meta"
-      ],
-      "type": "object"
-    },
-    "AgentInfo": {
-      "description": "Upstream ACP's `agentInfo` shape.",
-      "properties": {
-        "name": {
-          "type": "string"
-        },
-        "title": {
-          "type": "string"
-        },
-        "version": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "name",
-        "title",
-        "version"
+        "loadSession",
+        "promptCapabilities",
+        "mcpCapabilities",
+        "sessionCapabilities"
       ],
       "type": "object"
     },
@@ -312,17 +310,6 @@
       },
       "required": [
         "cancelled"
-      ],
-      "type": "object"
-    },
-    "CapabilitiesMeta": {
-      "properties": {
-        "hotl": {
-          "$ref": "#/$defs/HotlMeta"
-        }
-      },
-      "required": [
-        "hotl"
       ],
       "type": "object"
     },
@@ -464,6 +451,9 @@
       "required": [
         "allow"
       ],
+      "type": "object"
+    },
+    "EmptyCapability": {
       "type": "object"
     },
     "Frame": {
@@ -1560,87 +1550,65 @@
       ],
       "type": "string"
     },
-    "HotlMeta": {
-      "description": "hotl speaks its own dialect (`dialect`), shaped after the upstream release\nnamed by `acpSchema`; `extensions` lists every method it speaks.",
+    "Implementation": {
       "properties": {
-        "acpSchema": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "name": {
           "type": "string"
         },
-        "dialect": {
-          "type": "string"
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
-        "extensions": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
+        "version": {
+          "type": "string"
         }
       },
       "required": [
-        "dialect",
-        "acpSchema",
-        "extensions"
+        "name",
+        "version"
       ],
       "type": "object"
     },
-    "InitializeResult": {
-      "description": "The `initialize` result.",
+    "InitializeResponse": {
       "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
         "agentCapabilities": {
           "$ref": "#/$defs/AgentCapabilities"
         },
         "agentInfo": {
-          "$ref": "#/$defs/AgentInfo"
+          "$ref": "#/$defs/Implementation"
         },
-        "contextWindow": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "defaultMode": {
-          "type": "string"
-        },
-        "defaultPlan": {
-          "type": "boolean"
+        "authMethods": {
+          "items": true,
+          "type": "array"
         },
         "protocolVersion": {
-          "description": "hotl's own dialect string — not upstream ACP's integer version.",
-          "type": "string"
-        },
-        "schemaVersion": {
-          "format": "uint32",
+          "format": "uint16",
+          "maximum": 65535,
           "minimum": 0,
           "type": "integer"
-        },
-        "skills": {
-          "items": {
-            "$ref": "#/$defs/RosterEntry"
-          },
-          "type": "array"
-        },
-        "streamIdleSecs": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "workflows": {
-          "items": {
-            "$ref": "#/$defs/RosterEntry"
-          },
-          "type": "array"
         }
       },
       "required": [
         "protocolVersion",
-        "schemaVersion",
-        "skills",
-        "workflows",
-        "defaultMode",
-        "defaultPlan",
-        "contextWindow",
-        "streamIdleSecs",
-        "agentInfo",
-        "agentCapabilities"
+        "agentCapabilities",
+        "authMethods",
+        "agentInfo"
       ],
       "type": "object"
     },
@@ -1691,6 +1659,21 @@
         "detached",
         "state",
         "secs"
+      ],
+      "type": "object"
+    },
+    "McpCapabilities": {
+      "properties": {
+        "http": {
+          "type": "boolean"
+        },
+        "sse": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "http",
+        "sse"
       ],
       "type": "object"
     },
@@ -2024,6 +2007,25 @@
       ],
       "type": "object"
     },
+    "PromptCapabilities": {
+      "properties": {
+        "audio": {
+          "type": "boolean"
+        },
+        "embeddedContext": {
+          "type": "boolean"
+        },
+        "image": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "image",
+        "audio",
+        "embeddedContext"
+      ],
+      "type": "object"
+    },
     "PromptResult": {
       "description": "The `session/prompt` result, sent when the turn ends.",
       "properties": {
@@ -2273,6 +2275,41 @@
         "name",
         "description"
       ],
+      "type": "object"
+    },
+    "SessionCapabilities": {
+      "properties": {
+        "close": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmptyCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "list": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmptyCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resume": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmptyCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
       "type": "object"
     },
     "SessionOpenResult": {
@@ -2642,7 +2679,7 @@
       "$ref": "#/$defs/GoalAck"
     },
     "initialize": {
-      "$ref": "#/$defs/InitializeResult"
+      "$ref": "#/$defs/InitializeResponse"
     },
     "modeAck": {
       "$ref": "#/$defs/ModeAck"

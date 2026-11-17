@@ -11,7 +11,7 @@ use hotl_tools::{rules::Rules, Registry};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::acp;
+use crate::{acp, acp_types};
 
 /// A session whose scripted model calls bash (a gated tool → a permission
 /// ask) then replies with text.
@@ -710,12 +710,12 @@ async fn initialize_advertises_skill_names_and_descriptions() {
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"_meta":{"hotl.dev/extensions":1}}}}),
     )
     .await;
     let init = next(&mut lines).await;
     assert_eq!(
-        init["result"]["skills"],
+        init["result"]["agentCapabilities"]["_meta"]["hotl.dev/init"]["skills"],
         json!([
             {"name": "brainstorming", "description": "turn an idea into a design"},
             {"name": "acme:deploy", "description": ""},
@@ -724,7 +724,7 @@ async fn initialize_advertises_skill_names_and_descriptions() {
     // 0044: saved recipes ride beside skills, same shape, so `/<recipe>`
     // completes and dispatches from the handshake alone.
     assert_eq!(
-        init["result"]["workflows"],
+        init["result"]["agentCapabilities"]["_meta"]["hotl.dev/init"]["workflows"],
         json!([{"name": "review-changes", "description": "review then verify"}])
     );
 }
@@ -1159,14 +1159,13 @@ async fn initialize_new_prompt_permission_and_result() {
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
 
-    // 1. initialize → carries the stable schema version.
+    // 1. initialize.
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}),
     )
     .await;
-    let init = next(&mut lines).await;
-    assert_eq!(init["result"]["schemaVersion"], acp::UPDATE_SCHEMA_VERSION);
+    assert_eq!(next(&mut lines).await["result"]["protocolVersion"], 1);
 
     // 2. session/new → a session id.
     send(
@@ -1927,12 +1926,18 @@ async fn the_session_reports_its_effective_mode() {
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"_meta":{"hotl.dev/extensions":1}}}}),
     )
     .await;
     let hello = read_until_id(&mut lines, 1).await;
-    assert_eq!(hello["result"]["defaultMode"], "auto");
-    assert_eq!(hello["result"]["contextWindow"], 1_000_000);
+    assert_eq!(
+        hello["result"]["agentCapabilities"]["_meta"]["hotl.dev/init"]["defaultMode"],
+        "auto"
+    );
+    assert_eq!(
+        hello["result"]["agentCapabilities"]["_meta"]["hotl.dev/init"]["contextWindow"],
+        1_000_000
+    );
 
     send(
         &mut cwrite,
@@ -1992,11 +1997,14 @@ async fn set_plan_is_its_own_axis_and_the_legacy_plan_mode_word_still_works() {
 
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"_meta":{"hotl.dev/extensions":1}}}}),
     )
     .await;
     let hello = read_until_id(&mut lines, 1).await;
-    assert_eq!(hello["result"]["defaultPlan"], false);
+    assert_eq!(
+        hello["result"]["agentCapabilities"]["_meta"]["hotl.dev/init"]["defaultPlan"],
+        false
+    );
     send(
         &mut cwrite,
         json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
@@ -2794,12 +2802,18 @@ async fn reload_config_swaps_the_engine_and_broadcasts_the_new_truth() {
     // the reloaded roster too.
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":4,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":4,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"_meta":{"hotl.dev/extensions":1}}}}),
     )
     .await;
     let init = next_matching(&mut lines, |m| m["id"] == json!(4)).await;
-    assert_eq!(init["result"]["contextWindow"], 900_000);
-    assert_eq!(init["result"]["defaultMode"], "auto");
+    assert_eq!(
+        init["result"]["agentCapabilities"]["_meta"]["hotl.dev/init"]["contextWindow"],
+        900_000
+    );
+    assert_eq!(
+        init["result"]["agentCapabilities"]["_meta"]["hotl.dev/init"]["defaultMode"],
+        "auto"
+    );
 }
 
 /// A `config.toml` with a typo must not cost you the session: the running
@@ -3572,11 +3586,7 @@ async fn session_children_stop_interrupts_by_id_and_unknown_ids_say_so() {
     );
 }
 
-/// 0076 D6: `initialize` names the dialect, the upstream release it was
-/// checked against, and hotl itself — and keeps the dialect string, never
-/// the integer an ACP v1 agent would send.
-#[tokio::test]
-async fn initialize_stamps_the_dialect_and_the_acp_release_it_was_checked_against() {
+async fn initialize_with(params: Value) -> Value {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
     tokio::spawn(acp::serve(
@@ -3590,20 +3600,101 @@ async fn initialize_stamps_the_dialect_and_the_acp_release_it_was_checked_agains
     let mut lines = BufReader::new(cread).lines();
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":params}),
     )
     .await;
-    let init = next(&mut lines).await;
-    let r = &init["result"];
-    assert_eq!(r["protocolVersion"], "0.1");
+    next(&mut lines).await["result"].clone()
+}
+
+#[tokio::test]
+async fn initialize_answers_v1() {
+    let r = initialize_with(json!({"protocolVersion": 1})).await;
+    assert_eq!(r["protocolVersion"], json!(1));
     assert_eq!(r["agentInfo"]["name"], "hotl");
+    assert_eq!(r["agentInfo"]["title"], "hotl");
     assert_eq!(r["agentInfo"]["version"], env!("CARGO_PKG_VERSION"));
-    let meta = &r["agentCapabilities"]["_meta"]["hotl"];
-    assert_eq!(meta["dialect"], acp::PROTOCOL_VERSION);
-    assert_eq!(meta["acpSchema"], acp::ACP_SCHEMA_CHECKED);
+    assert_eq!(r["authMethods"], json!([]));
+    let caps = &r["agentCapabilities"];
+    assert_eq!(caps["loadSession"], true);
     assert_eq!(
-        meta["extensions"].as_array().unwrap().len(),
+        caps["promptCapabilities"],
+        json!({"image": true, "audio": false, "embeddedContext": true})
+    );
+    assert_eq!(caps["mcpCapabilities"], json!({"http": true, "sse": false}));
+    assert_eq!(
+        caps["sessionCapabilities"],
+        json!({"list": {}, "resume": {}, "close": {}})
+    );
+    assert!(caps.get("_meta").is_none());
+    assert!(r.get("skills").is_none());
+}
+
+#[tokio::test]
+async fn initialize_answers_1_to_a_future_version() {
+    let r = initialize_with(json!({"protocolVersion": 7})).await;
+    assert_eq!(r["protocolVersion"], json!(1));
+}
+
+#[tokio::test]
+async fn initialize_answers_1_to_an_old_client() {
+    let r = initialize_with(json!({"protocolVersion": "0.1"})).await;
+    assert_eq!(r["protocolVersion"], json!(1));
+    let r = initialize_with(Value::Null).await;
+    assert_eq!(r["protocolVersion"], json!(1));
+}
+
+#[tokio::test]
+async fn initialize_meta_only_for_opted_in_clients() {
+    let r = initialize_with(json!({
+        "protocolVersion": 1,
+        "clientCapabilities": {"_meta": {"hotl.dev/extensions": 1}}
+    }))
+    .await;
+    let init = &r["agentCapabilities"]["_meta"]["hotl.dev/init"];
+    assert!(init["skills"].is_array());
+    assert!(init["workflows"].is_array());
+    assert_eq!(init["defaultMode"], "ask");
+    assert_eq!(init["defaultPlan"], false);
+    assert!(init["contextWindow"].is_u64());
+    assert!(init["streamIdleSecs"].is_u64());
+    assert_eq!(init["acpSchema"], acp::ACP_SCHEMA_CHECKED);
+    assert_eq!(
+        init["extensions"].as_array().unwrap().len(),
         acp::EXTENSION_METHODS.len()
+    );
+    let r = initialize_with(json!({
+        "protocolVersion": 1,
+        "clientCapabilities": {"_meta": {"hotl.dev/extensions": 2}}
+    }))
+    .await;
+    assert!(r["agentCapabilities"].get("_meta").is_none());
+}
+
+#[test]
+fn client_caps_read_what_the_client_announced() {
+    let req: acp_types::InitializeRequest = serde_json::from_value(json!({
+        "protocolVersion": 1,
+        "clientCapabilities": {
+            "_meta": {"hotl.dev/extensions": 1},
+            "session": {"notices": {}, "compaction": {}},
+            "elicitation": {"form": {}},
+            "auth": {"terminal": true}
+        }
+    }))
+    .unwrap();
+    assert_eq!(
+        acp::client_caps_of(&req),
+        acp::ClientCaps {
+            ext: true,
+            notices: true,
+            compaction: true,
+            elicitation_form: true,
+            auth_terminal: true
+        }
+    );
+    assert_eq!(
+        acp::client_caps_of(&Default::default()),
+        acp::ClientCaps::default()
     );
 }
 

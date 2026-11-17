@@ -11,6 +11,20 @@ use serde_json::{json, Value};
 
 use crate::{acp, features, schema_cli, wire};
 
+fn server_info() -> acp::ServerInfo {
+    acp::ServerInfo {
+        skills: Vec::new(),
+        workflows: Vec::new(),
+        workflows_report: || json!({"runs": []}),
+        default_mode: "ask".into(),
+        default_plan: false,
+        context_window: 200_000,
+        stream_idle_secs: 90,
+        model_resolver: None,
+        model: "m".into(),
+    }
+}
+
 /// Read at runtime: a compile-time `env!` goes stale under a shared `target/`.
 fn schema_dir() -> PathBuf {
     PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets it"))
@@ -193,35 +207,8 @@ fn acp_valid(def: &str, value: &Value) {
 #[test]
 fn every_acp_payload_validates_against_the_published_schema() {
     acp_valid(
-        "InitializeResult",
-        &serde_json::to_value(acp::InitializeResult {
-            protocol_version: "0.1".into(),
-            schema_version: 1,
-            skills: vec![acp::RosterEntry {
-                name: "a".into(),
-                description: "b".into(),
-            }],
-            workflows: vec![],
-            default_mode: "ask".into(),
-            default_plan: false,
-            context_window: 200_000,
-            stream_idle_secs: 90,
-            agent_info: acp::AgentInfo {
-                name: "hotl".into(),
-                title: "hotl".into(),
-                version: "0".into(),
-            },
-            agent_capabilities: acp::AgentCapabilities {
-                meta: acp::CapabilitiesMeta {
-                    hotl: acp::HotlMeta {
-                        dialect: "0.1".into(),
-                        acp_schema: "schema-v1.26.0".into(),
-                        extensions: vec!["session/new".into()],
-                    },
-                },
-            },
-        })
-        .unwrap(),
+        "InitializeResponse",
+        &serde_json::to_value(acp::initialize_response(&server_info(), true)).unwrap(),
     );
     acp_valid(
         "PromptResult",

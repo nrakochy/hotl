@@ -20,16 +20,17 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::acp_ext::codes;
-use crate::acp_types::ErrorObject;
+use crate::acp_types::{
+    AgentCapabilities, ErrorObject, Implementation, InitializeRequest, InitializeResponse,
+    McpCapabilities, PromptCapabilities, SessionCapabilities,
+};
 
 /// Stable schema version of `session/update` / prompt-result payloads (an MD
 /// Tier-1 contract — bump only on a breaking change).
 pub const UPDATE_SCHEMA_VERSION: u32 = 1;
-pub const PROTOCOL_VERSION: &str = "0.1";
+pub const ACP_PROTOCOL_VERSION: u16 = 1;
 
-/// The upstream ACP schema release the extension list was last read against
-/// (agentclientprotocol, 2026-10-16). Bumping it is a deliberate edit.
-pub const ACP_SCHEMA_CHECKED: &str = "schema-v1.26.0";
+pub const ACP_SCHEMA_CHECKED: &str = "agent-client-protocol-schema 1.18.0";
 
 /// Every method this dialect speaks beyond `initialize`: what the handler
 /// answers, then the three requests it sends the client. Advertised under
@@ -421,6 +422,7 @@ pub async fn serve(
     mut info: ServerInfo,
     mut reload: Option<Reload>,
 ) {
+    let mut client_caps = ClientCaps::default();
     let writer: Writer = Arc::new(Mutex::new(Box::new(write)));
     let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let pending_questions: PendingQuestions = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -473,6 +475,7 @@ pub async fn serve(
             &mut next_id,
             &mut info,
             &mut reload,
+            &mut client_caps,
         )
         .await;
     }
@@ -504,40 +507,20 @@ async fn handle_request(
     next_id: &mut u64,
     info: &mut ServerInfo,
     reload: &mut Option<Reload>,
+    client_caps: &mut ClientCaps,
 ) {
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
     match msg.get("method").and_then(Value::as_str).unwrap_or("") {
         "initialize" => {
-            // `skills` lets a front end resolve `/<skill>` itself and build a
-            // completion menu — the roster is server-side knowledge, so the
-            // client never has to walk the config dirs to know what a slash
-            // could mean. Descriptions ride this response only; they are
-            // never part of any prompt.
-            let skills = skill_roster(info);
-            // `defaultMode` and `contextWindow` are server-side truth a client
-            // renders rather than guesses: the badge used to read "ask" while
-            // the shipped default ran "auto" (evaluation §5.7).
+            let request: InitializeRequest = msg
+                .get("params")
+                .and_then(|p| serde_json::from_value(p.clone()).ok())
+                .unwrap_or_default();
+            *client_caps = client_caps_of(&request);
             reply_ok(
                 writer,
                 id,
-                to_json(&InitializeResult {
-                    protocol_version: PROTOCOL_VERSION.into(),
-                    schema_version: UPDATE_SCHEMA_VERSION,
-                    skills,
-                    workflows: workflow_roster(info),
-                    default_mode: info.default_mode.clone(),
-                    default_plan: info.default_plan,
-                    context_window: info.context_window,
-                    stream_idle_secs: info.stream_idle_secs,
-                    // `protocolVersion` stays hotl's dialect string: the
-                    // integer `1` would claim ACP v1 conformance (0076 D6).
-                    agent_info: AgentInfo {
-                        name: "hotl".into(),
-                        title: "hotl".into(),
-                        version: env!("CARGO_PKG_VERSION").into(),
-                    },
-                    agent_capabilities: AgentCapabilities::stamp(),
-                }),
+                to_json(&initialize_response(info, client_caps.ext)),
             )
             .await;
         }
@@ -2313,65 +2296,91 @@ pub struct RosterEntry {
     pub description: String,
 }
 
-/// The `initialize` result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClientCaps {
+    pub ext: bool,
+    pub notices: bool,
+    pub compaction: bool,
+    pub elicitation_form: bool,
+    pub auth_terminal: bool,
+}
+
+pub fn client_caps_of(req: &InitializeRequest) -> ClientCaps {
+    let caps = &req.client_capabilities;
+    let session = caps.session.as_ref();
+    ClientCaps {
+        ext: caps
+            .meta
+            .as_ref()
+            .and_then(|m| m.get(crate::acp_ext::META_EXT))
+            .and_then(Value::as_u64)
+            == Some(1),
+        notices: session.is_some_and(|s| s.notices.is_some()),
+        compaction: session.is_some_and(|s| s.compaction.is_some()),
+        elicitation_form: caps.elicitation.as_ref().is_some_and(|e| e.form.is_some()),
+        auth_terminal: caps.auth.terminal,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct InitializeResult {
-    /// hotl's own dialect string — not upstream ACP's integer version.
-    pub protocol_version: String,
-    pub schema_version: u32,
+pub struct HotlInit {
     pub skills: Vec<RosterEntry>,
     pub workflows: Vec<RosterEntry>,
     pub default_mode: String,
     pub default_plan: bool,
     pub context_window: u64,
     pub stream_idle_secs: u64,
-    pub agent_info: AgentInfo,
-    pub agent_capabilities: AgentCapabilities,
-}
-
-/// Upstream ACP's `agentInfo` shape.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct AgentInfo {
-    pub name: String,
-    pub title: String,
-    pub version: String,
-}
-
-/// Upstream ACP's capability object; hotl's own facts ride under `_meta`, the
-/// spec's place for extensions (0076 D6). No upstream capability is claimed.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct AgentCapabilities {
-    #[serde(rename = "_meta")]
-    pub meta: CapabilitiesMeta,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct CapabilitiesMeta {
-    pub hotl: HotlMeta,
-}
-
-/// hotl speaks its own dialect (`dialect`), shaped after the upstream release
-/// named by `acpSchema`; `extensions` lists every method it speaks.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct HotlMeta {
-    pub dialect: String,
     pub acp_schema: String,
     pub extensions: Vec<String>,
 }
 
-impl AgentCapabilities {
-    fn stamp() -> Self {
-        AgentCapabilities {
-            meta: CapabilitiesMeta {
-                hotl: HotlMeta {
-                    dialect: PROTOCOL_VERSION.into(),
-                    acp_schema: ACP_SCHEMA_CHECKED.into(),
-                    extensions: EXTENSION_METHODS.iter().map(|m| m.to_string()).collect(),
-                },
+pub const META_INIT: &str = "hotl.dev/init";
+
+pub fn initialize_response(info: &ServerInfo, ext: bool) -> InitializeResponse {
+    let meta = ext.then(|| {
+        let init = HotlInit {
+            skills: skill_roster(info),
+            workflows: workflow_roster(info),
+            default_mode: info.default_mode.clone(),
+            default_plan: info.default_plan,
+            context_window: info.context_window,
+            stream_idle_secs: info.stream_idle_secs,
+            acp_schema: ACP_SCHEMA_CHECKED.into(),
+            extensions: EXTENSION_METHODS.iter().map(|m| m.to_string()).collect(),
+        };
+        let mut m = serde_json::Map::new();
+        m.insert(META_INIT.into(), to_json(&init));
+        m
+    });
+    InitializeResponse {
+        protocol_version: ACP_PROTOCOL_VERSION,
+        agent_capabilities: AgentCapabilities {
+            load_session: true,
+            prompt_capabilities: PromptCapabilities {
+                image: true,
+                audio: false,
+                embedded_context: true,
             },
-        }
+            mcp_capabilities: McpCapabilities {
+                http: true,
+                sse: false,
+            },
+            session_capabilities: SessionCapabilities {
+                list: Some(Default::default()),
+                resume: Some(Default::default()),
+                close: Some(Default::default()),
+            },
+            meta,
+        },
+        auth_methods: Vec::new(),
+        agent_info: Implementation {
+            name: "hotl".into(),
+            title: Some("hotl".into()),
+            version: env!("CARGO_PKG_VERSION").into(),
+            meta: None,
+        },
+        meta: None,
     }
 }
 
@@ -2687,7 +2696,7 @@ pub struct EgressReply {
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)] // schema-only
 pub struct AcpPayloads {
-    initialize: InitializeResult,
+    initialize: InitializeResponse,
     session_open: SessionOpenResult,
     prompt_result: PromptResult,
     session_update: SessionUpdateParams,

@@ -332,7 +332,13 @@ async fn start_with(factory: acp::SessionFactory) -> (Client, Reader) {
     let mut client = AcpClient::new(cwrite);
     let mut reader = FrameReader::new(cread);
     let init = client
-        .request("initialize", Value::Null)
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {"_meta": {"hotl.dev/extensions": 1}}
+            }),
+        )
         .await
         .expect("write");
     wait_response(&mut reader, init).await.expect("initialize");
