@@ -108,6 +108,28 @@ pub fn parse_hex(s: &str) -> Option<[u8; 3]> {
     ])
 }
 
+/// `/color`'s names (Claude Code's eight) and their hex. Mid-saturation, so
+/// each reads on dark and light presets alike.
+pub const SESSION_COLORS: [(&str, &str); 8] = [
+    ("red", "#e06c75"),
+    ("blue", "#61afef"),
+    ("green", "#98c379"),
+    ("yellow", "#e5c07b"),
+    ("purple", "#b48ead"),
+    ("orange", "#e09956"),
+    ("pink", "#f087bd"),
+    ("cyan", "#56b6c2"),
+];
+
+/// The canonical name of a session color, case-insensitive. `default` and
+/// anything else is `None`. The one validator for the TUI, ACP and watch.
+pub fn session_color(name: &str) -> Option<&'static str> {
+    SESSION_COLORS
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(n, _)| *n)
+}
+
 impl ThemeConfig {
     /// Resolve to a concrete palette. Unknown preset name -> default base + a
     /// warning; set color fields override the base slot-by-slot. Any override
@@ -285,6 +307,14 @@ mod palette {
         }
     }
 
+    /// A session color (`/color`) as a terminal color.
+    pub fn session_color_rgb(name: &str) -> Option<Color> {
+        let canon = super::session_color(name)?;
+        let (_, hex) = super::SESSION_COLORS.iter().find(|(n, _)| *n == canon)?;
+        let [r, g, b] = parse_hex(hex)?;
+        Some(Color::Rgb(r, g, b))
+    }
+
     /// sRGB → linear light. Blending in gamma-encoded bytes darkens the middle
     /// of a ramp (the classic muddy midpoint); decoding first is what keeps a
     /// faint→accent sweep reading as one hue moving, not as a dip.
@@ -335,11 +365,32 @@ mod palette {
     }
 }
 #[cfg(feature = "ratatui")]
-pub use palette::{blend, ramp, Palette};
+pub use palette::{blend, ramp, session_color_rgb, Palette};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_colors_are_the_eight_names_and_all_parse() {
+        let names: Vec<_> = SESSION_COLORS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            ["red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan"]
+        );
+        for (n, hex) in SESSION_COLORS {
+            assert!(parse_hex(hex).is_some(), "{n}: {hex}");
+        }
+    }
+
+    #[test]
+    fn session_color_ignores_case_and_refuses_default_and_unknowns() {
+        assert_eq!(session_color("Pink"), Some("pink"));
+        assert_eq!(session_color("CYAN"), Some("cyan"));
+        for bad in ["default", "", "magenta", "#ff0000", " red"] {
+            assert_eq!(session_color(bad), None, "{bad}");
+        }
+    }
 
     /// 0061 T10: `**bold**` needs a role of its own — borrowing `active`
     /// would mean "a tool is working" in the middle of a sentence.
@@ -513,6 +564,15 @@ mod tests {
 mod palette_tests {
     use super::*;
     use ratatui::style::Color;
+
+    #[test]
+    fn session_color_rgb_goes_through_the_table() {
+        assert_eq!(session_color_rgb("RED"), {
+            let [r, g, b] = parse_hex(SESSION_COLORS[0].1).unwrap();
+            Some(Color::Rgb(r, g, b))
+        });
+        assert_eq!(session_color_rgb("default"), None);
+    }
 
     #[test]
     fn palette_from_theme_converts_hex_to_rgb() {
