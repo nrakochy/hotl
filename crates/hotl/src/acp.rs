@@ -3012,6 +3012,29 @@ mod drain_tests {
 }
 
 #[cfg(test)]
+mod question_reply_tests {
+    use super::*;
+
+    #[test]
+    fn a_permission_shaped_reply_to_a_question_is_no_human() {
+        let (tx, _rx) = oneshot::channel();
+        let slot = QuestionSlot {
+            reply: tx,
+            form: Some(FormAsk {
+                offered: vec!["MVP".into()],
+                multi: false,
+            }),
+        };
+        let msg =
+            json!({"id": 1, "result": {"outcome": {"outcome": "selected", "optionId": "allow"}}});
+        assert_eq!(
+            question_reply_of(&msg, &slot),
+            hotl_types::QuestionAnswer::NoHuman
+        );
+    }
+}
+
+#[cfg(test)]
 mod ask_reply_tests {
     use super::*;
 

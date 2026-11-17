@@ -5587,6 +5587,44 @@ async fn cancel_denies_an_open_permission_request() {
 }
 
 #[tokio::test]
+async fn an_elicitation_shaped_reply_to_a_permission_request_is_a_denial() {
+    let (_provider, sid, mut w, mut lines) = open_with(
+        vec![
+            ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
+            ScriptedProvider::text_reply("unused"),
+        ],
+        init_params(),
+    )
+    .await;
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "go"}])),
+    )
+    .await;
+    let ask = next_matching_raw(&mut lines, |m| m["method"] == "session/request_permission").await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"action":"accept","content":{"answer":"allow"}}}),
+    )
+    .await;
+    let (before, reply) = frames_through_reply(&mut lines, 3).await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+    assert!(
+        before
+            .iter()
+            .any(|m| m["params"]["update"]["toolCallId"] == "t1"
+                && m["params"]["update"]["_meta"]["hotl.dev/denied"] == true),
+        "the wrong-shaped reply denied the tool: {before:?}"
+    );
+    assert!(
+        before
+            .iter()
+            .all(|m| m["params"]["update"]["type"] != "tool_start"),
+        "the tool ran: {before:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_plain_client_gets_a_standard_permission_request_and_one_tool_call() {
     let (_provider, sid, mut w, mut lines) = open_with(
         vec![

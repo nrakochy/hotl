@@ -84,6 +84,7 @@ pub struct AcpClient<W: AsyncWrite + Unpin> {
     writer: W,
     next_id: u64,
     session_id: Option<String>,
+    multi_questions: std::collections::HashSet<u64>,
 }
 
 impl<W: AsyncWrite + Unpin> AcpClient<W> {
@@ -92,6 +93,15 @@ impl<W: AsyncWrite + Unpin> AcpClient<W> {
             writer,
             next_id: 0,
             session_id: None,
+            multi_questions: std::collections::HashSet::new(),
+        }
+    }
+
+    pub fn note_server_msg(&mut self, msg: &ServerMsg) {
+        if let ServerMsg::QuestionRequest { req_id, question } = msg {
+            if question.multi {
+                self.multi_questions.insert(*req_id);
+            }
         }
     }
 
@@ -164,11 +174,12 @@ impl<W: AsyncWrite + Unpin> AcpClient<W> {
         selected: Vec<String>,
         free_text: Option<String>,
     ) -> io::Result<()> {
+        let multi = self.multi_questions.remove(&req_id);
         let result = match (free_text, selected.len()) {
             (Some(text), _) => json!({"action": "accept", "content": {"other": text}}),
             (None, 0) => json!({"action": "decline"}),
-            (None, 1) => json!({"action": "accept", "content": {"answer": selected[0]}}),
-            (None, _) => json!({"action": "accept", "content": {"answer": selected}}),
+            (None, _) if multi => json!({"action": "accept", "content": {"answer": selected}}),
+            (None, _) => json!({"action": "accept", "content": {"answer": selected[0]}}),
         };
         self.send(&json!({"jsonrpc": "2.0", "id": req_id, "result": result}))
             .await
@@ -1203,6 +1214,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_multi_question_answers_with_a_list_even_for_one_label() {
+        let (mut read, write) = tokio::io::duplex(4096);
+        let mut client = AcpClient::new(write);
+        let ask = |multi| Question {
+            header: "h".into(),
+            prompt: "p".into(),
+            options: Vec::new(),
+            multi,
+        };
+        client.note_server_msg(&ServerMsg::QuestionRequest {
+            req_id: 1,
+            question: ask(true),
+        });
+        client.note_server_msg(&ServerMsg::QuestionRequest {
+            req_id: 2,
+            question: ask(false),
+        });
+        client
+            .reply_question(1, vec!["MVP".into()], None)
+            .await
+            .unwrap();
+        client
+            .reply_question(2, vec!["MVP".into()], None)
+            .await
+            .unwrap();
+        drop(client);
+        let mut out = String::new();
+        read.read_to_string(&mut out).await.unwrap();
+        let lines: Vec<Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines[0]["result"]["content"]["answer"], json!(["MVP"]));
+        assert_eq!(lines[1]["result"]["content"]["answer"], json!("MVP"));
+    }
+
+    #[tokio::test]
     async fn reply_question_shape_matches_server_contract() {
         let (mut read, write) = tokio::io::duplex(4096);
         let mut client = AcpClient::new(write);
@@ -1215,7 +1263,7 @@ mod tests {
             .await
             .unwrap();
         client
-            .reply_question(11, vec!["MVP".into(), "Full".into()], None)
+            .reply_question(11, vec!["MVP".into()], None)
             .await
             .unwrap();
         client.reply_question(12, Vec::new(), None).await.unwrap();
@@ -1236,7 +1284,7 @@ mod tests {
         );
         assert_eq!(
             lines[2]["result"],
-            json!({"action": "accept", "content": {"answer": ["MVP", "Full"]}})
+            json!({"action": "accept", "content": {"answer": "MVP"}})
         );
         assert_eq!(lines[3]["result"], json!({"action": "decline"}));
     }

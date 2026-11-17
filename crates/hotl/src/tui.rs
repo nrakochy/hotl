@@ -794,13 +794,16 @@ async fn run_loop(
                 )),
             },
             sm = read_server_msg(reader) => match sm {
-                Some(m) => translate(
+                Some(m) => {
+                    client.note_server_msg(&m);
+                    translate(
                     m,
                     &mut prompt_ids,
                     &mut steer_ids,
                     &mut model_ids,
                     &mut remember_ids,
-                ),
+                    )
+                }
                 None => return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "the session server closed the connection",
