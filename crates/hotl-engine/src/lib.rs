@@ -1500,6 +1500,7 @@ impl Meter {
 
 pub struct SessionHandle {
     meter: Meter,
+    prompts_held: Arc<std::sync::atomic::AtomicBool>,
     cmd: mpsc::Sender<SessionCmd>,
     pub events: mpsc::Receiver<EngineEvent>,
     current_turn: Arc<Mutex<CancellationToken>>,
@@ -1564,18 +1565,21 @@ impl SessionHandle {
             .await;
     }
 
-    pub async fn drop_queued(&self) -> Vec<u64> {
+    pub fn drop_queued(&self) -> oneshot::Receiver<Vec<u64>> {
+        self.prompts_held
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let (reply, rx) = oneshot::channel();
-        if self
-            .cmd
-            .send(SessionCmd::DropQueued { reply })
-            .await
-            .is_err()
+        if let Err(mpsc::error::TrySendError::Full(cmd)) =
+            self.cmd.try_send(SessionCmd::DropQueued { reply })
         {
-            return Vec::new();
+            let cmd_tx = self.cmd.clone();
+            tokio::spawn(async move {
+                let _ = cmd_tx.send(cmd).await;
+            });
         }
-        rx.await.unwrap_or_default()
+        rx
     }
+
     /// A prompt whose committed user item carries a provenance tag (T2).
     pub async fn prompt_tagged(&self, text: String, synthetic: hotl_types::SyntheticReason) {
         let _ = self
@@ -1931,6 +1935,7 @@ pub fn spawn_session_with_channels(
     // `Sender` and never gives it up.
     let (head_tx, head_rx) = actor::head_channel();
     let meter = Meter::default();
+    let prompts_held = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // The actor gets only a weak sender: strong senders are the handle and
     // any in-flight turn task, so dropping the handle lets the command
     // channel close and the actor task exit instead of leaking.
@@ -1943,9 +1948,11 @@ pub fn spawn_session_with_channels(
         notifications.clone(),
         head_tx,
         meter.clone(),
+        prompts_held.clone(),
     ));
     SessionHandle {
         meter,
+        prompts_held,
         cmd: cmd_tx,
         events: event_rx,
         current_turn,

@@ -156,9 +156,8 @@ fn question_answer_from_result(result: Option<&Value>) -> hotl_types::QuestionAn
     hotl_types::QuestionAnswer::NoHuman
 }
 
-/// JSON-RPC ids of in-flight prompt requests, keyed by the tag the engine
-/// reports back in `TurnStarted`, and answered when that turn's `TurnDone`
-/// arrives.
+/// JSON-RPC ids of in-flight prompt requests, answered in order on TurnDone
+/// (the engine queues overlapping prompts and finishes them FIFO).
 type PendingPrompt = Arc<std::sync::Mutex<PromptBook>>;
 
 #[derive(Default)]
@@ -471,7 +470,6 @@ pub async fn serve(
     let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let pending_questions: PendingQuestions = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let pending_egress: PendingEgress = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let pending_prompt: PendingPrompt = PendingPrompt::default();
     let mut next_id: u64 = 1;
     let mut session: Option<SessionState> = None;
 
@@ -520,7 +518,6 @@ pub async fn serve(
             &pending,
             &pending_questions,
             &pending_egress,
-            &pending_prompt,
             &mut next_id,
             &mut info,
             &mut reload,
@@ -543,6 +540,7 @@ struct SessionState {
     config: SharedConfig,
     drain: tokio::task::JoinHandle<()>,
     go: Option<oneshot::Sender<()>>,
+    book: PendingPrompt,
     /// The worktree lock (0065 T7): unlocked when this state drops — a
     /// replaced session, a closed connection, a clean quit.
     _lease: Option<hotl_store::worktree::Leased>,
@@ -565,7 +563,6 @@ async fn handle_request(
     pending: &Pending,
     pending_questions: &PendingQuestions,
     pending_egress: &PendingEgress,
-    pending_prompt: &PendingPrompt,
     next_id: &mut u64,
     info: &mut ServerInfo,
     reload: &mut Option<Reload>,
@@ -708,7 +705,6 @@ async fn handle_request(
                 pending,
                 pending_questions,
                 pending_egress,
-                pending_prompt,
                 next_id,
                 &info.model,
                 &info.fallback_models,
@@ -874,15 +870,7 @@ async fn handle_request(
                     }
                 };
             if session.as_ref().is_some_and(|s| s.id == request.session_id) {
-                retire_session(
-                    writer,
-                    session,
-                    pending,
-                    pending_questions,
-                    pending_egress,
-                    pending_prompt,
-                )
-                .await;
+                retire_session(writer, session, pending, pending_questions, pending_egress).await;
             }
             reply_ok(writer, id, json!({})).await;
         }
@@ -936,7 +924,7 @@ async fn handle_request(
                 }
             };
             let tag = {
-                let mut book = lock_prompts(pending_prompt);
+                let mut book = lock_prompts(&state.book);
                 book.next_tag += 1;
                 let tag = book.next_tag;
                 book.ids.insert(tag, id);
@@ -1433,17 +1421,13 @@ async fn handle_request(
             if request.session_id.is_some_and(|s| s != state.id) {
                 return;
             }
-            let dropped_tags = state.handle.drop_queued().await;
-            let dropped: Vec<Value> = {
-                let mut book = lock_prompts(pending_prompt);
+            {
+                let mut book = lock_prompts(&state.book);
                 let running = book.current.clone();
                 book.cancelled.extend(running);
-                dropped_tags
-                    .iter()
-                    .filter_map(|tag| book.ids.remove(tag))
-                    .collect()
-            };
+            }
             state.handle.interrupt();
+            let dropped = state.handle.drop_queued();
             for (_, reply) in pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1465,9 +1449,23 @@ async fn handle_request(
             {
                 let _ = reply.send(hotl_tools::net::EgressDecision::NoAnswer);
             }
-            for prompt_id in dropped {
-                reply_cancelled(writer, prompt_id).await;
-            }
+            let book = state.book.clone();
+            let writer = writer.clone();
+            tokio::spawn(async move {
+                let Ok(tags) = dropped.await else {
+                    return;
+                };
+                for tag in tags {
+                    let id = {
+                        let mut b = lock_prompts(&book);
+                        b.cancelled.remove(&tag);
+                        b.ids.remove(&tag)
+                    };
+                    if let Some(id) = id {
+                        reply_cancelled(&writer, id).await;
+                    }
+                }
+            });
         }
         // Re-read `config.toml` and rebuild the engine behind this connection,
         // then re-open the live session through the ordinary resume path so its
@@ -1566,7 +1564,6 @@ async fn handle_request(
                         pending,
                         pending_questions,
                         pending_egress,
-                        pending_prompt,
                         next_id,
                         &info.model,
                         &info.fallback_models,
@@ -2158,7 +2155,6 @@ async fn retire_session(
     pending: &Pending,
     pending_questions: &PendingQuestions,
     pending_egress: &PendingEgress,
-    pending_prompt: &PendingPrompt,
 ) {
     let Some(old) = session.take() else {
         return;
@@ -2178,7 +2174,7 @@ async fn retire_session(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
     let outstanding: Vec<Value> = {
-        let mut book = lock_prompts(pending_prompt);
+        let mut book = lock_prompts(&old.book);
         let mut ids: Vec<(u64, Value)> = std::mem::take(&mut book.ids).into_iter().collect();
         ids.sort_by_key(|(tag, _)| *tag);
         book.current.clear();
@@ -2217,22 +2213,13 @@ async fn install_session(
     pending: &Pending,
     pending_questions: &PendingQuestions,
     pending_egress: &PendingEgress,
-    pending_prompt: &PendingPrompt,
     next_id: &mut u64,
     model: &str,
     fallbacks: &[String],
     ext: bool,
     context_window: u64,
 ) {
-    retire_session(
-        writer,
-        session,
-        pending,
-        pending_questions,
-        pending_egress,
-        pending_prompt,
-    )
-    .await;
+    retire_session(writer, session, pending, pending_questions, pending_egress).await;
     let config = Arc::new(std::sync::Mutex::new(crate::acp_map::ConfigState {
         model: open.model.clone().unwrap_or_else(|| model.to_string()),
         plan: open.plan,
@@ -2253,7 +2240,6 @@ async fn install_session(
         pending.clone(),
         pending_questions.clone(),
         pending_egress.clone(),
-        pending_prompt.clone(),
         next_id,
         model.to_string(),
     );
@@ -2275,7 +2261,6 @@ fn start_session(
     pending: Pending,
     pending_questions: PendingQuestions,
     pending_egress: PendingEgress,
-    pending_prompt: PendingPrompt,
     next_id: &mut u64,
     model: String,
 ) -> SessionState {
@@ -2289,6 +2274,8 @@ fn start_session(
     let link = EngineLink {
         meter: handle.meter(),
     };
+    let book = PendingPrompt::default();
+    let pending_prompt = book.clone();
     let (go, held) = oneshot::channel::<()>();
     let drain = tokio::spawn(async move {
         if held.await.is_ok() {
@@ -2317,6 +2304,7 @@ fn start_session(
         config,
         drain,
         go: Some(go),
+        book,
         _lease: None,
     }
 }
@@ -2567,13 +2555,13 @@ async fn drain_events(
                     }),
                 )
                 .await;
-                let answered: Vec<(Value, bool)> = {
+                let answered: Vec<(u64, Value, bool)> = {
                     let mut book = lock_prompts(&pending_prompt);
                     let tags = std::mem::take(&mut book.current);
                     tags.into_iter()
                         .filter_map(|tag| {
-                            let cancelled = book.cancelled.remove(&tag);
-                            book.ids.remove(&tag).map(|id| (id, cancelled))
+                            let cancelled = book.cancelled.contains(&tag);
+                            book.ids.get(&tag).map(|id| (tag, id.clone(), cancelled))
                         })
                         .collect()
                 };
@@ -2582,8 +2570,11 @@ async fn drain_events(
                     usage: frame,
                     mispredictions: misses,
                 };
-                for (id, cancelled) in answered {
+                for (tag, id, cancelled) in answered {
                     reply_turn_end(&writer, id, &outcome, cancelled, ext, turn.clone()).await;
+                    let mut book = lock_prompts(&pending_prompt);
+                    book.ids.remove(&tag);
+                    book.cancelled.remove(&tag);
                 }
             }
             EngineEvent::TurnStarted { tags } => {
@@ -2810,6 +2801,8 @@ mod drain_tests {
         assert_eq!(lock_prompts(&book).ids.len(), 1);
     }
 
+    /// 0033 Task 2: a burst already sitting in the queue folds into ONE
+    /// frame — one JSON line, one flush, one client parse.
     #[tokio::test]
     async fn queued_text_deltas_coalesce_into_one_update() {
         let (tx, rx) = mpsc::channel(64);

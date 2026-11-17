@@ -6058,3 +6058,63 @@ async fn stop_reasons_for(
     }
     got
 }
+
+#[tokio::test]
+async fn cancel_during_a_goal_evaluation_answers_at_once() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::text_reply("worked"),
+        hanging(),
+    ]));
+    let (mut w, mut lines) = connect_caps(
+        factory_with(provider, "m", Vec::new(), Some("ship it".into())),
+        init_params(),
+    )
+    .await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 2).await;
+    let sid = opened["result"]["sessionId"].as_str().unwrap().to_string();
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "a"}])),
+    )
+    .await;
+    loop {
+        let m = next_raw(&mut lines).await;
+        if m["params"]["update"]["type"] == "goal_evaluating" {
+            break;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let started = std::time::Instant::now();
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId": sid}}),
+    )
+    .await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":9,"method":"session/rename","params":{"name":"x"}}),
+    )
+    .await;
+    let (mut reply, mut renamed) = (None, None);
+    while reply.is_none() || renamed.is_none() {
+        let m = next_raw(&mut lines).await;
+        if m.get("method").is_none() && m["id"] == json!(3) {
+            reply = Some(m);
+        } else if m.get("method").is_none() && m["id"] == json!(9) {
+            renamed = Some(m);
+        }
+    }
+    let (reply, renamed) = (reply.unwrap(), renamed.unwrap());
+    assert_eq!(reply["result"]["stopReason"], "cancelled", "{reply}");
+    assert_eq!(renamed["result"], json!({"ok": true}), "{renamed}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "the cancel waited on the engine: {:?}",
+        started.elapsed()
+    );
+}

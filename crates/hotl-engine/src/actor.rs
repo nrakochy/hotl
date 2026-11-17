@@ -675,6 +675,7 @@ pub(crate) struct SharedDeps {
     /// cannot run forever, and a fresh turn is not a fresh budget.
     tool_calls: AtomicU64,
     pub(crate) meter: crate::Meter,
+    pub(crate) prompts_held: Arc<AtomicBool>,
     /// Which budget thresholds have already been announced (bit 0 = 50%,
     /// 1 = 80%, 2 = 100%), so each fires once per session.
     budget_notices: AtomicU8,
@@ -849,6 +850,7 @@ impl SharedDeps {
             effort_pinned,
             tool_calls,
             meter: crate::Meter::default(),
+            prompts_held: Arc::new(AtomicBool::new(false)),
             budget_notices,
             keepalive_rejected,
             last_batch_verified,
@@ -1230,6 +1232,7 @@ pub(crate) async fn run(
     notifications: crate::hooks::NotificationDrain,
     head_tx: tokio::sync::watch::Sender<Arc<ProjectionHead>>,
     meter: crate::Meter,
+    prompts_held: Arc<AtomicBool>,
 ) {
     // Resumed history is repaired on the way in, both for a steer that landed
     // mid-batch (`pair_tool_results`) and for a crash that persisted an
@@ -1336,6 +1339,7 @@ pub(crate) async fn run(
     ));
     let (mut shared, mut log) = SharedDeps::new(deps, notifications, head_rx, jobs, children);
     shared.meter = meter;
+    shared.prompts_held = prompts_held;
     let shared = Arc::new(shared);
     // Usage carried across compaction respawns within one logical turn.
     let mut carry_usage = TokenUsage::default();
@@ -1475,6 +1479,7 @@ pub(crate) async fn run(
                     dropped.extend(q.tags.iter().copied());
                     false
                 });
+                shared.prompts_held.store(false, Ordering::SeqCst);
                 let _ = reply.send(dropped);
             }
             SessionCmd::Continue => {
@@ -3091,7 +3096,15 @@ async fn end_turn(
         )
         .await;
     }
-    match queue.pop_front() {
+    let next = if shared.prompts_held.load(Ordering::SeqCst) {
+        queue
+            .iter()
+            .position(|q| q.tags.is_empty())
+            .and_then(|i| queue.remove(i))
+    } else {
+        queue.pop_front()
+    };
+    match next {
         Some(next) => {
             start_turn(
                 shared,
@@ -4094,7 +4107,7 @@ async fn admit_prompt(
             // `[Image #1]`, and renumbering would mean parsing message text,
             // which types-layer policy forbids — accepted on this
             // pathological path (text folding already truncates far worse).
-            Some(last) if full => {
+            Some(last) if full && (prompt.tags.is_empty() || !last.tags.is_empty()) => {
                 // Images first, disclosure on the INCOMING text, one fold_into
                 // call — keeps FOLD_MARK the literal tail so it never stacks.
                 let dropped = fold_images(&mut last.images, prompt.images, HELD_IMAGE_B64_MAX);
