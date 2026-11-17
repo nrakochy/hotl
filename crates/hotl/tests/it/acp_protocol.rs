@@ -87,6 +87,7 @@ fn scripted_factory_recording(
             memory_mode: None,
             worktree: None,
             lease: None,
+            color: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider,
@@ -151,6 +152,7 @@ fn interrupted_factory(seen: Arc<std::sync::Mutex<Vec<String>>>) -> acp::Session
             memory_mode: None,
             worktree: None,
             lease: None,
+            color: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![
@@ -358,6 +360,7 @@ fn inherited_state_factory(effort: Option<Option<String>>) -> acp::SessionFactor
             memory_mode: None,
             worktree: None,
             lease: None,
+            color: Some("pink".into()),
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
@@ -442,6 +445,7 @@ async fn the_open_reply_seeds_context_todos_and_effort() {
         r["effort"], "max",
         "inherited-set rides as the level itself"
     );
+    assert_eq!(r["color"], "pink", "a resumed /color rides the open reply");
 
     // The base factory inherits nothing: `effort` absent, `todos` empty.
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -474,6 +478,7 @@ async fn the_open_reply_seeds_context_todos_and_effort() {
          re-creates the effort lie: {opened}"
     );
     assert_eq!(r["todos"], json!([]), "{opened}");
+    assert!(r.get("color").is_none(), "no color: key absent: {opened}");
 }
 
 /// The inner half of the tri-state: an inherited *clear* rides as `null`, so
@@ -532,6 +537,7 @@ async fn the_open_reply_carries_the_title_and_session_titled_is_broadcast() {
             memory_mode: None,
             worktree: None,
             lease: None,
+            color: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider,
@@ -849,6 +855,7 @@ async fn session_aside_acks_then_broadcasts_the_answer() {
             memory_mode: None,
             worktree: None,
             lease: None,
+            color: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider,
@@ -1248,6 +1255,7 @@ async fn overlapping_prompts_resolve_in_order() {
             memory_mode: None,
             worktree: None,
             lease: None,
+            color: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider,
@@ -1470,6 +1478,7 @@ async fn prompt_images_are_validated_at_the_wire() {
             memory_mode: None,
             worktree: None,
             lease: None,
+            color: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![
@@ -1634,6 +1643,68 @@ async fn named_open_and_rename() {
     assert_eq!(next(&mut lines).await["result"]["ok"], true);
 }
 
+/// 0080: `session/set_color` takes one of the eight names (any case) or
+/// `null`, and refuses anything else — the TUI resolves a random pick before
+/// it sends, so an unknown name here is a client bug, not a request.
+#[tokio::test]
+async fn set_color_acks_a_known_name_or_null_and_refuses_the_rest() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/set_color","params":{"color":"red"}}),
+    )
+    .await;
+    assert!(
+        read_until_id(&mut lines, 2).await["error"].is_object(),
+        "no session yet"
+    );
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/new"}),
+    )
+    .await;
+    read_until_id(&mut lines, 3).await;
+    for (id, color) in [(4, json!("Pink")), (5, json!(null))] {
+        send(
+            &mut cwrite,
+            json!({"jsonrpc":"2.0","id":id,"method":"session/set_color","params":{"color":color}}),
+        )
+        .await;
+        let r = read_until_id(&mut lines, id).await;
+        assert_eq!(r["result"]["ok"], true, "{color}: {r}");
+    }
+    for (id, params) in [
+        (6, json!({"color":"magenta"})),
+        (7, json!({"color":"default"})),
+        (8, json!({"color":3})),
+        (9, json!({})),
+    ] {
+        send(
+            &mut cwrite,
+            json!({"jsonrpc":"2.0","id":id,"method":"session/set_color","params":params}),
+        )
+        .await;
+        let r = read_until_id(&mut lines, id).await;
+        assert!(r["error"].is_object(), "{params}: {r}");
+    }
+}
+
 /// `ask_user` round-trips through `session/request_question`: the client
 /// sees the header/prompt/options, answers with a selection, and the tool
 /// result (fed back to the scripted model) carries the selected label. Also
@@ -1671,6 +1742,7 @@ async fn ask_user_round_trip_via_session_request_question() {
             memory_mode: None,
             worktree: None,
             lease: None,
+            color: None,
             handle: hotl_engine::spawn_session_with_channels(
                 SessionDeps {
                     concurrency: Default::default(),
@@ -2240,6 +2312,7 @@ async fn a_resumed_session_runs_its_last_model_set() {
             memory_mode: None,
             worktree: None,
             lease: None,
+            color: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![])),
@@ -2498,6 +2571,7 @@ async fn the_open_reply_carries_the_resumed_goal_and_a_forks_is_null() {
             memory_mode: None,
             worktree: None,
             lease: None,
+            color: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![])),
@@ -2893,6 +2967,7 @@ fn memory_factory(
             memory_mode: Some(mode.as_str().to_string()),
             worktree: None,
             lease: None,
+            color: None,
             session_id,
             warnings: Vec::new(),
             title: None,
@@ -3146,6 +3221,7 @@ fn jobs_factory(command: &str) -> acp::SessionFactory {
             memory_mode: None,
             worktree: None,
             lease: None,
+            color: None,
             session_id,
             warnings: Vec::new(),
             title: None,
@@ -3385,6 +3461,7 @@ fn children_factory() -> acp::SessionFactory {
             memory_mode: None,
             worktree: None,
             lease: None,
+            color: None,
             session_id,
             warnings: Vec::new(),
             title: None,

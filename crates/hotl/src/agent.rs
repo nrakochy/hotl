@@ -59,6 +59,9 @@ pub(crate) struct Resumed {
     /// child wins; 0065). Resume reopens it; a fork inherits it unless `-w`
     /// opens a new one.
     pub worktree: Option<(String, String)>,
+    /// The chain's `/color` (last `ColorSet`, child wins; 0080). Follows the
+    /// chain on resume and fork alike — replay walks the lineage anyway.
+    pub color: Option<String>,
     /// The parent's last `EffortSet`, if any. Doubly optional like
     /// `hotl_store::Replayed::effort`: outer `None` = never set, inner `None`
     /// = deliberately cleared back to the provider's default.
@@ -198,6 +201,7 @@ pub(crate) fn load_lineage(
         decisions,
         goal,
         worktree,
+        color,
         tip_entry_id,
         ..
     } = replayed;
@@ -217,6 +221,7 @@ pub(crate) fn load_lineage(
         mode,
         plan,
         worktree,
+        color,
         effort,
         // D-A11: todos describe the parent's *final* state. A fork cut back to
         // an earlier prefix would inherit a checklist about work its own
@@ -786,6 +791,7 @@ pub(crate) async fn build_acp() -> Result<
         }
         // The title copies forward the same way (0071 T4); a fork inherits
         // neither label (D-A3).
+        let resumed_color = resumed.as_ref().and_then(|r| r.color.clone());
         let inherited_title = resumed
             .as_ref()
             .filter(|_| !is_fork)
@@ -1025,6 +1031,7 @@ pub(crate) async fn build_acp() -> Result<
         );
         Ok(crate::acp::SessionOpen {
             handle,
+            color: resumed_color,
             worktree: worktree_wire,
             lease: opened.map(|o| o.lease),
             name: requested,
@@ -5941,6 +5948,28 @@ mod fork_tests {
         // of what it inherits (D-A6).
         let forked = load_lineage(dir.path(), &log.session_id, KeepSpec::All).unwrap();
         assert_eq!(forked.items, replayed.items);
+    }
+
+    /// 0080: `/color` follows the chain — `load_lineage` reports it, and a
+    /// resumed child's own replay still sees it without a copy-forward.
+    #[test]
+    fn a_resume_inherits_the_chains_color() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent_id, mut parent) = parent_with_three_turns(dir.path());
+        parent
+            .append(
+                &EntryPayload::ColorSet {
+                    color: Some("pink".into()),
+                },
+                3,
+            )
+            .unwrap();
+        let resumed = load_lineage(dir.path(), &parent_id, KeepSpec::All).unwrap();
+        assert_eq!(resumed.color.as_deref(), Some("pink"));
+        let child =
+            create_session_log(dir.path(), "m", Masker::empty(), 9, Some(&resumed), false).unwrap();
+        let again = load_lineage(dir.path(), &child.session_id, KeepSpec::All).unwrap();
+        assert_eq!(again.color.as_deref(), Some("pink"));
     }
 
     #[test]

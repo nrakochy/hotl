@@ -593,6 +593,9 @@ pub struct State {
     /// The git branch of the session's worktree (0065), from the open reply;
     /// rides the title so `hotl watch` can show it.
     pub session_branch: Option<String>,
+    /// The session's `/color` (0080): a canonical `SESSION_COLORS` name, or
+    /// `None` for the default border.
+    pub session_color: Option<String>,
     /// A `/btw` in flight (0071 T5): the question and ticks since it was
     /// sent, for the strip's `aside · Ns` segment. `None` = none pending.
     pub aside_pending: Option<(String, u64)>,
@@ -791,6 +794,7 @@ impl State {
             session_name: None,
             session_title: None,
             session_branch: None,
+            session_color: None,
             aside_pending: None,
             mode: "ask".into(),
             plan: false,

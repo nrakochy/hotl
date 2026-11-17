@@ -2278,6 +2278,13 @@
     "SessionOpenResult": {
       "description": "The `session/new` / `session/load` / fork result. Absent keys mean\nsomething different from `null` (probe failed / never set / same model).",
       "properties": {
+        "color": {
+          "description": "The session's `/color` (0080); absent when unset.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "contextTokens": {
           "format": "uint64",
           "minimum": 0,

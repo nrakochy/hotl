@@ -172,12 +172,18 @@ fn seed_state(state: &mut State, model: String, opened: Opened, first_run_hint: 
         title,
         memory_mode,
         worktree,
+        color,
     } = opened;
     state.model = model;
     state.memory_mode = memory_mode;
     state.session_name = session_name;
     state.session_title = title;
     state.session_branch = worktree.map(|(_, branch)| branch);
+    // An older server or an unknown word is no color, never a guess.
+    state.session_color = color
+        .as_deref()
+        .and_then(hotl_theme::session_color)
+        .map(String::from);
     // Server-side truth, seeded before the post-open loop's first draw: the
     // badge must never render a mode the session is not actually running
     // (evaluation §5.7) — pre-open it rendered none at all.
@@ -370,6 +376,7 @@ fn client_settings() -> ClientSettings {
 /// (server-confirmed), the skills `initialize` advertised (what makes
 /// `/<skill>` resolvable), and the session's effective permission mode plus
 /// context window — both server-side truth the client renders, never infers.
+#[derive(Default)]
 struct Opened {
     name: Option<String>,
     skills: Vec<(String, String)>,
@@ -401,6 +408,8 @@ struct Opened {
     title: Option<String>,
     /// The session's git worktree as `(path, branch)` (0065), when it has one.
     worktree: Option<(String, String)>,
+    /// The session's `/color` (0080), when it has one.
+    color: Option<String>,
     /// The inherited todo list at open (0040): the engine injects it into
     /// every request, so the client renders it or lies by omission (§5.7).
     todos: Vec<hotl_tools::todo::Todo>,
@@ -515,6 +524,7 @@ async fn handshake(
             .collect(),
         title: v.get("title").and_then(Value::as_str).map(String::from),
         worktree: parse_worktree(&v),
+        color: v.get("color").and_then(Value::as_str).map(String::from),
     })
 }
 
@@ -1700,6 +1710,23 @@ fn age(t: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn seed_state_restores_a_known_color_and_drops_an_unknown_one() {
+        let mut state = hotl_tui::app::State::new(false, "m".into());
+        let opened = super::Opened {
+            color: Some("Pink".into()),
+            ..Default::default()
+        };
+        super::seed_state(&mut state, "m".into(), opened, None);
+        assert_eq!(state.session_color.as_deref(), Some("pink"));
+        let opened = super::Opened {
+            color: Some("magenta".into()),
+            ..Default::default()
+        };
+        super::seed_state(&mut state, "m".into(), opened, None);
+        assert_eq!(state.session_color, None);
+    }
+
     use super::{
         clipboard_paste, defers_draw, is_paste_key, parse_tui_args, parse_tui_flags, resolve_mouse,
         resolve_session_arg, stamp_finished, terminal_msg, ClipboardSource, WHEEL_LINES,

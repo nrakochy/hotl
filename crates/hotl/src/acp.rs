@@ -36,6 +36,7 @@ pub const EXTENSION_METHODS: &[&str] = &[
     "session/load",
     "session/prompt",
     "session/rename",
+    "session/set_color",
     "session/set_mode",
     "session/set_plan",
     "session/set_effort",
@@ -234,6 +235,9 @@ pub struct SessionOpen {
     /// The worktree's lock, held for the session's life: dropping it on a
     /// clean close is what unlocks (0065 T7). `None` without a worktree.
     pub lease: Option<hotl_store::worktree::Leased>,
+    /// The session's `/color` at open (0080), inherited from the chain. The
+    /// open reply's `color`; absent when unset.
+    pub color: Option<String>,
     /// This session's effective permission mode at open (inherited-and-coerced
     /// on resume, else the configured default).
     /// INVARIANT: equals what the engine's `Rules` will actually enforce.
@@ -624,6 +628,7 @@ async fn handle_request(
                     let open_model = open.model.clone().unwrap_or_else(|| info.model.clone());
                     let memory_mode = open.memory_mode.clone();
                     let open_worktree = open.worktree.clone();
+                    let open_color = open.color.clone();
                     let sid = install_session(
                         open,
                         writer,
@@ -697,6 +702,7 @@ async fn handle_request(
                         memory_mode,
                         // Absent for a main-checkout session (0065).
                         worktree: open_worktree.map(|(path, branch)| WorktreeInfo { path, branch }),
+                        color: open_color,
                     };
                     reply_ok(writer, id, to_json(&reply)).await;
                 }
@@ -743,6 +749,30 @@ async fn handle_request(
                 .await;
             };
             state.handle.rename(name).await;
+            reply_ok(writer, id, to_json(&Ack { ok: true })).await;
+        }
+        // `{"color": "<name>" | null}` (0080). The TUI resolves a random
+        // pick before sending, so an unknown name is refused, never guessed.
+        "session/set_color" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "no session — call session/new first").await;
+            };
+            let color = match msg.pointer("/params/color") {
+                Some(Value::Null) => None,
+                Some(Value::String(c)) => match hotl_theme::session_color(c) {
+                    Some(c) => Some(c.to_string()),
+                    None => return reply_err(writer, id, &format!("unknown color {c:?}")).await,
+                },
+                _ => {
+                    return reply_err(
+                        writer,
+                        id,
+                        "session/set_color requires params.color (a color name or null)",
+                    )
+                    .await
+                }
+            };
+            state.handle.set_color(color).await;
             reply_ok(writer, id, to_json(&Ack { ok: true })).await;
         }
         "session/set_mode" => {
@@ -2141,6 +2171,9 @@ pub struct SessionOpenResult {
     pub memory_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeInfo>,
+    /// The session's `/color` (0080); absent when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
 }
 
 /// The `session/prompt` result, sent when the turn ends.
