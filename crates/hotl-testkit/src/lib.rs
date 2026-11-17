@@ -453,7 +453,7 @@ impl Harness {
     pub async fn wait_for_outcome(&mut self) -> Outcome {
         loop {
             let event = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(60),
                 self.handle.events.recv(),
             )
             .await

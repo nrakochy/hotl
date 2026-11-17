@@ -40,15 +40,15 @@ impl Provider for Router {
         } else {
             let inner = self.main.stream(req);
             // Hold the turn open: a pause after the first delta.
-            let mut first = true;
+            let mut delta_sent = false;
+            let mut paused = false;
             Box::pin(futures_util::StreamExt::then(inner, move |ev| {
-                let pause = first && matches!(ev, Ok(StreamEvent::TextDelta { .. }));
-                if pause {
-                    first = false;
-                }
+                let pause = delta_sent && !paused;
+                paused |= pause;
+                delta_sent |= matches!(ev, Ok(StreamEvent::TextDelta { .. }));
                 async move {
                     if pause {
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        tokio::time::sleep(Duration::from_millis(1_000)).await;
                     }
                     ev
                 }
