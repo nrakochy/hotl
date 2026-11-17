@@ -68,6 +68,34 @@ fn mask(value: &str) -> String {
     }
 }
 
+fn env_value_is_secret(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    let runs_code = [
+        "NODE_OPTIONS",
+        "PATH",
+        "RUBYOPT",
+        "PERL5OPT",
+        "JAVA_TOOL_OPTIONS",
+    ]
+    .contains(&upper.as_str())
+        || ["LD_", "DYLD_", "PYTHON"]
+            .iter()
+            .any(|p| upper.starts_with(p))
+        || upper.ends_with("_OPTIONS");
+    !runs_code
+        && [
+            "TOKEN",
+            "KEY",
+            "SECRET",
+            "PASSWORD",
+            "PASSWD",
+            "AUTH",
+            "CREDENTIAL",
+        ]
+        .iter()
+        .any(|s| upper.contains(s))
+}
+
 /// `scheme://host[:port]` of a URL, for the screen sentence.
 fn origin(url: &str) -> &str {
     let Some(scheme_end) = url.find("://") else {
@@ -251,13 +279,20 @@ impl fmt::Display for Fingerprint {
                 if !args.is_empty() {
                     write!(f, "\nargs: {args:?}")?;
                 }
-                // Everything `key()` records is shown: the screen and the grant
-                // come from one read (H-07). An env entry is a code-execution
+                // Everything `key()` records is shown, save the value of an env
+                // entry whose name looks secret: the screen and the grant come
+                // from one read (H-07). An env entry is a code-execution
                 // channel, so it is screened exactly like an argument.
                 if !env.is_empty() {
                     let pairs: Vec<String> = env
                         .iter()
-                        .map(|(k, v)| format!("{k}={}", mask(v)))
+                        .map(|(k, v)| {
+                            if env_value_is_secret(k) {
+                                format!("{k}={}", mask(v))
+                            } else {
+                                format!("{k}={v}")
+                            }
+                        })
                         .collect();
                     write!(f, "\nenv: {}", pairs.join(" "))?;
                 }
@@ -697,8 +732,10 @@ mod tests {
 
         // Shown == recorded: what the key folds in, the screen displays.
         let screen = env_fp.to_string();
-        assert!(screen.contains("NODE_OPTIONS=--re…"), "{screen}");
-        assert!(!screen.contains("evil"), "{screen}");
+        assert!(
+            screen.contains("NODE_OPTIONS=--require /tmp/evil.js"),
+            "{screen}"
+        );
         let screen = cwd_fp.to_string();
         assert!(screen.contains("cwd: "), "{screen}");
         assert!(!base.to_string().contains("env:"), "{base}");
@@ -710,6 +747,47 @@ mod tests {
         store.record("docs", &env_fp).unwrap();
         assert!(store.is_trusted("docs", &env_fp));
         assert!(!store.is_trusted("docs", &base));
+    }
+
+    fn env_screen(env: &[(&str, &str)]) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("server");
+        std::fs::write(&bin, b"x").unwrap();
+        let mut c = cfg(bin.to_str().unwrap(), &[]);
+        c.env = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Fingerprint::of(&c).to_string()
+    }
+
+    #[test]
+    fn env_values_show_in_full_unless_the_name_looks_secret() {
+        let screen = env_screen(&[
+            ("NODE_OPTIONS", "--require /tmp/evil.js"),
+            ("API_TOKEN", "sk-live-abcdef"),
+            ("PATH", "/tmp/evil/bin:/usr/bin"),
+            ("db_password", "hunter22"),
+            ("LD_PRELOAD", "/tmp/evil.so"),
+            ("AUTH_OPTIONS", "--trust-all"),
+            ("PYTHONSTARTUP_KEY", "/tmp/evil.py"),
+            ("LOG_LEVEL", "debug"),
+        ]);
+        assert!(
+            screen.contains("NODE_OPTIONS=--require /tmp/evil.js"),
+            "{screen}"
+        );
+        assert!(screen.contains("API_TOKEN=sk-l…"), "{screen}");
+        assert!(!screen.contains("abcdef"), "{screen}");
+        assert!(screen.contains("PATH=/tmp/evil/bin:/usr/bin"), "{screen}");
+        assert!(screen.contains("db_password=hunt…"), "{screen}");
+        assert!(screen.contains("LD_PRELOAD=/tmp/evil.so"), "{screen}");
+        assert!(screen.contains("AUTH_OPTIONS=--trust-all"), "{screen}");
+        assert!(
+            screen.contains("PYTHONSTARTUP_KEY=/tmp/evil.py"),
+            "{screen}"
+        );
+        assert!(screen.contains("LOG_LEVEL=debug"), "{screen}");
     }
 
     #[test]
