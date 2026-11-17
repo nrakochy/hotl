@@ -12,335 +12,44 @@
       ],
       "type": "object"
     },
-    "AcpOnlyUpdate": {
-      "description": "`session/update` bodies only the ACP surface sends.",
-      "oneOf": [
-        {
-          "properties": {
-            "bytes": {
-              "format": "uint",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "cap": {
-              "format": "uint",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "entries": {
-              "items": {
-                "$ref": "#/$defs/MemoryEntryRow"
-              },
-              "type": "array"
-            },
-            "mode": {
-              "type": "string"
-            },
-            "path": {
-              "type": "string"
-            },
-            "type": {
-              "const": "memory_report",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "mode",
-            "path",
-            "bytes",
-            "cap",
-            "entries"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "reason": {
-              "type": "string"
-            },
-            "type": {
-              "const": "config_reload_failed",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "reason"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "rows": {
-              "items": {
-                "$ref": "#/$defs/ContextRow"
-              },
-              "type": "array"
-            },
-            "type": {
-              "const": "context_report",
-              "type": "string"
-            },
-            "window": {
-              "format": "uint64",
-              "minimum": 0,
-              "type": "integer"
-            }
-          },
-          "required": [
-            "type",
-            "window",
-            "rows"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "jobs": {
-              "items": {
-                "$ref": "#/$defs/JobRow"
-              },
-              "type": "array"
-            },
-            "type": {
-              "const": "jobs_report",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "jobs"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "children": {
-              "items": {
-                "$ref": "#/$defs/ChildRow"
-              },
-              "type": "array"
-            },
-            "type": {
-              "const": "children_report",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "children"
-          ],
-          "type": "object"
-        }
-      ]
-    },
-    "AcpUpdate": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/Frame"
-        },
-        {
-          "$ref": "#/$defs/AcpOnlyUpdate"
-        }
-      ],
-      "description": "Any `session/update` body: a stream frame or an ACP-only kind. The\n`workflows_report` body is the workflow registry's own JSON (untyped here)."
-    },
-    "AgentCapabilities": {
+    "AsideParams": {
       "properties": {
-        "_meta": {
-          "additionalProperties": true,
+        "question": {
+          "type": "string"
+        },
+        "sessionId": {
           "type": [
-            "object",
+            "string",
             "null"
           ]
-        },
-        "loadSession": {
-          "type": "boolean"
-        },
-        "mcpCapabilities": {
-          "$ref": "#/$defs/McpCapabilities"
-        },
-        "promptCapabilities": {
-          "$ref": "#/$defs/PromptCapabilities"
-        },
-        "sessionCapabilities": {
-          "$ref": "#/$defs/SessionCapabilities"
         }
       },
       "required": [
-        "loadSession",
-        "promptCapabilities",
-        "mcpCapabilities",
-        "sessionCapabilities"
+        "question"
       ],
       "type": "object"
     },
-    "AudioContent": {
+    "AskDetail": {
       "properties": {
-        "data": {
-          "type": "string"
-        },
-        "mimeType": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "data",
-        "mimeType"
-      ],
-      "type": "object"
-    },
-    "AuthMethod": {
-      "oneOf": [
-        {
-          "properties": {
-            "_meta": {
-              "additionalProperties": true,
-              "type": [
-                "object",
-                "null"
-              ]
-            },
-            "description": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "id": {
-              "type": "string"
-            },
-            "name": {
-              "type": "string"
-            },
-            "type": {
-              "const": "agent",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "id",
-            "name"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "_meta": {
-              "additionalProperties": true,
-              "type": [
-                "object",
-                "null"
-              ]
-            },
-            "args": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "description": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "env": {
-              "additionalProperties": {
-                "type": "string"
-              },
-              "type": [
-                "object",
-                "null"
-              ]
-            },
-            "id": {
-              "type": "string"
-            },
-            "name": {
-              "type": "string"
-            },
-            "type": {
-              "const": "terminal",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "id",
-            "name",
-            "args"
-          ],
-          "type": "object"
-        }
-      ]
-    },
-    "AvailableCommand": {
-      "properties": {
-        "description": {
-          "type": "string"
-        },
-        "input": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/AvailableCommandInput"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "name": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "name",
-        "description"
-      ],
-      "type": "object"
-    },
-    "AvailableCommandInput": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/UnstructuredCommandInput"
-        }
-      ]
-    },
-    "AvailableCommandsUpdate": {
-      "properties": {
-        "availableCommands": {
+        "diff": {
           "items": {
-            "$ref": "#/$defs/AvailableCommand"
+            "$ref": "#/$defs/DiffRow"
           },
           "type": "array"
-        }
-      },
-      "required": [
-        "availableCommands"
-      ],
-      "type": "object"
-    },
-    "BlobResourceContents": {
-      "properties": {
-        "blob": {
-          "type": "string"
         },
-        "mimeType": {
+        "protectedWhy": {
           "type": [
             "string",
             "null"
           ]
         },
-        "uri": {
+        "summary": {
           "type": "string"
         }
       },
       "required": [
-        "uri",
-        "blob"
+        "summary",
+        "diff"
       ],
       "type": "object"
     },
@@ -409,159 +118,73 @@
       ],
       "type": "object"
     },
-    "CompactionStatus": {
-      "enum": [
-        "in_progress",
-        "completed",
-        "failed",
-        "cancelled"
-      ],
-      "type": "string"
-    },
-    "CompactionUpdate": {
+    "ChildStopParams": {
       "properties": {
-        "_meta": {
-          "additionalProperties": true,
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "compactionId": {
+        "child": {
           "type": "string"
         },
-        "error": {
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "child"
+      ],
+      "type": "object"
+    },
+    "ChildrenReport": {
+      "properties": {
+        "children": {
+          "items": {
+            "$ref": "#/$defs/ChildRow"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "children_report",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "children"
+      ],
+      "type": "object"
+    },
+    "ColorParams": {
+      "properties": {
+        "color": {
+          "description": "A color name, or null to clear",
           "type": [
             "string",
             "null"
           ]
         },
-        "status": {
-          "$ref": "#/$defs/CompactionStatus"
-        }
-      },
-      "required": [
-        "compactionId",
-        "status"
-      ],
-      "type": "object"
-    },
-    "ConfigOptionUpdate": {
-      "properties": {
-        "_meta": {
-          "additionalProperties": true,
+        "sessionId": {
           "type": [
-            "object",
+            "string",
             "null"
           ]
-        },
-        "configOptions": {
-          "items": {
-            "$ref": "#/$defs/SessionConfigOption"
-          },
-          "type": "array"
         }
       },
-      "required": [
-        "configOptions"
-      ],
       "type": "object"
     },
-    "Content": {
+    "ConfigReloadFailed": {
       "properties": {
-        "content": {
-          "$ref": "#/$defs/ContentBlock"
+        "reason": {
+          "type": "string"
+        },
+        "type": {
+          "const": "config_reload_failed",
+          "type": "string"
         }
       },
       "required": [
-        "content"
-      ],
-      "type": "object"
-    },
-    "ContentBlock": {
-      "oneOf": [
-        {
-          "$ref": "#/$defs/TextContent",
-          "properties": {
-            "type": {
-              "const": "text",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/ImageContent",
-          "properties": {
-            "type": {
-              "const": "image",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/AudioContent",
-          "properties": {
-            "type": {
-              "const": "audio",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/ResourceLink",
-          "properties": {
-            "type": {
-              "const": "resource_link",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/EmbeddedResource",
-          "properties": {
-            "type": {
-              "const": "resource",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "type": "object"
-        }
-      ]
-    },
-    "ContentChunk": {
-      "properties": {
-        "_meta": {
-          "additionalProperties": true,
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "content": {
-          "$ref": "#/$defs/ContentBlock"
-        }
-      },
-      "required": [
-        "content"
+        "type",
+        "reason"
       ],
       "type": "object"
     },
@@ -592,6 +215,31 @@
         }
       ]
     },
+    "ContextReport": {
+      "properties": {
+        "rows": {
+          "items": {
+            "$ref": "#/$defs/ContextRow"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "context_report",
+          "type": "string"
+        },
+        "window": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "type",
+        "window",
+        "rows"
+      ],
+      "type": "object"
+    },
     "ContextRow": {
       "description": "One row of a `/context` breakdown. `kind` is a stable wire tag, never a\ndisplay string — the client owns the label.",
       "properties": {
@@ -610,267 +258,31 @@
       ],
       "type": "object"
     },
-    "Cost": {
+    "DiffRow": {
       "properties": {
-        "amount": {
-          "format": "double",
-          "type": "number"
+        "op": {
+          "description": "ctx, add, del, or trailer (the \"[+N more lines]\" row)",
+          "type": "string"
         },
-        "currency": {
+        "text": {
           "type": "string"
         }
       },
       "required": [
-        "amount",
-        "currency"
+        "op",
+        "text"
       ],
       "type": "object"
     },
-    "CreateElicitationRequest": {
-      "oneOf": [
-        {
-          "$ref": "#/$defs/ElicitationFormMode",
-          "properties": {
-            "mode": {
-              "const": "form",
-              "type": "string"
-            }
-          },
-          "required": [
-            "mode"
-          ],
-          "type": "object"
-        }
-      ],
+    "Egress": {
       "properties": {
-        "_meta": {
-          "additionalProperties": true,
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "message": {
+        "host": {
           "type": "string"
         }
       },
       "required": [
-        "message"
+        "host"
       ],
-      "type": "object"
-    },
-    "CreateElicitationResponse": {
-      "oneOf": [
-        {
-          "$ref": "#/$defs/ElicitationAcceptAction",
-          "properties": {
-            "action": {
-              "const": "accept",
-              "type": "string"
-            }
-          },
-          "required": [
-            "action"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "action": {
-              "const": "decline",
-              "type": "string"
-            }
-          },
-          "required": [
-            "action"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "action": {
-              "const": "cancel",
-              "type": "string"
-            }
-          },
-          "required": [
-            "action"
-          ],
-          "type": "object"
-        }
-      ],
-      "properties": {
-        "_meta": {
-          "additionalProperties": true,
-          "type": [
-            "object",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "CurrentModeUpdate": {
-      "properties": {
-        "currentModeId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "currentModeId"
-      ],
-      "type": "object"
-    },
-    "Diff": {
-      "properties": {
-        "newText": {
-          "type": "string"
-        },
-        "oldText": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "path": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "path",
-        "newText"
-      ],
-      "type": "object"
-    },
-    "ElicitationAcceptAction": {
-      "properties": {
-        "content": {
-          "additionalProperties": {
-            "$ref": "#/$defs/ElicitationContentValue"
-          },
-          "type": [
-            "object",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "ElicitationContentValue": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "format": "int64",
-          "type": "integer"
-        },
-        {
-          "format": "double",
-          "type": "number"
-        },
-        {
-          "type": "boolean"
-        },
-        {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        }
-      ]
-    },
-    "ElicitationFormMode": {
-      "properties": {
-        "requestedSchema": {
-          "$ref": "#/$defs/ElicitationSchema"
-        },
-        "sessionId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "sessionId",
-        "requestedSchema"
-      ],
-      "type": "object"
-    },
-    "ElicitationPropertySchema": {
-      "oneOf": [
-        {
-          "$ref": "#/$defs/StringPropertySchema",
-          "properties": {
-            "type": {
-              "const": "string",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/MultiSelectPropertySchema",
-          "properties": {
-            "type": {
-              "const": "array",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "type": "object"
-        }
-      ]
-    },
-    "ElicitationSchema": {
-      "properties": {
-        "properties": {
-          "additionalProperties": {
-            "$ref": "#/$defs/ElicitationPropertySchema"
-          },
-          "type": "object"
-        },
-        "type": {
-          "$ref": "#/$defs/ElicitationSchemaType"
-        }
-      },
-      "required": [
-        "type",
-        "properties"
-      ],
-      "type": "object"
-    },
-    "ElicitationSchemaType": {
-      "enum": [
-        "object"
-      ],
-      "type": "string"
-    },
-    "EmbeddedResource": {
-      "properties": {
-        "resource": {
-          "$ref": "#/$defs/EmbeddedResourceResource"
-        }
-      },
-      "required": [
-        "resource"
-      ],
-      "type": "object"
-    },
-    "EmbeddedResourceResource": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/TextResourceContents"
-        },
-        {
-          "$ref": "#/$defs/BlobResourceContents"
-        }
-      ]
-    },
-    "EmptyCapability": {
       "type": "object"
     },
     "ExtSessionUpdateParams": {
@@ -879,12 +291,113 @@
           "type": "string"
         },
         "update": {
-          "$ref": "#/$defs/AcpUpdate"
+          "$ref": "#/$defs/Frame"
         }
       },
       "required": [
         "sessionId",
         "update"
+      ],
+      "type": "object"
+    },
+    "Flagged": {
+      "properties": {
+        "denied": {
+          "type": "boolean"
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "why",
+        "denied"
+      ],
+      "type": "object"
+    },
+    "FoldParams": {
+      "properties": {
+        "focus": {
+          "description": "What the summary should keep, 1 to 4000 characters",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ForkParams": {
+      "properties": {
+        "cwd": {
+          "description": "Absolute path; defaults to the agent's working directory",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "keepItems": {
+          "description": "Keep only the first N history items; not with keepTurns",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "keepTurns": {
+          "description": "Keep only the first N turns; not with keepItems",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mcpServers": {
+          "description": "Same shape as session/new's mcpServers",
+          "items": true,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "worktree": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "type": "object"
+    },
+    "ForkResult": {
+      "description": "The same result as session/new: sessionId, modes, configOptions and _meta[\"hotl.dev/open\"]",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId"
       ],
       "type": "object"
     },
@@ -1971,6 +1484,24 @@
       ],
       "type": "object"
     },
+    "GoalParams": {
+      "properties": {
+        "goal": {
+          "description": "1 to 4000 characters, or null to clear",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "GoalVerdictTag": {
       "enum": [
         "not_yet",
@@ -1982,88 +1513,64 @@
       ],
       "type": "string"
     },
-    "ImageContent": {
+    "HotlInit": {
       "properties": {
-        "data": {
+        "acpSchema": {
           "type": "string"
         },
-        "mimeType": {
+        "contextWindow": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "defaultMode": {
           "type": "string"
         },
-        "uri": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "data",
-        "mimeType"
-      ],
-      "type": "object"
-    },
-    "Implementation": {
-      "properties": {
-        "_meta": {
-          "additionalProperties": true,
-          "type": [
-            "object",
-            "null"
-          ]
+        "defaultPlan": {
+          "type": "boolean"
         },
-        "name": {
-          "type": "string"
-        },
-        "title": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "version": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "name",
-        "version"
-      ],
-      "type": "object"
-    },
-    "InitializeResponse": {
-      "properties": {
-        "_meta": {
-          "additionalProperties": true,
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "agentCapabilities": {
-          "$ref": "#/$defs/AgentCapabilities"
-        },
-        "agentInfo": {
-          "$ref": "#/$defs/Implementation"
-        },
-        "authMethods": {
+        "skills": {
           "items": {
-            "$ref": "#/$defs/AuthMethod"
+            "$ref": "#/$defs/RosterEntry"
           },
           "type": "array"
         },
-        "protocolVersion": {
-          "format": "uint16",
-          "maximum": 65535,
+        "streamIdleSecs": {
+          "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "workflows": {
+          "items": {
+            "$ref": "#/$defs/RosterEntry"
+          },
+          "type": "array"
         }
       },
       "required": [
-        "protocolVersion",
-        "agentCapabilities",
-        "authMethods",
-        "agentInfo"
+        "skills",
+        "workflows",
+        "defaultMode",
+        "defaultPlan",
+        "contextWindow",
+        "streamIdleSecs",
+        "acpSchema"
+      ],
+      "type": "object"
+    },
+    "ImageParam": {
+      "properties": {
+        "data": {
+          "description": "Base64 image bytes",
+          "type": "string"
+        },
+        "media_type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "media_type",
+        "data"
       ],
       "type": "object"
     },
@@ -2117,69 +1624,39 @@
       ],
       "type": "object"
     },
-    "ListSessionsResponse": {
+    "JobStopParams": {
       "properties": {
-        "nextCursor": {
+        "job": {
+          "type": "string"
+        },
+        "sessionId": {
           "type": [
             "string",
             "null"
           ]
-        },
-        "sessions": {
-          "items": {
-            "$ref": "#/$defs/SessionInfo"
-          },
-          "type": "array"
         }
       },
       "required": [
-        "sessions"
+        "job"
       ],
       "type": "object"
     },
-    "LoadSessionResponse": {
+    "JobsReport": {
       "properties": {
-        "_meta": {
-          "additionalProperties": true,
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "configOptions": {
+        "jobs": {
           "items": {
-            "$ref": "#/$defs/SessionConfigOption"
+            "$ref": "#/$defs/JobRow"
           },
-          "type": [
-            "array",
-            "null"
-          ]
+          "type": "array"
         },
-        "modes": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SessionModeState"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "McpCapabilities": {
-      "properties": {
-        "http": {
-          "type": "boolean"
-        },
-        "sse": {
-          "type": "boolean"
+        "type": {
+          "const": "jobs_report",
+          "type": "string"
         }
       },
       "required": [
-        "http",
-        "sse"
+        "type",
+        "jobs"
       ],
       "type": "object"
     },
@@ -2195,6 +1672,45 @@
       "required": [
         "date",
         "note"
+      ],
+      "type": "object"
+    },
+    "MemoryReport": {
+      "properties": {
+        "bytes": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cap": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/MemoryEntryRow"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "type": {
+          "const": "memory_report",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "mode",
+        "path",
+        "bytes",
+        "cap",
+        "entries"
       ],
       "type": "object"
     },
@@ -2225,112 +1741,58 @@
       ],
       "type": "object"
     },
-    "MultiSelectItems": {
-      "oneOf": [
-        {
-          "$ref": "#/$defs/StringMultiSelectItems",
-          "properties": {
-            "type": {
-              "const": "string",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "type": "object"
-        }
-      ]
-    },
-    "MultiSelectPropertySchema": {
+    "ModelChange": {
       "properties": {
-        "description": {
+        "contextTokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "contextWindow": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "model": {
+          "type": "string"
+        },
+        "previous": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "model",
+        "previous",
+        "contextTokens",
+        "contextWindow"
+      ],
+      "type": "object"
+    },
+    "OpenParams": {
+      "properties": {
+        "name": {
+          "description": "A session name, 1 to 64 characters",
           "type": [
             "string",
             "null"
           ]
         },
-        "items": {
-          "$ref": "#/$defs/MultiSelectItems"
-        }
-      },
-      "required": [
-        "items"
-      ],
-      "type": "object"
-    },
-    "NewSessionResponse": {
-      "properties": {
-        "_meta": {
-          "additionalProperties": true,
+        "noWorktree": {
+          "description": "session/load and session/resume only: do not reuse the worktree",
           "type": [
-            "object",
+            "boolean",
             "null"
           ]
         },
-        "configOptions": {
-          "items": {
-            "$ref": "#/$defs/SessionConfigOption"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "modes": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SessionModeState"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "sessionId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "sessionId"
-      ],
-      "type": "object"
-    },
-    "Notice": {
-      "properties": {
-        "_meta": {
-          "additionalProperties": true,
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "description": {
+        "worktree": {
+          "description": "session/new only: run the session in a new git worktree",
           "type": [
             "string",
             "null"
           ]
-        },
-        "severity": {
-          "$ref": "#/$defs/NoticeSeverity"
-        },
-        "title": {
-          "type": "string"
         }
       },
-      "required": [
-        "severity",
-        "title"
-      ],
       "type": "object"
-    },
-    "NoticeSeverity": {
-      "enum": [
-        "info",
-        "warning",
-        "error"
-      ],
-      "type": "string"
     },
     "OutcomeFrame": {
       "description": "A turn outcome, tagged by `kind`.",
@@ -2496,41 +1958,6 @@
         }
       ]
     },
-    "PermissionOption": {
-      "properties": {
-        "_meta": {
-          "additionalProperties": true,
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "kind": {
-          "$ref": "#/$defs/PermissionOptionKind"
-        },
-        "name": {
-          "type": "string"
-        },
-        "optionId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "optionId",
-        "name",
-        "kind"
-      ],
-      "type": "object"
-    },
-    "PermissionOptionKind": {
-      "enum": [
-        "allow_once",
-        "allow_always",
-        "reject_once",
-        "reject_always"
-      ],
-      "type": "string"
-    },
     "Phase": {
       "description": "The ten boundary events a turn's sample passes through. Declaration order\nis the critical-path order the design doc's per-phase deltas price\n(`SnapshotReady−BoundaryStart` prices the snapshot transport, etc.) — see\n[`DELTA_PAIRS`]. A doom-loop abort or a failed sample can legitimately\nskip phases past the point of failure; see [`LoopLedger::stamp`].\n\n`BatchProposed`/`WatermarkDurable` are the one place the critical path\nforks: a sample proposes once (the model's own assistant+usage entry) or\ntwice (that entry, then — only when a tool phase runs — the tool-results\nentry). These two phases use [`LoopLedger::restamp`] (last-wins, not\n`stamp`'s first-wins), so their recorded position always tracks the\nsample's REAL final commit — after `ToolsJoined` when a tool phase ran,\notherwise right after `LastBlockEnd`. Every other phase is written\nexactly once by construction, so `stamp`'s first-wins rule is what\napplies to them.\n\n**Declaration order is stamp order, not wall order** — and since S2c's\noptimistic dispatch those two genuinely diverge. A sample whose request\nwas dispatched at the *previous* boundary already had bytes on the wire\nbefore this sample's `BoundaryStart`: its true first byte can precede the\nprevious sample's `WatermarkDurable`, which is the overlap the mechanism\nexists for, not a measurement error. Every stamp is taken when the turn\n**observes** the event, so the recorded sequence stays monotone and the\nsummary needs no special case; what a reader must not do is treat\n`RequestBuilt→FirstByte` on an adopted sample as a round-trip\nmeasurement. It is the time to *notice* a byte that was already there,\nand it is legitimately near zero. ([`width`] saturates either way, so an\nout-of-order pair reports `0` rather than wrapping.)",
       "enum": [
@@ -2575,96 +2002,30 @@
       ],
       "type": "object"
     },
-    "Plan": {
+    "Question": {
+      "description": "A structured multiple-choice question the agent asks the human\n(`ask_user`) — a header, a prompt, and 2-4 labelled options (plus an\nalways-available free-text \"other\" the surfaces provide, not encoded\nhere). `multi` reserves multi-select for a future surface; today's\nsurfaces treat every question as single-select.",
       "properties": {
-        "_meta": {
-          "additionalProperties": true,
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "entries": {
-          "items": {
-            "$ref": "#/$defs/PlanEntry"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "entries"
-      ],
-      "type": "object"
-    },
-    "PlanEntry": {
-      "properties": {
-        "content": {
+        "header": {
           "type": "string"
         },
-        "priority": {
-          "$ref": "#/$defs/PlanEntryPriority"
+        "multi": {
+          "default": false,
+          "type": "boolean"
         },
-        "status": {
-          "$ref": "#/$defs/PlanEntryStatus"
+        "options": {
+          "items": {
+            "$ref": "#/$defs/QuestionOption"
+          },
+          "type": "array"
+        },
+        "prompt": {
+          "type": "string"
         }
       },
       "required": [
-        "content",
-        "priority",
-        "status"
-      ],
-      "type": "object"
-    },
-    "PlanEntryPriority": {
-      "enum": [
-        "high",
-        "medium",
-        "low"
-      ],
-      "type": "string"
-    },
-    "PlanEntryStatus": {
-      "enum": [
-        "pending",
-        "in_progress",
-        "completed"
-      ],
-      "type": "string"
-    },
-    "PromptCapabilities": {
-      "properties": {
-        "audio": {
-          "type": "boolean"
-        },
-        "embeddedContext": {
-          "type": "boolean"
-        },
-        "image": {
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "image",
-        "audio",
-        "embeddedContext"
-      ],
-      "type": "object"
-    },
-    "PromptResponse": {
-      "properties": {
-        "_meta": {
-          "additionalProperties": true,
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "stopReason": {
-          "$ref": "#/$defs/StopReason"
-        }
-      },
-      "required": [
-        "stopReason"
+        "header",
+        "prompt",
+        "options"
       ],
       "type": "object"
     },
@@ -2811,80 +2172,62 @@
       ],
       "type": "object"
     },
-    "RequestPermissionOutcome": {
-      "oneOf": [
-        {
-          "properties": {
-            "outcome": {
-              "const": "cancelled",
-              "type": "string"
-            }
-          },
-          "required": [
-            "outcome"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/SelectedPermissionOutcome",
-          "properties": {
-            "outcome": {
-              "const": "selected",
-              "type": "string"
-            }
-          },
-          "required": [
-            "outcome"
-          ],
-          "type": "object"
-        }
-      ]
-    },
-    "RequestPermissionRequest": {
+    "RememberParams": {
       "properties": {
-        "_meta": {
-          "additionalProperties": true,
+        "note": {
+          "description": "One line to save to memory after the owner approves it; without a note the reply is a memory_report",
           "type": [
-            "object",
+            "string",
             "null"
           ]
         },
-        "options": {
-          "items": {
-            "$ref": "#/$defs/PermissionOption"
-          },
-          "type": "array"
-        },
         "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "RenameParams": {
+      "properties": {
+        "name": {
+          "description": "1 to 64 characters after trimming",
           "type": "string"
         },
-        "toolCall": {
-          "$ref": "#/$defs/ToolCallUpdate"
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
-        "sessionId",
-        "toolCall",
-        "options"
+        "name"
       ],
       "type": "object"
     },
-    "RequestPermissionResponse": {
+    "Reply": {
       "properties": {
-        "_meta": {
-          "additionalProperties": true,
+        "input": {
+          "description": "With an allow option: run the tool with this input instead"
+        },
+        "message": {
+          "description": "With the deny option: a reason the model reads",
           "type": [
-            "object",
+            "string",
             "null"
           ]
         },
-        "outcome": {
-          "$ref": "#/$defs/RequestPermissionOutcome"
+        "respond": {
+          "description": "With an allow option: skip the tool and send this text as its result",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
-      "required": [
-        "outcome"
-      ],
       "type": "object"
     },
     "RequestQuestionParams": {
@@ -2918,77 +2261,6 @@
       ],
       "type": "object"
     },
-    "ResourceLink": {
-      "properties": {
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "mimeType": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "name": {
-          "type": "string"
-        },
-        "size": {
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "title": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "uri": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "uri",
-        "name"
-      ],
-      "type": "object"
-    },
-    "ResumeSessionResponse": {
-      "properties": {
-        "_meta": {
-          "additionalProperties": true,
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "configOptions": {
-          "items": {
-            "$ref": "#/$defs/SessionConfigOption"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "modes": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SessionModeState"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "type": "object"
-    },
     "RetryScopeTag": {
       "enum": [
         "sample",
@@ -3012,282 +2284,6 @@
       "required": [
         "name",
         "description"
-      ],
-      "type": "object"
-    },
-    "SelectedPermissionOutcome": {
-      "properties": {
-        "_meta": {
-          "additionalProperties": true,
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "optionId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "optionId"
-      ],
-      "type": "object"
-    },
-    "SessionCapabilities": {
-      "properties": {
-        "close": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/EmptyCapability"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "list": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/EmptyCapability"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "resume": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/EmptyCapability"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "SessionConfigBoolean": {
-      "properties": {
-        "currentValue": {
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "currentValue"
-      ],
-      "type": "object"
-    },
-    "SessionConfigOption": {
-      "oneOf": [
-        {
-          "$ref": "#/$defs/SessionConfigSelect",
-          "properties": {
-            "type": {
-              "const": "select",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/SessionConfigBoolean",
-          "properties": {
-            "type": {
-              "const": "boolean",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "type": "object"
-        }
-      ],
-      "properties": {
-        "category": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SessionConfigOptionCategory"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "id": {
-          "type": "string"
-        },
-        "name": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "id",
-        "name"
-      ],
-      "type": "object"
-    },
-    "SessionConfigOptionCategory": {
-      "enum": [
-        "mode",
-        "model",
-        "model_config",
-        "thought_level"
-      ],
-      "type": "string"
-    },
-    "SessionConfigSelect": {
-      "properties": {
-        "currentValue": {
-          "type": "string"
-        },
-        "options": {
-          "items": {
-            "$ref": "#/$defs/SessionConfigSelectOption"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "currentValue",
-        "options"
-      ],
-      "type": "object"
-    },
-    "SessionConfigSelectOption": {
-      "properties": {
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "name": {
-          "type": "string"
-        },
-        "value": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "value",
-        "name"
-      ],
-      "type": "object"
-    },
-    "SessionInfo": {
-      "properties": {
-        "cwd": {
-          "type": "string"
-        },
-        "sessionId": {
-          "type": "string"
-        },
-        "title": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "updatedAt": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "sessionId",
-        "cwd"
-      ],
-      "type": "object"
-    },
-    "SessionInfoUpdate": {
-      "properties": {
-        "_meta": {
-          "additionalProperties": true,
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "title": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "updatedAt": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "SessionMode": {
-      "properties": {
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "id": {
-          "type": "string"
-        },
-        "name": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "id",
-        "name"
-      ],
-      "type": "object"
-    },
-    "SessionModeState": {
-      "properties": {
-        "availableModes": {
-          "items": {
-            "$ref": "#/$defs/SessionMode"
-          },
-          "type": "array"
-        },
-        "currentModeId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "currentModeId",
-        "availableModes"
-      ],
-      "type": "object"
-    },
-    "SessionNotification": {
-      "properties": {
-        "sessionId": {
-          "type": "string"
-        },
-        "update": {
-          "$ref": "#/$defs/SessionUpdate"
-        }
-      },
-      "required": [
-        "sessionId",
-        "update"
       ],
       "type": "object"
     },
@@ -3399,188 +2395,42 @@
       ],
       "type": "object"
     },
-    "SessionUpdate": {
-      "oneOf": [
-        {
-          "$ref": "#/$defs/ContentChunk",
-          "properties": {
-            "sessionUpdate": {
-              "const": "user_message_chunk",
-              "type": "string"
-            }
-          },
-          "required": [
-            "sessionUpdate"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/ContentChunk",
-          "properties": {
-            "sessionUpdate": {
-              "const": "agent_message_chunk",
-              "type": "string"
-            }
-          },
-          "required": [
-            "sessionUpdate"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/ContentChunk",
-          "properties": {
-            "sessionUpdate": {
-              "const": "agent_thought_chunk",
-              "type": "string"
-            }
-          },
-          "required": [
-            "sessionUpdate"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/ToolCall",
-          "properties": {
-            "sessionUpdate": {
-              "const": "tool_call",
-              "type": "string"
-            }
-          },
-          "required": [
-            "sessionUpdate"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/ToolCallUpdate",
-          "properties": {
-            "sessionUpdate": {
-              "const": "tool_call_update",
-              "type": "string"
-            }
-          },
-          "required": [
-            "sessionUpdate"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/Plan",
-          "properties": {
-            "sessionUpdate": {
-              "const": "plan",
-              "type": "string"
-            }
-          },
-          "required": [
-            "sessionUpdate"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/AvailableCommandsUpdate",
-          "properties": {
-            "sessionUpdate": {
-              "const": "available_commands_update",
-              "type": "string"
-            }
-          },
-          "required": [
-            "sessionUpdate"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/UsageUpdate",
-          "properties": {
-            "sessionUpdate": {
-              "const": "usage_update",
-              "type": "string"
-            }
-          },
-          "required": [
-            "sessionUpdate"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/SessionInfoUpdate",
-          "properties": {
-            "sessionUpdate": {
-              "const": "session_info_update",
-              "type": "string"
-            }
-          },
-          "required": [
-            "sessionUpdate"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/CurrentModeUpdate",
-          "properties": {
-            "sessionUpdate": {
-              "const": "current_mode_update",
-              "type": "string"
-            }
-          },
-          "required": [
-            "sessionUpdate"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/ConfigOptionUpdate",
-          "properties": {
-            "sessionUpdate": {
-              "const": "config_option_update",
-              "type": "string"
-            }
-          },
-          "required": [
-            "sessionUpdate"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/Notice",
-          "properties": {
-            "sessionUpdate": {
-              "const": "notice",
-              "type": "string"
-            }
-          },
-          "required": [
-            "sessionUpdate"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/CompactionUpdate",
-          "properties": {
-            "sessionUpdate": {
-              "const": "compaction_update",
-              "type": "string"
-            }
-          },
-          "required": [
-            "sessionUpdate"
-          ],
-          "type": "object"
+    "SessionParams": {
+      "properties": {
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
-      ]
+      },
+      "type": "object"
     },
-    "StopReason": {
-      "enum": [
-        "end_turn",
-        "max_tokens",
-        "max_turn_requests",
-        "refusal",
-        "cancelled"
+    "SteerParams": {
+      "properties": {
+        "images": {
+          "items": {
+            "$ref": "#/$defs/ImageParam"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
       ],
-      "type": "string"
+      "type": "object"
     },
     "StoppedAck": {
       "properties": {
@@ -3594,72 +2444,6 @@
       "required": [
         "ok",
         "stopped"
-      ],
-      "type": "object"
-    },
-    "StringMultiSelectItems": {
-      "properties": {
-        "enum": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "enum"
-      ],
-      "type": "object"
-    },
-    "StringPropertySchema": {
-      "properties": {
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "enum": {
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "TextContent": {
-      "properties": {
-        "text": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "text"
-      ],
-      "type": "object"
-    },
-    "TextResourceContents": {
-      "properties": {
-        "mimeType": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "text": {
-          "type": "string"
-        },
-        "uri": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "uri",
-        "text"
       ],
       "type": "object"
     },
@@ -3784,189 +2568,6 @@
       },
       "type": "object"
     },
-    "ToolCall": {
-      "properties": {
-        "_meta": {
-          "additionalProperties": true,
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "content": {
-          "items": {
-            "$ref": "#/$defs/ToolCallContent"
-          },
-          "type": "array"
-        },
-        "kind": {
-          "$ref": "#/$defs/ToolKind"
-        },
-        "locations": {
-          "items": {
-            "$ref": "#/$defs/ToolCallLocation"
-          },
-          "type": "array"
-        },
-        "rawInput": true,
-        "rawOutput": true,
-        "status": {
-          "$ref": "#/$defs/ToolCallStatus"
-        },
-        "title": {
-          "type": "string"
-        },
-        "toolCallId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "toolCallId",
-        "title",
-        "kind",
-        "status",
-        "content",
-        "locations"
-      ],
-      "type": "object"
-    },
-    "ToolCallContent": {
-      "oneOf": [
-        {
-          "$ref": "#/$defs/Content",
-          "properties": {
-            "type": {
-              "const": "content",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "type": "object"
-        },
-        {
-          "$ref": "#/$defs/Diff",
-          "properties": {
-            "type": {
-              "const": "diff",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "type": "object"
-        }
-      ]
-    },
-    "ToolCallLocation": {
-      "properties": {
-        "line": {
-          "format": "uint32",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "path": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "path"
-      ],
-      "type": "object"
-    },
-    "ToolCallStatus": {
-      "enum": [
-        "pending",
-        "in_progress",
-        "completed",
-        "failed"
-      ],
-      "type": "string"
-    },
-    "ToolCallUpdate": {
-      "properties": {
-        "_meta": {
-          "additionalProperties": true,
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "content": {
-          "items": {
-            "$ref": "#/$defs/ToolCallContent"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "kind": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ToolKind"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "locations": {
-          "items": {
-            "$ref": "#/$defs/ToolCallLocation"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "rawInput": true,
-        "rawOutput": true,
-        "status": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ToolCallStatus"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "title": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "toolCallId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "toolCallId"
-      ],
-      "type": "object"
-    },
-    "ToolKind": {
-      "enum": [
-        "read",
-        "edit",
-        "delete",
-        "move",
-        "search",
-        "execute",
-        "think",
-        "fetch",
-        "switch_mode",
-        "other"
-      ],
-      "type": "string"
-    },
     "TurnMeta": {
       "properties": {
         "mispredictions": {
@@ -3987,17 +2588,6 @@
       "required": [
         "outcome",
         "usage"
-      ],
-      "type": "object"
-    },
-    "UnstructuredCommandInput": {
-      "properties": {
-        "hint": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "hint"
       ],
       "type": "object"
     },
@@ -4057,32 +2647,23 @@
       },
       "type": "object"
     },
-    "UsageUpdate": {
+    "WorkflowsReport": {
       "properties": {
-        "cost": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Cost"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        "runs": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
         },
-        "size": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "used": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
+        "type": {
+          "description": "Always workflows_report",
+          "type": "string"
         }
       },
       "required": [
-        "used",
-        "size"
+        "type",
+        "runs"
       ],
       "type": "object"
     },
@@ -4103,105 +2684,347 @@
       "type": "object"
     }
   },
-  "$id": "https://nrakochy.github.io/hotl/schema/acp-v1.schema.json",
+  "$id": "https://nrakochy.github.io/hotl/schema/acp-hotl-extensions.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "Index type: exists so `schema_for!` puts every payload in `$defs`.",
-  "properties": {
-    "ack": {
-      "$ref": "#/$defs/Ack"
+  "description": "What hotl adds to ACP v1: the _hotl/ methods and the hotl.dev/ _meta keys. A client sees them only after it sets clientCapabilities._meta[\"hotl.dev/extensions\"] to 1 in initialize. Every standard ACP message follows the ACP v1 schema.",
+  "meta": {
+    "hotl.dev/ask": [
+      {
+        "on": "session/request_permission params: toolCall._meta",
+        "schema": {
+          "$ref": "#/$defs/AskDetail"
+        }
+      }
+    ],
+    "hotl.dev/autoAllowed": [
+      {
+        "on": "session/update tool_call_update: _meta",
+        "schema": {
+          "description": "The allow rule that let the call run",
+          "type": "string"
+        }
+      }
+    ],
+    "hotl.dev/child": [
+      {
+        "on": "session/update tool_call_update of a spawn call: _meta",
+        "schema": {
+          "$ref": "#/$defs/Frame"
+        }
+      }
+    ],
+    "hotl.dev/denied": [
+      {
+        "on": "session/update tool_call_update: _meta",
+        "schema": {
+          "const": true
+        }
+      }
+    ],
+    "hotl.dev/egress": [
+      {
+        "on": "session/request_permission params: toolCall._meta",
+        "schema": {
+          "$ref": "#/$defs/Egress"
+        }
+      }
+    ],
+    "hotl.dev/extensions": [
+      {
+        "on": "initialize params: clientCapabilities._meta",
+        "schema": {
+          "const": 1
+        }
+      }
+    ],
+    "hotl.dev/flagged": [
+      {
+        "on": "session/update tool_call_update: _meta",
+        "schema": {
+          "$ref": "#/$defs/Flagged"
+        }
+      }
+    ],
+    "hotl.dev/frame": [
+      {
+        "on": "session/update: update._meta",
+        "schema": {
+          "$ref": "#/$defs/Frame"
+        }
+      }
+    ],
+    "hotl.dev/init": [
+      {
+        "on": "initialize result: agentCapabilities._meta",
+        "schema": {
+          "$ref": "#/$defs/HotlInit"
+        }
+      }
+    ],
+    "hotl.dev/methods": [
+      {
+        "on": "initialize result: agentCapabilities._meta",
+        "schema": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      }
+    ],
+    "hotl.dev/model": [
+      {
+        "on": "session/update config_option_update: _meta",
+        "schema": {
+          "$ref": "#/$defs/ModelChange"
+        }
+      },
+      {
+        "on": "session/set_config_option result: _meta",
+        "schema": {
+          "$ref": "#/$defs/ModelAck"
+        }
+      }
+    ],
+    "hotl.dev/open": [
+      {
+        "on": "session/new, session/load, session/resume params: _meta",
+        "schema": {
+          "$ref": "#/$defs/OpenParams"
+        }
+      },
+      {
+        "on": "session/new, session/load, session/resume, _hotl/session/fork result: _meta",
+        "schema": {
+          "$ref": "#/$defs/SessionOpenExtras"
+        }
+      }
+    ],
+    "hotl.dev/protectedWhy": [
+      {
+        "on": "session/request_permission params: toolCall._meta",
+        "schema": {
+          "type": "string"
+        }
+      }
+    ],
+    "hotl.dev/question": [
+      {
+        "on": "elicitation/create params: _meta",
+        "schema": {
+          "$ref": "#/$defs/Question"
+        }
+      }
+    ],
+    "hotl.dev/reply": [
+      {
+        "on": "session/request_permission result (sent by the client): _meta",
+        "schema": {
+          "$ref": "#/$defs/Reply"
+        }
+      }
+    ],
+    "hotl.dev/socketToken": [
+      {
+        "on": "initialize params: _meta (hotl serve socket only)",
+        "schema": {
+          "type": "string"
+        }
+      }
+    ],
+    "hotl.dev/turn": [
+      {
+        "on": "session/prompt result: _meta",
+        "schema": {
+          "$ref": "#/$defs/TurnMeta"
+        }
+      },
+      {
+        "on": "session/prompt error: error.data._meta",
+        "schema": {
+          "$ref": "#/$defs/TurnMeta"
+        }
+      }
+    ]
+  },
+  "methods": {
+    "_hotl/session/aside": {
+      "from": "client",
+      "params": {
+        "$ref": "#/$defs/AsideParams"
+      },
+      "result": {
+        "$ref": "#/$defs/Ack"
+      }
     },
-    "elicitationRequest": {
-      "$ref": "#/$defs/CreateElicitationRequest"
+    "_hotl/session/children": {
+      "from": "client",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ChildrenReport"
+      }
     },
-    "elicitationResponse": {
-      "$ref": "#/$defs/CreateElicitationResponse"
+    "_hotl/session/children/stop": {
+      "from": "client",
+      "params": {
+        "$ref": "#/$defs/ChildStopParams"
+      },
+      "result": {
+        "$ref": "#/$defs/StoppedAck"
+      }
     },
-    "extSessionUpdate": {
-      "$ref": "#/$defs/ExtSessionUpdateParams"
+    "_hotl/session/context": {
+      "from": "client",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ContextReport"
+      }
     },
-    "goalAck": {
-      "$ref": "#/$defs/GoalAck"
+    "_hotl/session/fold": {
+      "from": "client",
+      "params": {
+        "$ref": "#/$defs/FoldParams"
+      },
+      "result": {
+        "$ref": "#/$defs/Queued"
+      }
     },
-    "initialize": {
-      "$ref": "#/$defs/InitializeResponse"
+    "_hotl/session/fork": {
+      "from": "client",
+      "params": {
+        "$ref": "#/$defs/ForkParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ForkResult"
+      }
     },
-    "listSessions": {
-      "$ref": "#/$defs/ListSessionsResponse"
+    "_hotl/session/jobs": {
+      "from": "client",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/JobsReport"
+      }
     },
-    "loadSession": {
-      "$ref": "#/$defs/LoadSessionResponse"
+    "_hotl/session/jobs/stop": {
+      "from": "client",
+      "params": {
+        "$ref": "#/$defs/JobStopParams"
+      },
+      "result": {
+        "$ref": "#/$defs/StoppedAck"
+      }
     },
-    "modelAck": {
-      "$ref": "#/$defs/ModelAck"
+    "_hotl/session/reload_config": {
+      "errorData": {
+        "$ref": "#/$defs/ConfigReloadFailed"
+      },
+      "from": "client",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/ReloadAck"
+          },
+          {
+            "$ref": "#/$defs/ReloadSessionAck"
+          }
+        ]
+      }
     },
-    "newSession": {
-      "$ref": "#/$defs/NewSessionResponse"
+    "_hotl/session/remember": {
+      "from": "client",
+      "params": {
+        "$ref": "#/$defs/RememberParams"
+      },
+      "result": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/Ack"
+          },
+          {
+            "$ref": "#/$defs/MemoryReport"
+          }
+        ]
+      }
     },
-    "permissionReply": {
-      "$ref": "#/$defs/RequestPermissionResponse"
+    "_hotl/session/rename": {
+      "from": "client",
+      "params": {
+        "$ref": "#/$defs/RenameParams"
+      },
+      "result": {
+        "$ref": "#/$defs/Ack"
+      }
     },
-    "promptResponse": {
-      "$ref": "#/$defs/PromptResponse"
+    "_hotl/session/request_question": {
+      "from": "agent",
+      "params": {
+        "$ref": "#/$defs/RequestQuestionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/QuestionReply"
+      }
     },
-    "questionReply": {
-      "$ref": "#/$defs/QuestionReply"
+    "_hotl/session/set_color": {
+      "from": "client",
+      "params": {
+        "$ref": "#/$defs/ColorParams"
+      },
+      "result": {
+        "$ref": "#/$defs/Ack"
+      }
     },
-    "queued": {
-      "$ref": "#/$defs/Queued"
+    "_hotl/session/set_goal": {
+      "from": "client",
+      "params": {
+        "$ref": "#/$defs/GoalParams"
+      },
+      "result": {
+        "$ref": "#/$defs/GoalAck"
+      }
     },
-    "reloadAck": {
-      "$ref": "#/$defs/ReloadAck"
+    "_hotl/session/steer": {
+      "from": "client",
+      "params": {
+        "$ref": "#/$defs/SteerParams"
+      },
+      "result": {
+        "$ref": "#/$defs/Queued"
+      }
     },
-    "reloadSessionAck": {
-      "$ref": "#/$defs/ReloadSessionAck"
+    "_hotl/session/stop": {
+      "from": "client",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/Ack"
+      }
     },
-    "requestPermission": {
-      "$ref": "#/$defs/RequestPermissionRequest"
+    "_hotl/session/update": {
+      "from": "agent",
+      "notification": true,
+      "params": {
+        "$ref": "#/$defs/ExtSessionUpdateParams"
+      }
     },
-    "requestQuestion": {
-      "$ref": "#/$defs/RequestQuestionParams"
-    },
-    "resumeSession": {
-      "$ref": "#/$defs/ResumeSessionResponse"
-    },
-    "sessionNotification": {
-      "$ref": "#/$defs/SessionNotification"
-    },
-    "sessionOpenExtras": {
-      "$ref": "#/$defs/SessionOpenExtras"
-    },
-    "stoppedAck": {
-      "$ref": "#/$defs/StoppedAck"
-    },
-    "turnMeta": {
-      "$ref": "#/$defs/TurnMeta"
+    "_hotl/session/workflows": {
+      "from": "client",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/WorkflowsReport"
+      }
     }
   },
-  "required": [
-    "initialize",
-    "newSession",
-    "loadSession",
-    "resumeSession",
-    "listSessions",
-    "sessionNotification",
-    "sessionOpenExtras",
-    "promptResponse",
-    "turnMeta",
-    "extSessionUpdate",
-    "ack",
-    "modelAck",
-    "goalAck",
-    "stoppedAck",
-    "reloadAck",
-    "reloadSessionAck",
-    "queued",
-    "requestPermission",
-    "requestQuestion",
-    "elicitationRequest",
-    "elicitationResponse",
-    "permissionReply",
-    "questionReply"
-  ],
-  "title": "hotl ACP-dialect payloads",
-  "type": "object"
+  "title": "hotl ACP extensions"
 }

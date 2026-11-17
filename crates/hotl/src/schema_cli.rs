@@ -6,7 +6,7 @@
 pub fn render(which: &str) -> Option<String> {
     let v = match which {
         "json-stream" => crate::wire::json_stream_schema(),
-        "acp" => crate::acp::acp_schema(),
+        "acp" => crate::acp_ext::schema(),
         _ => return None,
     };
     let mut s = serde_json::to_string_pretty(&sorted(v)).expect("a schema always serializes");

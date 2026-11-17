@@ -34,7 +34,7 @@ type ReadHalf = tokio::io::ReadHalf<Stream>;
 type WriteHalf = tokio::io::WriteHalf<Stream>;
 type Lines = tokio::io::Lines<BufReader<ReadHalf>>;
 
-pub const META_SOCKET_TOKEN: &str = "hotl.dev/socketToken";
+pub const META_SOCKET_TOKEN: &str = crate::acp_ext::META_SOCKET_TOKEN;
 
 /// What a surface prints after a human allows a host: the grant is
 /// session-scoped, and hotl does not write `config.toml` for you.

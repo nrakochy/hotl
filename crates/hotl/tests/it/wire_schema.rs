@@ -9,7 +9,7 @@ use hotl_engine::{EngineEvent, Outcome};
 use hotl_types::TokenUsage;
 use serde_json::{json, Value};
 
-use crate::{acp, features, schema_cli, wire};
+use crate::{acp, acp_ext, acp_map, features, schema_cli, wire};
 
 fn server_info() -> acp::ServerInfo {
     acp::ServerInfo {
@@ -62,8 +62,8 @@ fn the_committed_json_stream_schema_matches_the_types() {
 }
 
 #[test]
-fn the_committed_acp_schema_matches_the_types() {
-    check("acp-v1.schema.json", "acp");
+fn the_committed_acp_extensions_schema_matches_the_types() {
+    check("acp-hotl-extensions.schema.json", "acp");
 }
 
 fn committed(file: &str) -> Value {
@@ -77,8 +77,8 @@ fn schema_ids_name_the_published_urls() {
         "https://nrakochy.github.io/hotl/schema/json-stream-v2.schema.json"
     );
     assert_eq!(
-        committed("acp-v1.schema.json")["$id"],
-        "https://nrakochy.github.io/hotl/schema/acp-v1.schema.json"
+        committed("acp-hotl-extensions.schema.json")["$id"],
+        "https://nrakochy.github.io/hotl/schema/acp-hotl-extensions.schema.json"
     );
 }
 
@@ -196,58 +196,223 @@ fn every_pinned_frame_validates_against_the_published_schema() {
     }
 }
 
-/// Validate `value` against one `$defs` entry of the ACP schema.
-fn acp_valid(def: &str, value: &Value) {
-    let schema = committed("acp-v1.schema.json");
-    let root = json!({"$ref": format!("#/$defs/{def}"), "$defs": schema["$defs"]});
+fn ext_schema() -> Value {
+    committed("acp-hotl-extensions.schema.json")
+}
+
+fn validates(schema: &Value, part: &Value, value: &Value) -> Result<(), Vec<String>> {
+    let root = json!({"allOf": [part], "$defs": schema["$defs"]});
     let v = jsonschema::validator_for(&root).expect("a valid schema");
-    assert!(
-        v.is_valid(value),
-        "{def} rejects {value}: {:?}",
-        v.iter_errors(value)
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-    );
+    if v.is_valid(value) {
+        Ok(())
+    } else {
+        Err(v.iter_errors(value).map(|e| e.to_string()).collect())
+    }
+}
+
+fn ext_valid(def: &str, value: &Value) {
+    let schema = ext_schema();
+    let part = json!({"$ref": format!("#/$defs/{def}")});
+    if let Err(e) = validates(&schema, &part, value) {
+        panic!("{def} rejects {value}: {e:?}");
+    }
+}
+
+fn check_meta(schema: &Value, value: &Value, seen: &mut std::collections::BTreeSet<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::Object(meta)) = map.get("_meta") {
+                for (key, payload) in meta {
+                    assert!(key.starts_with("hotl.dev/"), "foreign _meta key {key}");
+                    let places = schema["meta"][key]
+                        .as_array()
+                        .unwrap_or_else(|| panic!("{key} is not in the extension schema"));
+                    let errors: Vec<_> = places
+                        .iter()
+                        .filter_map(|p| validates(schema, &p["schema"], payload).err())
+                        .collect();
+                    assert!(
+                        errors.len() < places.len(),
+                        "{key} = {payload} matches no schema: {errors:?}"
+                    );
+                    seen.insert(key.clone());
+                }
+            }
+            for v in map.values() {
+                check_meta(schema, v, seen);
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|v| check_meta(schema, v, seen)),
+        _ => {}
+    }
+}
+
+fn ext_caps() -> acp::ClientCaps {
+    acp::ClientCaps {
+        ext: true,
+        ..Default::default()
+    }
 }
 
 #[test]
-fn every_acp_payload_validates_against_the_published_schema() {
-    acp_valid(
-        "InitializeResponse",
-        &serde_json::to_value(acp::initialize_response(
-            &server_info(),
-            acp::ClientCaps {
-                ext: true,
-                ..Default::default()
+fn every_hotl_meta_payload_validates_against_the_published_schema() {
+    let schema = ext_schema();
+    let caps = ext_caps();
+    let mut calls = acp_map::ToolCalls::rooted(std::env::temp_dir());
+    let mut sent = vec![
+        serde_json::to_value(acp::initialize_response(&server_info(), caps)).unwrap(),
+        json!({"stopReason": "end_turn", "_meta": {acp::META_TURN: acp::TurnMeta {
+            outcome: wire::OutcomeFrame::of(&Outcome::Done { text: "x".into() }),
+            usage: wire::UsageFrame::of("claude-opus-5", &TokenUsage { input_tokens: 3, ..Default::default() }),
+            mispredictions: Some(1),
+        }}}),
+        json!({"_meta": {acp::META_MODEL: acp_ext::ModelChange {
+            model: "a".into(), previous: "b".into(), context_tokens: 1, context_window: 2,
+        }}}),
+        json!({"_meta": {acp::META_MODEL: acp::ModelAck {
+            ok: true, model: "m".into(), applied: false, warnings: vec![],
+        }}}),
+        serde_json::to_value(acp_map::egress_tool_call(3, "example.com", &caps)).unwrap(),
+        serde_json::to_value(acp_map::question_form(
+            "s",
+            &hotl_types::Question {
+                header: "h".into(),
+                prompt: "p".into(),
+                options: vec![hotl_types::QuestionOption {
+                    label: "a".into(),
+                    description: None,
+                }],
+                multi: false,
             },
+            true,
         ))
         .unwrap(),
-    );
-    acp_valid("PromptResponse", &json!({"stopReason": "end_turn"}));
-    acp_valid(
-        "TurnMeta",
-        &json!({"outcome": {"kind": "done", "text": "x"}, "usage": wire::UsageFrame::of("claude-opus-5", &TokenUsage { input_tokens: 3, ..Default::default() })}),
-    );
-    acp_valid(
-        "ExtSessionUpdateParams",
-        &json!({"sessionId": "s", "update": wire::update_frame(&EngineEvent::TextDelta("x".into())).unwrap()}),
-    );
-    acp_valid(
-        "SessionNotification",
-        &json!({"sessionId": "s", "update": {"sessionUpdate": "usage_update", "used": 10, "size": 200000, "cost": {"amount": 0.5, "currency": "USD"}}}),
-    );
-    acp_valid(
-        "RequestPermissionRequest",
-        &json!({"sessionId": "s", "toolCall": {"toolCallId": "t1", "kind": "execute", "status": "pending", "title": "bash: ls", "rawInput": {"command": "ls"}}, "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}, {"optionId": "deny", "name": "Deny", "kind": "reject_once"}]}),
-    );
-    acp_valid(
-        "RequestPermissionResponse",
-        &json!({"outcome": {"outcome": "selected", "optionId": "allow"}}),
-    );
-    acp_valid("Ack", &json!({"ok": true}));
-    acp_valid(
+        serde_json::to_value(calls.ask(
+            &acp_map::AskView {
+                call_id: "e1",
+                tool: "edit",
+                input: &json!({"path": "x.txt", "old_string": "a", "new_string": "b"}),
+                summary: "edit x.txt",
+                protected_why: Some("protected"),
+            },
+            &caps,
+        ))
+        .unwrap(),
+        json!({"outcome": {"outcome": "selected", "optionId": "deny"}, "_meta": {acp_map::META_REPLY: {"message": "no"}}}),
+        json!({"_meta": {acp_ext::META_EXT: 1, acp_ext::META_SOCKET_TOKEN: "t"}}),
+        json!({"_meta": {acp::META_OPEN: {"name": "n", "worktree": "w"}}}),
+    ];
+    let events = [
+        EngineEvent::TextDelta("hi".into()),
+        EngineEvent::ToolStart {
+            id: "t1".into(),
+            name: "spawn".into(),
+            summary: "spawn".into(),
+            input: json!({}),
+        },
+        EngineEvent::ChildTool {
+            parent_id: "t1".into(),
+            id: "c".into(),
+            name: "read".into(),
+            summary: "s".into(),
+            ok: None,
+            tokens: None,
+        },
+        EngineEvent::ToolAutoAllowed {
+            id: "t1".into(),
+            name: "spawn".into(),
+            rule: "spawn *".into(),
+        },
+        EngineEvent::ToolFlagged {
+            id: "t1".into(),
+            name: "spawn".into(),
+            summary: "s".into(),
+            why: "w".into(),
+            denied: false,
+        },
+        EngineEvent::ToolDenied {
+            id: "t1".into(),
+            name: "spawn".into(),
+        },
+        EngineEvent::GoalChanged { condition: None },
+    ];
+    for event in &events {
+        match acp_map::outgoing(event, &caps, &mut calls) {
+            Some(acp_map::Outgoing::Update(u)) => sent.push(serde_json::to_value(u).unwrap()),
+            Some(acp_map::Outgoing::Ext(frame)) => ext_valid(
+                "ExtSessionUpdateParams",
+                &json!({"sessionId": "s", "update": frame}),
+            ),
+            None => panic!("{event:?} sent nothing"),
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for value in &sent {
+        check_meta(&schema, value, &mut seen);
+    }
+    let documented: std::collections::BTreeSet<String> = schema["meta"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(seen, documented, "every documented key is exercised");
+}
+
+#[test]
+fn every_extension_method_is_in_the_published_schema() {
+    let schema = ext_schema();
+    let mut listed: Vec<&str> = acp::EXTENSION_METHODS.to_vec();
+    listed.sort_unstable();
+    let mut documented: Vec<&str> = schema["methods"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    documented.sort_unstable();
+    assert_eq!(listed, documented);
+}
+
+#[test]
+fn extension_results_validate_against_the_published_schema() {
+    assert!(validates(
+        &ext_schema(),
+        &json!({"$ref": "#/$defs/Ack"}),
+        &json!({"ok": "yes"})
+    )
+    .is_err());
+    ext_valid("Ack", &serde_json::to_value(acp::Ack { ok: true }).unwrap());
+    ext_valid(
         "ModelAck",
         &json!({"ok": true, "model": "m", "applied": false, "warnings": []}),
+    );
+    ext_valid("Queued", &json!({"queued": true}));
+    ext_valid("StoppedAck", &json!({"ok": true, "stopped": false}));
+    ext_valid(
+        "JobsReport",
+        &serde_json::to_value(acp::AcpOnlyUpdate::JobsReport { jobs: vec![] }).unwrap(),
+    );
+    ext_valid(
+        "ConfigReloadFailed",
+        &serde_json::to_value(acp::AcpOnlyUpdate::ConfigReloadFailed { reason: "r".into() })
+            .unwrap(),
+    );
+    ext_valid("QuestionReply", &json!({"freeText": "later"}));
+    ext_valid(
+        "RequestQuestionParams",
+        &serde_json::to_value(acp::RequestQuestionParams {
+            session_id: "s".into(),
+            header: "h".into(),
+            prompt: "p".into(),
+            options: vec![],
+            multi: false,
+        })
+        .unwrap(),
+    );
+    ext_valid(
+        "WorkflowsReport",
+        &json!({"type": "workflows_report", "runs": []}),
     );
 }
 

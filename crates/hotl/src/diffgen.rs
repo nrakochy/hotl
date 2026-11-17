@@ -9,8 +9,6 @@
 //! A plain LCS over lines, deliberately: `similar` would be nicer and is not
 //! worth a workspace dependency for one card.
 
-use serde_json::Value;
-
 /// Longest side, in lines, before the O(n·m) LCS table is abandoned for a
 /// whole-file replace. A minified bundle must not turn an approval prompt
 /// into a multi-second stall.
@@ -58,8 +56,11 @@ impl DiffLine {
         }
     }
 
-    pub fn to_json(&self) -> Value {
-        serde_json::json!({"op": self.op.as_str(), "text": self.text})
+    pub fn to_row(&self) -> crate::acp_ext::DiffRow {
+        crate::acp_ext::DiffRow {
+            op: self.op.as_str().to_string(),
+            text: self.text.clone(),
+        }
     }
 }
 
@@ -220,7 +221,7 @@ mod tests {
 
     #[test]
     fn the_wire_shape_is_op_and_text() {
-        let j = DiffLine::new(Op::Add, "x").to_json();
+        let j = serde_json::to_value(DiffLine::new(Op::Add, "x").to_row()).unwrap();
         assert_eq!(j["op"], "add");
         assert_eq!(j["text"], "x");
     }

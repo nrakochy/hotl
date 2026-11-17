@@ -2786,11 +2786,11 @@ async fn drain_events(
                 let mut m = serde_json::Map::new();
                 m.insert(
                     META_MODEL.into(),
-                    json!({
-                        "model": model,
-                        "previous": previous,
-                        "contextTokens": context_tokens,
-                        "contextWindow": context_window,
+                    to_json(&crate::acp_ext::ModelChange {
+                        model: model.clone(),
+                        previous: previous.clone(),
+                        context_tokens: *context_tokens,
+                        context_window: *context_window,
                     }),
                 );
                 m
@@ -3571,12 +3571,14 @@ mod ask_reply_tests {
             q(json!({"freeText": "later"})),
             QuestionAnswer::FreeText("later".into())
         );
-        let schema = acp_schema();
+        let schema = crate::acp_ext::schema();
         let defs = &schema["$defs"];
         let mut cases: Vec<(&str, Value)> = examples
             .iter()
-            .map(|e| ("RequestPermissionResponse", e.clone()))
+            .filter_map(|e| e.pointer("/_meta/hotl.dev~1reply"))
+            .map(|r| ("Reply", r.clone()))
             .collect();
+        assert_eq!(cases.len(), 3);
         cases.push(("QuestionReply", json!({"selected": ["MVP"]})));
         cases.push(("QuestionReply", json!({"freeText": "later"})));
         for (def, example) in cases {
@@ -3628,7 +3630,7 @@ mod ask_reply_tests {
 // --- Typed payloads (0076 D2) -------------------------------------------------
 //
 // Every result and notification body this server writes, as types, so the
-// published schema (`acp_schema`) is generated from what is actually sent.
+// published schema (`acp_ext::schema`) is generated from what is actually sent.
 // Field order is the wire order (`preserve_order` serializes declaration order).
 
 /// `{name, description}` — a skill or workflow in a roster.
@@ -3939,21 +3941,11 @@ pub enum AcpOnlyUpdate {
     },
 }
 
-/// Any `session/update` body: a stream frame or an ACP-only kind. The
-/// `workflows_report` body is the workflow registry's own JSON (untyped here).
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-#[serde(untagged)]
-#[allow(dead_code)] // schema-only: `notify` sends the two halves as values
-pub enum AcpUpdate {
-    Frame(crate::wire::Frame),
-    Acp(AcpOnlyUpdate),
-}
-
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtSessionUpdateParams {
     pub session_id: String,
-    pub update: AcpUpdate,
+    pub update: crate::wire::Frame,
 }
 
 /// Server → client `_hotl/session/request_question` params.
@@ -3978,48 +3970,6 @@ pub enum QuestionReply {
         #[serde(rename = "freeText")]
         free_text: String,
     },
-}
-
-/// Index type: exists so `schema_for!` puts every payload in `$defs`.
-#[derive(JsonSchema)]
-#[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // schema-only
-pub struct AcpPayloads {
-    initialize: InitializeResponse,
-    new_session: NewSessionResponse,
-    load_session: LoadSessionResponse,
-    resume_session: ResumeSessionResponse,
-    list_sessions: ListSessionsResponse,
-    session_notification: SessionNotification,
-    session_open_extras: SessionOpenExtras,
-    prompt_response: PromptResponse,
-    turn_meta: TurnMeta,
-    ext_session_update: ExtSessionUpdateParams,
-    ack: Ack,
-    model_ack: ModelAck,
-    goal_ack: GoalAck,
-    stopped_ack: StoppedAck,
-    reload_ack: ReloadAck,
-    reload_session_ack: ReloadSessionAck,
-    queued: Queued,
-    request_permission: RequestPermissionRequest,
-    request_question: RequestQuestionParams,
-    elicitation_request: crate::acp_types::CreateElicitationRequest,
-    elicitation_response: crate::acp_types::CreateElicitationResponse,
-    permission_reply: crate::acp_types::RequestPermissionResponse,
-    question_reply: QuestionReply,
-}
-
-/// Where the ACP schema is published (0076 D3).
-pub const ACP_SCHEMA_ID: &str = "https://nrakochy.github.io/hotl/schema/acp-v1.schema.json";
-
-/// The published schema of every ACP payload, `$id` set to its URL.
-pub fn acp_schema() -> Value {
-    let mut v = serde_json::to_value(schemars::schema_for!(AcpPayloads))
-        .expect("a schema always serializes");
-    v["$id"] = json!(ACP_SCHEMA_ID);
-    v["title"] = json!("hotl ACP-dialect payloads");
-    v
 }
 
 fn to_json<T: Serialize>(payload: &T) -> Value {

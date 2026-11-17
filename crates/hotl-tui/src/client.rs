@@ -1002,7 +1002,7 @@ mod tests {
             ))
         );
         let old: Value = serde_json::from_str(
-            r#"{"jsonrpc":"2.0","method":"session/update","params":{"schemaVersion":1,"sessionId":"s","update":{"type":"text_delta","text":"hi"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"type":"text_delta","text":"hi"}}}"#,
         )
         .unwrap();
         assert_eq!(decode(&old), None);

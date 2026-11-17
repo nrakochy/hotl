@@ -210,11 +210,11 @@ impl ToolCalls {
             _ => ask.summary.to_string(),
         };
         let meta = caps.ext.then(|| {
-            let rows: Vec<Value> = match &diff {
+            let rows: Vec<crate::acp_ext::DiffRow> = match &diff {
                 Some(ToolCallContent::Diff(d)) => {
                     crate::diffgen::unified(d.old_text.as_deref().unwrap_or(""), &d.new_text)
                         .iter()
-                        .map(crate::diffgen::DiffLine::to_json)
+                        .map(crate::diffgen::DiffLine::to_row)
                         .collect()
                 }
                 _ => Vec::new(),
@@ -225,11 +225,12 @@ impl ToolCalls {
             }
             m.insert(
                 META_ASK.into(),
-                serde_json::json!({
-                    "summary": ask.summary,
-                    "protectedWhy": ask.protected_why,
-                    "diff": rows,
-                }),
+                serde_json::to_value(crate::acp_ext::AskDetail {
+                    summary: ask.summary.to_string(),
+                    protected_why: ask.protected_why.map(str::to_string),
+                    diff: rows,
+                })
+                .unwrap_or_default(),
             );
             m
         });
@@ -344,10 +345,15 @@ pub fn egress_tool_call(req_id: u64, host: &str, caps: &ClientCaps) -> ToolCallU
             raw_input: Some(serde_json::json!({"host": host})),
             ..ToolCallUpdateFields::default()
         },
-        meta: caps
-            .ext
-            .then(|| meta_of(META_EGRESS, serde_json::json!({"host": host}))),
+        meta: caps.ext.then(|| meta_of(META_EGRESS, egress_meta(host))),
     }
+}
+
+fn egress_meta(host: &str) -> Value {
+    serde_json::to_value(crate::acp_ext::Egress {
+        host: host.to_string(),
+    })
+    .unwrap_or_default()
 }
 
 pub fn question_form(
@@ -609,7 +615,11 @@ fn standard(
         } => {
             let meta = ext_meta(
                 META_FLAGGED,
-                serde_json::json!({"why": why, "denied": denied}),
+                serde_json::to_value(crate::acp_ext::Flagged {
+                    why: why.clone(),
+                    denied: *denied,
+                })
+                .ok()?,
             )?;
             calls.touch(
                 id,
