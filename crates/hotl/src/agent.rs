@@ -685,10 +685,30 @@ pub(crate) async fn build_acp() -> Result<
     ),
     String,
 > {
-    let secrets = EnvSecrets;
     let cfg = crate::config::Config::load(&config_dir());
-    let (provider, model, key_source) = select_provider(&cfg, &secrets)?;
-    let mut scaffold = scaffold(provider, model, &secrets, cfg, key_source).await?;
+    build_acp_with(cfg, &EnvSecrets).await
+}
+
+pub(crate) async fn build_acp_with(
+    cfg: crate::config::Config,
+    secrets: &dyn SecretStore,
+) -> Result<
+    (
+        crate::acp::SessionFactory,
+        crate::acp::ServerInfo,
+        Vec<String>,
+    ),
+    String,
+> {
+    let (provider, model, key_source, key_available) = match select_provider_typed(&cfg, secrets) {
+        Ok((p, m, s)) => (p, m, s, true),
+        Err(SelectError::MissingKey(_)) => {
+            let (p, m, s) = select_provider_typed(&cfg, &PlaceholderKeys(secrets))?;
+            (p, m, s, false)
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let mut scaffold = scaffold(provider, model, secrets, cfg, key_source).await?;
     // §Task 4 (mode-derived 1h TTL): `hotl tui`/`hotl acp` sessions are
     // human-approval-gated and long-lived — pauses > 5 min are the dominant
     // cost pattern, and the stable prefix and rolling anchors are read every
@@ -732,7 +752,7 @@ pub(crate) async fn build_acp() -> Result<
         stream_idle_secs: scaffold.stream_idle_secs,
         model: scaffold.model.clone(),
         model_resolver: Some(model_resolver()),
-        key_available: true,
+        key_available,
     };
     let factory: crate::acp::SessionFactory = Box::new(move |spec| {
         // §S3.2 (TUI/ACP handshake trigger): the provider is process-wide
@@ -4947,6 +4967,36 @@ fn key_source_for(
     }
 }
 
+pub(crate) enum SelectError {
+    MissingKey(String),
+    Other(String),
+}
+
+impl From<String> for SelectError {
+    fn from(msg: String) -> Self {
+        SelectError::Other(msg)
+    }
+}
+
+impl From<SelectError> for String {
+    fn from(e: SelectError) -> Self {
+        match e {
+            SelectError::MissingKey(m) | SelectError::Other(m) => m,
+        }
+    }
+}
+
+struct PlaceholderKeys<'a>(&'a dyn SecretStore);
+
+impl SecretStore for PlaceholderKeys<'_> {
+    fn get(&self, name: &str) -> Option<String> {
+        self.0.get(name).or_else(|| {
+            matches!(name, "ANTHROPIC_API_KEY" | "OPENAI_API_KEY")
+                .then(|| "hotl-no-key-placeholder".to_string())
+        })
+    }
+}
+
 type ProviderAndSource = (
     Arc<dyn hotl_provider::Provider>,
     Arc<dyn hotl_provider::key::KeySource>,
@@ -4968,10 +5018,10 @@ type SelectedProvider = (
 /// A bare model string means Anthropic; unset means the Anthropic default.
 /// Returns the provider, the selected model, and the key source that backs
 /// it (so a caller can validate/refresh it once at startup).
-pub(crate) fn select_provider(
+fn select_provider_typed(
     cfg: &crate::config::Config,
     secrets: &dyn SecretStore,
-) -> Result<SelectedProvider, String> {
+) -> Result<SelectedProvider, SelectError> {
     // Precedence: env HOTL_MODEL > config.toml [provider].model > default.
     let (provider_name, model) = selected_model(cfg, secrets);
     let auth = auth_mode(cfg, secrets)?;
@@ -4980,15 +5030,22 @@ pub(crate) fn select_provider(
         "openai" | "oai" => resolve_openai(cfg, secrets, auth)?,
         "openai-responses" => resolve_openai_responses(cfg, secrets, auth)?,
         other => {
-            return Err(format!(
+            return Err(SelectError::Other(format!(
                 "unknown provider `{other}` in HOTL_MODEL. Supported: anthropic/<model>, \
                  openai/<model> (openai covers any OpenAI-compatible endpoint via \
                  HOTL_OPENAI_BASE_URL), openai-responses/<model> (the OpenAI Responses \
                  API dialect, for reasoning models whose effort control needs it)."
-            ))
+            )));
         }
     };
     Ok((provider, model, source))
+}
+
+pub(crate) fn select_provider(
+    cfg: &crate::config::Config,
+    secrets: &dyn SecretStore,
+) -> Result<SelectedProvider, String> {
+    select_provider_typed(cfg, secrets).map_err(String::from)
 }
 
 /// How hotl authenticates to the selected provider. Orthogonal to *which*
@@ -5104,7 +5161,7 @@ fn resolve_anthropic(
     cfg: &crate::config::Config,
     secrets: &dyn SecretStore,
     auth: AuthMode,
-) -> Result<ProviderAndSource, String> {
+) -> Result<ProviderAndSource, SelectError> {
     let base = provider_base_url(cfg, secrets, "HOTL_ANTHROPIC_BASE_URL");
     if auth == AuthMode::Subscription {
         let base = base.ok_or_else(subscription_needs_base_url)?;
@@ -5128,7 +5185,7 @@ fn resolve_anthropic(
     let key = secrets.get("ANTHROPIC_API_KEY");
     let source = key_source_for(cfg, secrets, key.clone());
     if !source.refreshable() && key.is_none() {
-        return Err(
+        return Err(SelectError::MissingKey(
             "ANTHROPIC_API_KEY is not set and no api_key_helper is configured.\n\
              Export the key, set [provider] api_key_helper in config.toml, point [provider] \
              base_url at an endpoint that authenticates for you and set auth = \
@@ -5136,7 +5193,7 @@ fn resolve_anthropic(
              (with OPENAI_API_KEY, or HOTL_OPENAI_BASE_URL for a local endpoint). \
              `hotl watch` needs no key."
                 .to_string(),
-        );
+        ));
     }
     let mut provider = AnthropicProvider::new(source.clone()).with_timeouts(
         hotl_provider::timeouts::CONNECT,
@@ -5154,7 +5211,7 @@ fn resolve_openai(
     cfg: &crate::config::Config,
     secrets: &dyn SecretStore,
     auth: AuthMode,
-) -> Result<ProviderAndSource, String> {
+) -> Result<ProviderAndSource, SelectError> {
     let configured = provider_base_url(cfg, secrets, "HOTL_OPENAI_BASE_URL");
     if auth == AuthMode::Subscription {
         let base = configured.ok_or_else(subscription_needs_base_url)?;
@@ -5170,13 +5227,13 @@ fn resolve_openai(
     let key = secrets.get("OPENAI_API_KEY");
     let source = key_source_for(cfg, secrets, key.clone());
     if !source.refreshable() && key.is_none() && base == hotl_provider_openai::DEFAULT_BASE_URL {
-        return Err(
+        return Err(SelectError::MissingKey(
             "OPENAI_API_KEY is not set (required for api.openai.com; keyless works \
                      only with HOTL_OPENAI_BASE_URL pointing at a local/compatible endpoint, \
                      e.g. http://localhost:11434/v1 for Ollama), or configure [provider] \
                      api_key_helper."
                 .to_string(),
-        );
+        ));
     }
     // H-09: a bearer key over cleartext http:// to a non-loopback host
     // crosses the network unencrypted. Warn loudly (don't silently send
@@ -5246,7 +5303,7 @@ fn resolve_openai_responses(
     cfg: &crate::config::Config,
     secrets: &dyn SecretStore,
     auth: AuthMode,
-) -> Result<ProviderAndSource, String> {
+) -> Result<ProviderAndSource, SelectError> {
     let configured = provider_base_url(cfg, secrets, "HOTL_OPENAI_BASE_URL");
     if auth == AuthMode::Subscription {
         let base = configured.ok_or_else(subscription_needs_base_url)?;
@@ -5266,12 +5323,12 @@ fn resolve_openai_responses(
         && key.is_none()
         && base == hotl_provider_openai_responses::DEFAULT_BASE_URL
     {
-        return Err(
+        return Err(SelectError::MissingKey(
             "OPENAI_API_KEY is not set (required for api.openai.com; keyless works \
                      only with HOTL_OPENAI_BASE_URL pointing at a local/compatible endpoint \
                      that serves /v1/responses), or configure [provider] api_key_helper."
                 .to_string(),
-        );
+        ));
     }
     // H-09 twin: see resolve_openai for the cleartext-bearer rationale.
     warn_cleartext(&base, auth, key.is_some() || source.refreshable());
@@ -8352,6 +8409,68 @@ mod tests {
                 .as_deref(),
             Some("env-pick")
         );
+    }
+
+    async fn acp_replies(
+        secrets: &MapSecrets,
+        calls: &[serde_json::Value],
+    ) -> Vec<serde_json::Value> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (factory, info, _) = build_acp_with(config_from_toml(""), secrets)
+            .await
+            .expect("a missing key must not stop the ACP startup");
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (sread, swrite) = tokio::io::split(server);
+        tokio::spawn(crate::acp::serve(sread, swrite, factory, info, None));
+        let (cread, mut cwrite) = tokio::io::split(client);
+        let mut lines = tokio::io::BufReader::new(cread).lines();
+        let mut out = Vec::new();
+        for (i, call) in calls.iter().enumerate() {
+            let mut call = call.clone();
+            call["jsonrpc"] = serde_json::json!("2.0");
+            call["id"] = serde_json::json!(i + 1);
+            cwrite
+                .write_all(format!("{call}\n").as_bytes())
+                .await
+                .unwrap();
+            loop {
+                let line = lines.next_line().await.unwrap().expect("server closed");
+                let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if v["id"] == serde_json::json!(i + 1) {
+                    out.push(v);
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn acp_starts_without_a_key_and_asks_for_auth() {
+        let calls = [
+            serde_json::json!({"method":"initialize","params":{"protocolVersion":1}}),
+            serde_json::json!({"method":"authenticate","params":{"methodId":"hotl-key"}}),
+            serde_json::json!({"method":"session/new","params":{}}),
+        ];
+        let replies = acp_replies(&MapSecrets::default(), &calls).await;
+        assert_eq!(replies[0]["result"]["authMethods"][0]["id"], "hotl-key");
+        assert_eq!(replies[1]["error"]["code"], -32000, "{}", replies[1]);
+        assert_eq!(replies[2]["error"]["code"], -32000, "{}", replies[2]);
+    }
+
+    #[tokio::test]
+    async fn acp_with_a_key_authenticates() {
+        let secrets = MapSecrets::from([("ANTHROPIC_API_KEY", "sk-ant-x")]);
+        let calls = [serde_json::json!({"method":"authenticate","params":{"methodId":"hotl-key"}})];
+        let replies = acp_replies(&secrets, &calls).await;
+        assert_eq!(replies[0]["result"], serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn acp_still_fails_on_an_unknown_provider_without_a_key() {
+        let secrets = MapSecrets::from([("HOTL_MODEL", "nope/x")]);
+        let err = build_acp_with(config_from_toml(""), &secrets).await.err();
+        assert!(err.is_some_and(|e| e.contains("unknown provider")));
     }
 
     #[test]
