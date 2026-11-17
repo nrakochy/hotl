@@ -345,7 +345,7 @@ async fn start_with(factory: acp::SessionFactory) -> (Client, Reader) {
             "initialize",
             json!({
                 "protocolVersion": 1,
-                "clientCapabilities": {"_meta": {"hotl.dev/extensions": 1}}
+                "clientCapabilities": {"elicitation": {"form": {}}, "_meta": {"hotl.dev/extensions": 1}}
             }),
         )
         .await
@@ -627,7 +627,7 @@ async fn dropped_image_paste_compacts_and_echoes_golden() {
 /// numbered options, a digit picks one, and the model's next turn (fed the
 /// selected label as the tool result) completes normally. Also proves the
 /// SECURITY invariant at the TUI layer: a question never freezes into
-/// `session/request_permission` — only `session/request_question`.
+/// `session/request_permission` — only `elicitation/create`.
 #[tokio::test]
 async fn ask_user_option_pick_golden() {
     let (mut client, mut reader) = start_with(scripted_ask_user_factory()).await;

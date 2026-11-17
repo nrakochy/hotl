@@ -860,3 +860,110 @@ fn meta_or_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Meta>, 
         _ => None,
     })
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateElicitationRequest {
+    #[serde(flatten)]
+    pub mode: ElicitationMode,
+    pub message: String,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ElicitationMode {
+    Form(ElicitationFormMode),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitationFormMode {
+    pub session_id: String,
+    pub requested_schema: ElicitationSchema,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct ElicitationSchema {
+    #[serde(rename = "type")]
+    pub type_: ElicitationSchemaType,
+    pub properties: std::collections::BTreeMap<String, ElicitationPropertySchema>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ElicitationSchemaType {
+    Object,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ElicitationPropertySchema {
+    String(StringPropertySchema),
+    Array(MultiSelectPropertySchema),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct StringPropertySchema {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "enum", skip_serializing_if = "Option::is_none")]
+    pub enum_values: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct MultiSelectPropertySchema {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub items: MultiSelectItems,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MultiSelectItems {
+    String(StringMultiSelectItems),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct StringMultiSelectItems {
+    #[serde(rename = "enum")]
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct CreateElicitationResponse {
+    #[serde(flatten)]
+    pub action: ElicitationAction,
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "meta_or_none"
+    )]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ElicitationAction {
+    Accept(ElicitationAcceptAction),
+    Decline,
+    Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct ElicitationAcceptAction {
+    #[serde(default)]
+    pub content: Option<std::collections::BTreeMap<String, ElicitationContentValue>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ElicitationContentValue {
+    String(String),
+    Integer(i64),
+    Number(f64),
+    Boolean(bool),
+    StringArray(Vec<String>),
+}

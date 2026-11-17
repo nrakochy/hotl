@@ -1759,14 +1759,8 @@ async fn set_color_acks_a_known_name_or_null_and_refuses_the_rest() {
     }
 }
 
-/// `ask_user` round-trips through `session/request_question`: the client
-/// sees the header/prompt/options, answers with a selection, and the tool
-/// result (fed back to the scripted model) carries the selected label. Also
-/// covers the SECURITY invariant end to end: the question never touches
-/// `session/request_permission` — only a plain `session/prompt` result.
-#[tokio::test]
-async fn ask_user_round_trip_via_session_request_question() {
-    let factory: acp::SessionFactory = Box::new(|_spec| {
+fn ask_user_factory(multi: bool) -> acp::SessionFactory {
+    Box::new(move |_spec| {
         let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
@@ -1787,7 +1781,8 @@ async fn ask_user_round_trip_via_session_request_question() {
                 "ask_user",
                 json!({
                     "header": "Scope", "prompt": "How far?",
-                    "options": [{"label": "MVP"}, {"label": "Full"}]
+                    "options": [{"label": "MVP"}, {"label": "Full"}],
+                    "multi": multi
                 }),
             ),
             ScriptedProvider::text_reply("all done via acp"),
@@ -1841,58 +1836,186 @@ async fn ask_user_round_trip_via_session_request_question() {
             title: None,
             model: None,
         })
-    });
-    let (client, server) = tokio::io::duplex(64 * 1024);
-    let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, factory, server_info(), None));
+    })
+}
 
-    let (cread, mut cwrite) = tokio::io::split(client);
-    let mut lines = BufReader::new(cread).lines();
-
+async fn open_ask_user(
+    init: Value,
+    multi: bool,
+) -> (
+    String,
+    impl AsyncWriteExt + Unpin,
+    tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
+) {
+    let (mut w, mut lines) = connect_caps(ask_user_factory(multi), init).await;
     send(
-        &mut cwrite,
-        json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":new_params()}),
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
     )
     .await;
-    let session_id = read_until_id(&mut lines, 1)
-        .await
-        .pointer("/result/sessionId")
-        .and_then(Value::as_str)
+    let sid = read_until_id(&mut lines, 2).await["result"]["sessionId"]
+        .as_str()
         .expect("session id")
         .to_string();
+    (sid, w, lines)
+}
 
+const FORM_CLIENT: fn() -> Value =
+    || json!({"protocolVersion": 1, "clientCapabilities": {"elicitation": {"form": {}}}});
+
+#[tokio::test]
+async fn question_is_a_form_elicitation() {
+    let (sid, mut w, mut lines) = open_ask_user(FORM_CLIENT(), false).await;
     send(
-        &mut cwrite,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"prompt":[{"type":"text","text":"go"}]}}),
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "go"}])),
     )
     .await;
+    let ask = next_matching_raw(&mut lines, |m| m["method"] == "elicitation/create").await;
+    assert_eq!(
+        ask["params"],
+        json!({
+            "sessionId": sid,
+            "mode": "form",
+            "message": "Scope: How far?",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "answer": {"type": "string", "enum": ["MVP", "Full"]},
+                    "other": {"type": "string", "description": "Your own answer, if none of the options fit"}
+                }
+            }
+        })
+    );
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"action":"accept","content":{"answer":"MVP"}}}),
+    )
+    .await;
+    let (_, reply) = frames_through_reply(&mut lines, 3).await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+}
 
-    let result = loop {
-        let msg = next(&mut lines).await;
-        assert_ne!(
-            msg.get("method").and_then(Value::as_str),
-            Some("session/request_permission"),
-            "ask_user must never route through the permission gate: {msg}"
-        );
-        if msg.get("method").and_then(Value::as_str) == Some("session/request_question") {
-            assert_eq!(msg["params"]["sessionId"], session_id);
-            assert_eq!(msg["params"]["header"], "Scope");
-            assert_eq!(msg["params"]["prompt"], "How far?");
-            assert_eq!(
-                msg["params"]["options"],
-                json!([{"label": "MVP"}, {"label": "Full"}])
-            );
-            let rid = msg["id"].clone();
-            send(
-                &mut cwrite,
-                json!({"jsonrpc":"2.0","id":rid,"result":{"selected":["MVP"]}}),
-            )
-            .await;
-        } else if msg.get("id") == Some(&json!(2)) {
-            break msg;
-        }
-    };
-    assert_eq!(result["result"]["stopReason"], "end_turn");
+#[tokio::test]
+async fn a_multi_question_offers_an_array_of_labels() {
+    let (sid, mut w, mut lines) = open_ask_user(
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {"elicitation": {"form": {}}, "_meta": {"hotl.dev/extensions": 1}}
+        }),
+        true,
+    )
+    .await;
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "go"}])),
+    )
+    .await;
+    let ask = next_matching_raw(&mut lines, |m| m["method"] == "elicitation/create").await;
+    assert_eq!(
+        ask["params"]["requestedSchema"]["properties"]["answer"],
+        json!({"type": "array", "items": {"type": "string", "enum": ["MVP", "Full"]}})
+    );
+    assert_eq!(
+        ask["params"]["_meta"]["hotl.dev/question"],
+        json!({
+            "header": "Scope", "prompt": "How far?",
+            "options": [{"label": "MVP"}, {"label": "Full"}],
+            "multi": true
+        })
+    );
+}
+
+#[tokio::test]
+async fn declined_elicitation_is_no_human() {
+    let (sid, mut w, mut lines) = open_ask_user(FORM_CLIENT(), false).await;
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "go"}])),
+    )
+    .await;
+    let ask = next_matching_raw(&mut lines, |m| m["method"] == "elicitation/create").await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"action":"decline"}}),
+    )
+    .await;
+    let (_, reply) = frames_through_reply(&mut lines, 3).await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+}
+
+#[tokio::test]
+async fn plain_client_without_elicitation_gets_no_request_and_no_human() {
+    let (sid, mut w, mut lines) = open_ask_user(json!({"protocolVersion": 1}), false).await;
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "go"}])),
+    )
+    .await;
+    let (before, reply) = frames_through_reply(&mut lines, 3).await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+    assert!(
+        before.iter().all(|m| m.get("id").is_none()),
+        "no request reached a client that cannot answer: {before:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_opted_in_client_without_elicitation_gets_the_extension_question() {
+    let (sid, mut w, mut lines) = open_ask_user(init_params(), false).await;
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "go"}])),
+    )
+    .await;
+    let ask = next_matching_raw(&mut lines, |m| {
+        m["method"] == "_hotl/session/request_question"
+    })
+    .await;
+    assert_eq!(ask["params"]["header"], "Scope");
+    assert_eq!(ask["params"]["prompt"], "How far?");
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"selected":["MVP"]}}),
+    )
+    .await;
+    let (_, reply) = frames_through_reply(&mut lines, 3).await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+}
+
+#[tokio::test]
+async fn unanswered_elicitation_resolves_on_cancel() {
+    let (sid, mut w, mut lines) = open_ask_user(FORM_CLIENT(), false).await;
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "go"}])),
+    )
+    .await;
+    let ask = next_matching_raw(&mut lines, |m| m["method"] == "elicitation/create").await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId": sid}}),
+    )
+    .await;
+    let (_, reply) = frames_through_reply(&mut lines, 3).await;
+    assert_eq!(reply["result"]["stopReason"], "cancelled", "{reply}");
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"action":"accept","content":{"answer":"MVP"}}}),
+    )
+    .await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":9,"method":"session/rename","params":{"name":"x"}}),
+    )
+    .await;
+    let (after, _) = frames_through_reply(&mut lines, 9).await;
+    assert!(
+        after
+            .iter()
+            .all(|m| m["params"]["update"]["type"] != "tool_start"),
+        "a late answer after cancel did something: {after:?}"
+    );
 }
 
 #[tokio::test]
@@ -3962,7 +4085,10 @@ async fn every_handled_method_is_advertised_as_an_extension() {
             rest = &tail[end..];
         }
     }
-    for m in ["session/request_permission", "session/request_question"] {
+    for m in [
+        "session/request_permission",
+        "_hotl/session/request_question",
+    ] {
         assert!(src.contains(&format!("\"method\": \"{m}\"")), "{m} is sent");
         handled.push(m.to_string());
     }
@@ -3988,7 +4114,7 @@ async fn every_handled_method_is_advertised_as_an_extension() {
     let mut id = 100;
     for m in acp::EXTENSION_METHODS
         .iter()
-        .filter(|m| !m.starts_with("session/request_"))
+        .filter(|m| !m.contains("session/request_"))
     {
         // No session yet: most answer "requires an open session" — anything
         // but "unknown method". `new`/`load` would open one; skip them here.

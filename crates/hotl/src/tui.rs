@@ -449,7 +449,7 @@ async fn handshake(
             json!({
                 "protocolVersion": 1,
                 "clientInfo": {"name": "hotl-tui", "version": env!("CARGO_PKG_VERSION")},
-                "clientCapabilities": {"_meta": {"hotl.dev/extensions": 1}}
+                "clientCapabilities": {"elicitation": {"form": {}}, "_meta": {"hotl.dev/extensions": 1}}
             }),
         )
         .await

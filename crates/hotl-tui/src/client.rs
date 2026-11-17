@@ -65,7 +65,7 @@ pub enum ServerMsg {
         protected_why: Option<String>,
         diff: Vec<DiffLine>,
     },
-    /// A `session/request_question` reverse-request (`ask_user`, tier-1
+    /// An `elicitation/create` reverse-request (`ask_user`, tier-1
     /// gap #4) — NOT a permission gate; answering it never authorizes a tool.
     QuestionRequest { req_id: u64, question: Question },
     /// A network `session/request_permission` reverse-request (plan 0026): a subprocess
@@ -155,7 +155,7 @@ impl<W: AsyncWrite + Unpin> AcpClient<W> {
             .await
     }
 
-    /// Answer a `session/request_question`: exactly one of `selected`
+    /// Answer an `elicitation/create` question: exactly one of `selected`
     /// (labels) or `free_text` is set by the caller (`app::Cmd::ReplyQuestion`
     /// only ever produces one or the other).
     pub async fn reply_question(
@@ -164,9 +164,11 @@ impl<W: AsyncWrite + Unpin> AcpClient<W> {
         selected: Vec<String>,
         free_text: Option<String>,
     ) -> io::Result<()> {
-        let result = match free_text {
-            Some(text) => json!({"freeText": text}),
-            None => json!({"selected": selected}),
+        let result = match (free_text, selected.len()) {
+            (Some(text), _) => json!({"action": "accept", "content": {"other": text}}),
+            (None, 0) => json!({"action": "decline"}),
+            (None, 1) => json!({"action": "accept", "content": {"answer": selected[0]}}),
+            (None, _) => json!({"action": "accept", "content": {"answer": selected}}),
         };
         self.send(&json!({"jsonrpc": "2.0", "id": req_id, "result": result}))
             .await
@@ -302,6 +304,57 @@ fn standard_update(kind: &str, update: &Value) -> Option<Value> {
     }
 }
 
+fn decode_question(params: &Value) -> Option<Question> {
+    if let Some(q) = params.pointer("/_meta/hotl.dev~1question") {
+        let text = |key: &str| q.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+        let options = q
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|o| QuestionOption {
+                        label: o
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        description: o
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        return Some(Question {
+            header: text("header"),
+            prompt: text("prompt"),
+            options,
+            multi: q.get("multi").and_then(Value::as_bool).unwrap_or(false),
+        });
+    }
+    let answer = params.pointer("/requestedSchema/properties/answer");
+    let labels = answer
+        .and_then(|a| a.get("enum").or_else(|| a.pointer("/items/enum")))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(|label| QuestionOption {
+                    label: label.to_string(),
+                    description: None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(Question {
+        header: String::new(),
+        prompt: params.get("message").and_then(Value::as_str)?.to_string(),
+        options: labels,
+        multi: answer.is_some_and(|a| a.get("type").and_then(Value::as_str) == Some("array")),
+    })
+}
+
 fn decode(msg: &Value) -> Option<ServerMsg> {
     match msg.get("method").and_then(Value::as_str) {
         Some("session/update") => {
@@ -340,46 +393,10 @@ fn decode(msg: &Value) -> Option<ServerMsg> {
                 diff: decode_diff(ask.and_then(|a| a.get("diff"))),
             })
         }
-        Some("session/request_question") => {
-            let options = msg
-                .pointer("/params/options")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .map(|o| QuestionOption {
-                            label: o
-                                .get("label")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string(),
-                            description: o
-                                .get("description")
-                                .and_then(Value::as_str)
-                                .map(String::from),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            Some(ServerMsg::QuestionRequest {
-                req_id: msg.get("id").and_then(Value::as_u64)?,
-                question: Question {
-                    header: msg
-                        .pointer("/params/header")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    prompt: msg
-                        .pointer("/params/prompt")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    options,
-                    multi: msg
-                        .pointer("/params/multi")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                },
-            })
+        Some("elicitation/create") => {
+            let req_id = msg.get("id").and_then(Value::as_u64)?;
+            let question = decode_question(msg.get("params")?)?;
+            Some(ServerMsg::QuestionRequest { req_id, question })
         }
         Some(_) => None,
         None => {
@@ -1133,7 +1150,7 @@ mod tests {
     async fn read_decodes_a_question_request() {
         let (client, mut server) = tokio::io::duplex(4096);
         let feed = concat!(
-            r#"{"jsonrpc":"2.0","id":9,"method":"session/request_question","params":{"sessionId":"s","header":"Scope","prompt":"How far?","options":[{"label":"MVP"},{"label":"Full","description":"everything"}],"multi":false}}"#,
+            r#"{"jsonrpc":"2.0","id":9,"method":"elicitation/create","params":{"sessionId":"s","mode":"form","message":"Scope: How far?","requestedSchema":{"type":"object","properties":{}},"_meta":{"hotl.dev/question":{"header":"Scope","prompt":"How far?","options":[{"label":"MVP"},{"label":"Full","description":"everything"}],"multi":false}}}}"#,
             "\n",
         );
         tokio::io::AsyncWriteExt::write_all(&mut server, feed.as_bytes())
@@ -1165,6 +1182,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_decodes_a_plain_elicitation_from_its_schema() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let feed = concat!(
+            r#"{"jsonrpc":"2.0","id":9,"method":"elicitation/create","params":{"sessionId":"s","mode":"form","message":"Scope: How far?","requestedSchema":{"type":"object","properties":{"answer":{"type":"array","items":{"type":"string","enum":["MVP","Full"]}}}}}}"#,
+            "\n",
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut server, feed.as_bytes())
+            .await
+            .unwrap();
+        drop(server);
+        let mut r = FrameReader::new(client);
+        let Some(ServerMsg::QuestionRequest { question, .. }) = read_server_msg(&mut r).await
+        else {
+            panic!("a question request");
+        };
+        assert_eq!(question.prompt, "Scope: How far?");
+        assert_eq!(question.options.len(), 2);
+        assert!(question.multi);
+    }
+
+    #[tokio::test]
     async fn reply_question_shape_matches_server_contract() {
         let (mut read, write) = tokio::io::duplex(4096);
         let mut client = AcpClient::new(write);
@@ -1176,6 +1214,11 @@ mod tests {
             .reply_question(10, Vec::new(), Some("other".into()))
             .await
             .unwrap();
+        client
+            .reply_question(11, vec!["MVP".into(), "Full".into()], None)
+            .await
+            .unwrap();
+        client.reply_question(12, Vec::new(), None).await.unwrap();
         drop(client);
         let mut out = String::new();
         read.read_to_string(&mut out).await.unwrap();
@@ -1185,12 +1228,17 @@ mod tests {
             .collect();
         assert_eq!(
             lines[0],
-            json!({"jsonrpc": "2.0", "id": 9, "result": {"selected": ["MVP"]}})
+            json!({"jsonrpc": "2.0", "id": 9, "result": {"action": "accept", "content": {"answer": "MVP"}}})
         );
         assert_eq!(
             lines[1],
-            json!({"jsonrpc": "2.0", "id": 10, "result": {"freeText": "other"}})
+            json!({"jsonrpc": "2.0", "id": 10, "result": {"action": "accept", "content": {"other": "other"}}})
         );
+        assert_eq!(
+            lines[2]["result"],
+            json!({"action": "accept", "content": {"answer": ["MVP", "Full"]}})
+        );
+        assert_eq!(lines[3]["result"], json!({"action": "decline"}));
     }
 
     #[tokio::test]

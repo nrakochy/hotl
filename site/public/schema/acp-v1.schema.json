@@ -677,6 +677,90 @@
       ],
       "type": "object"
     },
+    "CreateElicitationRequest": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ElicitationFormMode",
+          "properties": {
+            "mode": {
+              "const": "form",
+              "type": "string"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "message"
+      ],
+      "type": "object"
+    },
+    "CreateElicitationResponse": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ElicitationAcceptAction",
+          "properties": {
+            "action": {
+              "const": "accept",
+              "type": "string"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "decline",
+              "type": "string"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "cancel",
+              "type": "string"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "CurrentModeUpdate": {
       "properties": {
         "currentModeId": {
@@ -708,6 +792,113 @@
         "newText"
       ],
       "type": "object"
+    },
+    "ElicitationAcceptAction": {
+      "properties": {
+        "content": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ElicitationContentValue"
+          },
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ElicitationContentValue": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "format": "int64",
+          "type": "integer"
+        },
+        {
+          "format": "double",
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ]
+    },
+    "ElicitationFormMode": {
+      "properties": {
+        "requestedSchema": {
+          "$ref": "#/$defs/ElicitationSchema"
+        },
+        "sessionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId",
+        "requestedSchema"
+      ],
+      "type": "object"
+    },
+    "ElicitationPropertySchema": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/StringPropertySchema",
+          "properties": {
+            "type": {
+              "const": "string",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/MultiSelectPropertySchema",
+          "properties": {
+            "type": {
+              "const": "array",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ElicitationSchema": {
+      "properties": {
+        "properties": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ElicitationPropertySchema"
+          },
+          "type": "object"
+        },
+        "type": {
+          "$ref": "#/$defs/ElicitationSchemaType"
+        }
+      },
+      "required": [
+        "type",
+        "properties"
+      ],
+      "type": "object"
+    },
+    "ElicitationSchemaType": {
+      "enum": [
+        "object"
+      ],
+      "type": "string"
     },
     "EmbeddedResource": {
       "properties": {
@@ -2085,6 +2276,40 @@
       ],
       "type": "object"
     },
+    "MultiSelectItems": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/StringMultiSelectItems",
+          "properties": {
+            "type": {
+              "const": "string",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "MultiSelectPropertySchema": {
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "items": {
+          "$ref": "#/$defs/MultiSelectItems"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "type": "object"
+    },
     "NewSessionResponse": {
       "properties": {
         "_meta": {
@@ -2541,7 +2766,7 @@
           "type": "object"
         }
       ],
-      "description": "What a client answers `session/request_question` with. Schema only."
+      "description": "What a client answers `_hotl/session/request_question` with. Schema only."
     },
     "Queued": {
       "description": "`session/steer` and `session/aside`: `false` = there was no turn to queue on.",
@@ -2696,7 +2921,7 @@
       "type": "object"
     },
     "RequestQuestionParams": {
-      "description": "Server → client `session/request_question` params.",
+      "description": "Server → client `_hotl/session/request_question` params.",
       "properties": {
         "header": {
           "type": "string"
@@ -3405,6 +3630,40 @@
       ],
       "type": "object"
     },
+    "StringMultiSelectItems": {
+      "properties": {
+        "enum": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "enum"
+      ],
+      "type": "object"
+    },
+    "StringPropertySchema": {
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enum": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "TextContent": {
       "properties": {
         "text": {
@@ -3884,6 +4143,12 @@
     "ack": {
       "$ref": "#/$defs/Ack"
     },
+    "elicitationRequest": {
+      "$ref": "#/$defs/CreateElicitationRequest"
+    },
+    "elicitationResponse": {
+      "$ref": "#/$defs/CreateElicitationResponse"
+    },
     "extSessionUpdate": {
       "$ref": "#/$defs/ExtSessionUpdateParams"
     },
@@ -3965,6 +4230,8 @@
     "queued",
     "requestPermission",
     "requestQuestion",
+    "elicitationRequest",
+    "elicitationResponse",
     "permissionReply",
     "questionReply"
   ],

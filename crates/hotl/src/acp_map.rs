@@ -8,14 +8,17 @@ use serde_json::Value;
 use crate::acp::{ClientCaps, SessionOpen, SessionOpenExtras, WorktreeInfo};
 use crate::acp_types::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, CompactionStatus,
-    CompactionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
-    EmbeddedResourceResource, McpServer, Meta, Notice, NoticeSeverity, PermissionOption,
+    CompactionUpdate, Content, ContentBlock, ContentChunk, CreateElicitationRequest,
+    CreateElicitationResponse, Diff, ElicitationAction, ElicitationContentValue,
+    ElicitationFormMode, ElicitationMode, ElicitationPropertySchema, ElicitationSchema,
+    ElicitationSchemaType, EmbeddedResource, EmbeddedResourceResource, McpServer, Meta,
+    MultiSelectItems, MultiSelectPropertySchema, Notice, NoticeSeverity, PermissionOption,
     PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
     RequestPermissionOutcome, SessionConfigBoolean, SessionConfigKind, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelect, SessionConfigSelectOption, SessionInfoUpdate,
-    SessionMode, SessionModeState, SessionUpdate, StopReason, ToolCall, ToolCallContent,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-    UnstructuredCommandInput,
+    SessionMode, SessionModeState, SessionUpdate, StopReason, StringMultiSelectItems,
+    StringPropertySchema, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 
 pub const META_FRAME: &str = "hotl.dev/frame";
@@ -27,6 +30,9 @@ pub const META_PROTECTED_WHY: &str = "hotl.dev/protectedWhy";
 pub const META_ASK: &str = "hotl.dev/ask";
 pub const META_EGRESS: &str = "hotl.dev/egress";
 pub const META_REPLY: &str = "hotl.dev/reply";
+pub const META_QUESTION: &str = "hotl.dev/question";
+pub const ELICITATION_ANSWER: &str = "answer";
+pub const ELICITATION_OTHER: &str = "other";
 pub const OPTION_ALLOW: &str = "allow";
 pub const OPTION_DENY: &str = "deny";
 pub const OPTION_SECRET_READS: &str = "allow-secret-reads";
@@ -331,6 +337,84 @@ pub fn egress_tool_call(req_id: u64, host: &str, caps: &ClientCaps) -> ToolCallU
         meta: caps
             .ext
             .then(|| meta_of(META_EGRESS, serde_json::json!({"host": host}))),
+    }
+}
+
+pub fn question_form(
+    session_id: &str,
+    question: &hotl_types::Question,
+    ext: bool,
+) -> CreateElicitationRequest {
+    let labels: Vec<String> = question.options.iter().map(|o| o.label.clone()).collect();
+    let described: Vec<String> = question
+        .options
+        .iter()
+        .filter_map(|o| o.description.as_ref().map(|d| format!("{}: {d}", o.label)))
+        .collect();
+    let description = (!described.is_empty()).then(|| described.join("\n"));
+    let answer = if question.multi {
+        ElicitationPropertySchema::Array(MultiSelectPropertySchema {
+            description,
+            items: MultiSelectItems::String(StringMultiSelectItems { values: labels }),
+        })
+    } else {
+        ElicitationPropertySchema::String(StringPropertySchema {
+            description,
+            enum_values: Some(labels),
+        })
+    };
+    let other = ElicitationPropertySchema::String(StringPropertySchema {
+        description: Some("Your own answer, if none of the options fit".into()),
+        enum_values: None,
+    });
+    let mut properties = std::collections::BTreeMap::new();
+    properties.insert(ELICITATION_ANSWER.to_string(), answer);
+    properties.insert(ELICITATION_OTHER.to_string(), other);
+    CreateElicitationRequest {
+        mode: ElicitationMode::Form(ElicitationFormMode {
+            session_id: session_id.to_string(),
+            requested_schema: ElicitationSchema {
+                type_: ElicitationSchemaType::Object,
+                properties,
+            },
+        }),
+        message: format!("{}: {}", question.header, question.prompt),
+        meta: ext.then(|| meta_of(META_QUESTION, serde_json::json!(question))),
+    }
+}
+
+pub fn question_answer(
+    response: &CreateElicitationResponse,
+    offered: &[String],
+    multi: bool,
+) -> hotl_types::QuestionAnswer {
+    use hotl_types::QuestionAnswer;
+    let ElicitationAction::Accept(accepted) = &response.action else {
+        return QuestionAnswer::NoHuman;
+    };
+    let Some(content) = &accepted.content else {
+        return QuestionAnswer::NoHuman;
+    };
+    let chosen: Vec<String> = match content.get(ELICITATION_ANSWER) {
+        Some(ElicitationContentValue::String(label)) => vec![label.clone()],
+        Some(ElicitationContentValue::StringArray(labels)) => labels.clone(),
+        _ => Vec::new(),
+    };
+    let mut chosen: Vec<String> = chosen
+        .into_iter()
+        .filter(|label| offered.contains(label))
+        .collect();
+    if !multi {
+        chosen.truncate(1);
+    }
+    if !chosen.is_empty() {
+        return QuestionAnswer::Selected(chosen);
+    }
+    match content.get(ELICITATION_OTHER) {
+        Some(ElicitationContentValue::String(text)) if !text.trim().is_empty() => {
+            QuestionAnswer::FreeText(text.clone())
+        }
+        _ => QuestionAnswer::NoHuman,
     }
 }
 
@@ -2467,5 +2551,50 @@ mod tests {
             egress_decision(&RequestPermissionOutcome::Cancelled),
             EgressDecision::Deny
         );
+    }
+
+    fn answered(value: Value, multi: bool) -> hotl_types::QuestionAnswer {
+        let response: CreateElicitationResponse = serde_json::from_value(value).unwrap();
+        question_answer(&response, &["MVP".to_string(), "Full".to_string()], multi)
+    }
+
+    #[test]
+    fn an_accepted_form_maps_to_selected_or_free_text() {
+        use hotl_types::QuestionAnswer::{FreeText, NoHuman, Selected};
+        let accept = |content: Value| json!({"action": "accept", "content": content});
+        assert_eq!(
+            answered(accept(json!({"answer": "MVP"})), false),
+            Selected(vec!["MVP".into()])
+        );
+        assert_eq!(
+            answered(accept(json!({"answer": ["MVP", "Full", "Nope"]})), true),
+            Selected(vec!["MVP".into(), "Full".into()])
+        );
+        assert_eq!(
+            answered(accept(json!({"answer": ["MVP", "Full"]})), false),
+            Selected(vec!["MVP".into()])
+        );
+        assert_eq!(
+            answered(accept(json!({"other": "later"})), false),
+            FreeText("later".into())
+        );
+        assert_eq!(
+            answered(accept(json!({"answer": "Nope", "other": "later"})), false),
+            FreeText("later".into())
+        );
+        assert_eq!(answered(accept(json!({"answer": "Nope"})), false), NoHuman);
+        assert_eq!(answered(accept(json!({"other": "  "})), false), NoHuman);
+        assert_eq!(answered(json!({"action": "accept"}), false), NoHuman);
+        assert_eq!(answered(json!({"action": "decline"}), false), NoHuman);
+        assert_eq!(answered(json!({"action": "cancel"}), false), NoHuman);
+    }
+
+    #[test]
+    fn a_malformed_elicitation_reply_does_not_parse() {
+        assert!(
+            serde_json::from_value::<CreateElicitationResponse>(json!({"action": "maybe"}))
+                .is_err()
+        );
+        assert!(serde_json::from_value::<CreateElicitationResponse>(json!({})).is_err());
     }
 }

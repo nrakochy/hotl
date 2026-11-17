@@ -1038,7 +1038,7 @@ pub enum Cmd {
         secret_reads: bool,
         message: Option<String>,
     },
-    /// Answer a `session/request_question`. Exactly one of `selected`
+    /// Answer an `elicitation/create` question. Exactly one of `selected`
     /// (a single label — v1 is single-select even when `multi` was set) or
     /// `free_text` is populated.
     /// Answer a network `session/request_permission`. Two answers only, both scoped to

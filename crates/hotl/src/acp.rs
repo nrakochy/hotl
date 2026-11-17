@@ -66,7 +66,7 @@ pub const EXTENSION_METHODS: &[&str] = &[
     "session/children/stop",
     "session/jobs/stop",
     "session/request_permission",
-    "session/request_question",
+    "_hotl/session/request_question",
 ];
 
 type Writer = Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
@@ -80,8 +80,32 @@ type Pending = Arc<std::sync::Mutex<HashMap<u64, AskSlot>>>;
 /// In-flight `session/request_question` round-trips, parallel to `Pending`.
 /// Disjoint ids from `Pending`: both draw from the same per-session `req_id`
 /// counter in `drain_events`, so an id never means two different things.
-type PendingQuestions =
-    Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<hotl_types::QuestionAnswer>>>>;
+type PendingQuestions = Arc<std::sync::Mutex<HashMap<u64, QuestionSlot>>>;
+
+struct QuestionSlot {
+    reply: oneshot::Sender<hotl_types::QuestionAnswer>,
+    form: Option<FormAsk>,
+}
+
+struct FormAsk {
+    offered: Vec<String>,
+    multi: bool,
+}
+
+fn question_reply_of(msg: &Value, slot: &QuestionSlot) -> hotl_types::QuestionAnswer {
+    match &slot.form {
+        None => question_answer_from_result(msg.get("result")),
+        Some(form) => msg
+            .get("result")
+            .and_then(|r| {
+                serde_json::from_value::<crate::acp_types::CreateElicitationResponse>(r.clone())
+                    .ok()
+            })
+            .map_or(hotl_types::QuestionAnswer::NoHuman, |r| {
+                crate::acp_map::question_answer(&r, &form.offered, form.multi)
+            }),
+    }
+}
 /// In-flight network `session/request_permission` round-trips (plan 0026), parallel to
 /// `Pending` and disjoint from it for the same reason: one `req_id` counter,
 /// one meaning per id, but different reply types, so answering an egress
@@ -459,12 +483,13 @@ pub async fn serve(
         // the other, so trying both is safe and order-independent)?
         if msg.get("method").is_none() {
             if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                if let Some(reply) = pending_questions
+                if let Some(slot) = pending_questions
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&id)
                 {
-                    let _ = reply.send(question_answer_from_result(msg.get("result")));
+                    let answer = question_reply_of(&msg, &slot);
+                    let _ = slot.reply.send(answer);
                 } else if let Some(reply) = pending_egress
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1414,12 +1439,12 @@ async fn handle_request(
             {
                 let _ = slot.reply.send(AskReply::Deny { message: None });
             }
-            for (_, reply) in pending_questions
+            for (_, slot) in pending_questions
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .drain()
             {
-                let _ = reply.send(hotl_types::QuestionAnswer::NoHuman);
+                let _ = slot.reply.send(hotl_types::QuestionAnswer::NoHuman);
             }
             for (_, reply) in pending_egress
                 .lock()
@@ -2474,27 +2499,57 @@ async fn drain_events(
             EngineEvent::Question {
                 question, reply, ..
             } => {
-                // NOT a permission gate: the reply is plain text the model
-                // reads, never an authorization (SECURITY invariant).
-                req_id += 1;
-                pending_questions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(req_id, reply);
-                send(
-                    &writer,
-                    &json!({
-                        "jsonrpc": "2.0", "id": req_id, "method": "session/request_question",
-                        "params": to_json(&RequestQuestionParams {
-                            session_id: session_id.clone(),
-                            header: question.header,
-                            prompt: question.prompt,
-                            options: question.options,
-                            multi: question.multi,
+                if caps.elicitation_form {
+                    req_id += 1;
+                    let request = crate::acp_map::question_form(&session_id, &question, caps.ext);
+                    pending_questions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(
+                            req_id,
+                            QuestionSlot {
+                                reply,
+                                form: Some(FormAsk {
+                                    offered: question
+                                        .options
+                                        .iter()
+                                        .map(|o| o.label.clone())
+                                        .collect(),
+                                    multi: question.multi,
+                                }),
+                            },
+                        );
+                    send(
+                        &writer,
+                        &json!({
+                            "jsonrpc": "2.0", "id": req_id, "method": "elicitation/create",
+                            "params": to_json(&request),
                         }),
-                    }),
-                )
-                .await;
+                    )
+                    .await;
+                } else if caps.ext {
+                    req_id += 1;
+                    pending_questions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(req_id, QuestionSlot { reply, form: None });
+                    send(
+                        &writer,
+                        &json!({
+                            "jsonrpc": "2.0", "id": req_id, "method": "_hotl/session/request_question",
+                            "params": to_json(&RequestQuestionParams {
+                                session_id: session_id.clone(),
+                                header: question.header,
+                                prompt: question.prompt,
+                                options: question.options,
+                                multi: question.multi,
+                            }),
+                        }),
+                    )
+                    .await;
+                } else {
+                    let _ = reply.send(hotl_types::QuestionAnswer::NoHuman);
+                }
             }
             // Plan 0026. Both surfaces already carried a two-way allow/deny
             // reply and already defaulted to deny, so excluding ACP would only
@@ -2535,7 +2590,7 @@ async fn drain_events(
                 pending_questions
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .retain(|_, tx| !tx.is_closed());
+                    .retain(|_, slot| !slot.reply.is_closed());
                 pending_egress
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3401,7 +3456,7 @@ pub struct ExtSessionUpdateParams {
     pub update: AcpUpdate,
 }
 
-/// Server → client `session/request_question` params.
+/// Server → client `_hotl/session/request_question` params.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestQuestionParams {
@@ -3412,7 +3467,7 @@ pub struct RequestQuestionParams {
     pub multi: bool,
 }
 
-/// What a client answers `session/request_question` with. Schema only.
+/// What a client answers `_hotl/session/request_question` with. Schema only.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(untagged)]
 #[allow(dead_code)] // schema-only
@@ -3449,6 +3504,8 @@ pub struct AcpPayloads {
     queued: Queued,
     request_permission: RequestPermissionRequest,
     request_question: RequestQuestionParams,
+    elicitation_request: crate::acp_types::CreateElicitationRequest,
+    elicitation_response: crate::acp_types::CreateElicitationResponse,
     permission_reply: crate::acp_types::RequestPermissionResponse,
     question_reply: QuestionReply,
 }
