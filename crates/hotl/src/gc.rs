@@ -209,14 +209,16 @@ mod tests {
     #[test]
     fn the_dead_socket_sweep_takes_the_status_and_token_files_too() {
         use hotl_platform::PrivateFs as _;
-        let data = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_DATA_HOME", data.path());
+        if !crate::agent::runs_in_its_own_process(
+            module_path!(),
+            "the_dead_socket_sweep_takes_the_status_and_token_files_too",
+        ) {
+            return;
+        }
+        let data = std::path::PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap());
         let id = format!("gc-dead-{}", std::process::id());
         let run = crate::session_server::run_dir();
-        assert!(
-            run.starts_with(data.path()),
-            "{run:?} is not the temp folder"
-        );
+        assert!(run.starts_with(&data), "{run:?} is not the temp folder");
         hotl_platform::PRIVATE_FS.create_dir_all(&run).unwrap();
         let sock = run.join(format!("{id}.sock"));
         let _ = std::fs::remove_file(&sock);

@@ -10479,38 +10479,44 @@ mod worktree_session_tests {
 }
 
 #[cfg(test)]
+pub(crate) fn runs_in_its_own_process(module: &str, test: &str) -> bool {
+    const OWN_PROCESS: &str = "HOTL_TEST_OWN_PROCESS";
+    if std::env::var_os(OWN_PROCESS).is_some() {
+        return true;
+    }
+    let data = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+    let name = format!("{module}::{test}");
+    let run = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &name, "--test-threads=1", "--nocapture"])
+        .env(OWN_PROCESS, "1")
+        .env("XDG_DATA_HOME", data.path())
+        .env("XDG_CONFIG_HOME", config.path())
+        .env("HOTL_MODEL", DEFAULT_MODEL)
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("HOTL_PROVIDER_BASE_URL", "http://127.0.0.1:9")
+        .env("HOTL_SANDBOX", "off")
+        .env_remove("HOTL_ANTHROPIC_BASE_URL")
+        .env_remove("HOTL_PROVIDER_AUTH")
+        .env_remove("HOTL_PERMISSIONS")
+        .env_remove("HOTL_PLAN")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "{name} failed in its own process:\n{stdout}\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    false
+}
+
+#[cfg(test)]
 mod serve_open_tests {
     use super::*;
     use crate::run_status::{RunState, RunStatus};
     use hotl_types::{EntryPayload, Item};
-
-    pub(super) struct Isolated {
-        _data: tempfile::TempDir,
-        _config: tempfile::TempDir,
-    }
-
-    pub(super) fn isolated() -> Isolated {
-        let data = tempfile::tempdir().unwrap();
-        let config = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_DATA_HOME", data.path());
-        std::env::set_var("XDG_CONFIG_HOME", config.path());
-        std::env::set_var("HOTL_MODEL", DEFAULT_MODEL);
-        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-        std::env::set_var("HOTL_PROVIDER_BASE_URL", "http://127.0.0.1:9");
-        std::env::set_var("HOTL_SANDBOX", "off");
-        for key in [
-            "HOTL_ANTHROPIC_BASE_URL",
-            "HOTL_PROVIDER_AUTH",
-            "HOTL_PERMISSIONS",
-            "HOTL_PLAN",
-        ] {
-            std::env::remove_var(key);
-        }
-        Isolated {
-            _data: data,
-            _config: config,
-        }
-    }
 
     fn stored_with_one_turn(extra: &[EntryPayload]) -> String {
         let dir = sessions_dir();
@@ -10586,7 +10592,12 @@ mod serve_open_tests {
 
     #[tokio::test]
     async fn a_resumed_serve_continues_the_stored_session() {
-        let _home = isolated();
+        if !runs_in_its_own_process(
+            module_path!(),
+            "a_resumed_serve_continues_the_stored_session",
+        ) {
+            return;
+        }
         let old = stored_with_one_turn(&[]);
         let served = opened(Some(&old)).await;
         assert_ne!(served.stored_session_id, old);
@@ -10617,7 +10628,12 @@ mod serve_open_tests {
 
     #[tokio::test]
     async fn a_resume_of_an_unknown_id_fails_with_exit_1() {
-        let _home = isolated();
+        if !runs_in_its_own_process(
+            module_path!(),
+            "a_resume_of_an_unknown_id_fails_with_exit_1",
+        ) {
+            return;
+        }
         let before = logs_in_store();
         let err = serve_open("run-1", None, None, Some("01NOSUCHSESSION"), &[])
             .await
@@ -10629,7 +10645,12 @@ mod serve_open_tests {
 
     #[tokio::test]
     async fn a_resume_of_a_session_running_elsewhere_is_refused() {
-        let _home = isolated();
+        if !runs_in_its_own_process(
+            module_path!(),
+            "a_resume_of_a_session_running_elsewhere_is_refused",
+        ) {
+            return;
+        }
         let old = stored_with_one_turn(&[]);
         let first = opened(Some(&old)).await;
         let newest = hotl_store::newest_continuation(&sessions_dir(), &old);
@@ -10651,7 +10672,12 @@ mod serve_open_tests {
 
     #[tokio::test]
     async fn a_live_run_id_is_refused_before_anything_is_written() {
-        let _home = isolated();
+        if !runs_in_its_own_process(
+            module_path!(),
+            "a_live_run_id_is_refused_before_anything_is_written",
+        ) {
+            return;
+        }
         let old = stored_with_one_turn(&[]);
         let before = logs_in_store();
         for resume in [None, Some(old.as_str())] {
@@ -10674,7 +10700,12 @@ mod serve_open_tests {
 
     #[tokio::test]
     async fn a_resumed_serve_reports_the_mode_and_plan_it_inherited() {
-        let _home = isolated();
+        if !runs_in_its_own_process(
+            module_path!(),
+            "a_resumed_serve_reports_the_mode_and_plan_it_inherited",
+        ) {
+            return;
+        }
         let old = stored_with_one_turn(&[
             EntryPayload::ModeSet {
                 mode: "dontask".into(),
@@ -10691,7 +10722,9 @@ mod serve_open_tests {
 
     #[tokio::test]
     async fn a_fresh_serve_still_reports_the_defaults() {
-        let _home = isolated();
+        if !runs_in_its_own_process(module_path!(), "a_fresh_serve_still_reports_the_defaults") {
+            return;
+        }
         let served = opened(None).await;
         assert!(served.open.is_none());
         let default_mode = served.info.default_mode.clone();
@@ -10801,7 +10834,12 @@ mod ephemeral_acp_tests {
 
     #[tokio::test]
     async fn an_ephemeral_session_is_never_listed_and_cannot_be_loaded() {
-        let _home = super::serve_open_tests::isolated();
+        if !runs_in_its_own_process(
+            module_path!(),
+            "an_ephemeral_session_is_never_listed_and_cannot_be_loaded",
+        ) {
+            return;
+        }
         let work = tempfile::tempdir().unwrap();
         let fake = FakeAnthropic::start(Script::default()).await;
         let mut client = Client::start(&fake).await;
@@ -10826,7 +10864,12 @@ mod ephemeral_acp_tests {
 
     #[tokio::test]
     async fn a_normal_session_after_an_ephemeral_one_is_stored() {
-        let _home = super::serve_open_tests::isolated();
+        if !runs_in_its_own_process(
+            module_path!(),
+            "a_normal_session_after_an_ephemeral_one_is_stored",
+        ) {
+            return;
+        }
         let work = tempfile::tempdir().unwrap();
         let fake = FakeAnthropic::start(
             Script::default()
@@ -10858,7 +10901,12 @@ mod ephemeral_acp_tests {
 
     #[tokio::test]
     async fn a_schema_prompt_works_in_an_ephemeral_session() {
-        let _home = super::serve_open_tests::isolated();
+        if !runs_in_its_own_process(
+            module_path!(),
+            "a_schema_prompt_works_in_an_ephemeral_session",
+        ) {
+            return;
+        }
         let work = tempfile::tempdir().unwrap();
         let fake = FakeAnthropic::start(Script::queue(vec![text(r#"{"n": 3}"#).into()])).await;
         let mut client = Client::start(&fake).await;
