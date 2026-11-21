@@ -12,8 +12,10 @@ _hotl() {
   local subcommands="watch doctor resume acp bg attach approve setup gc mcp plugins skills workflows update init export stats schema features help version"
   local globals="-p --print --json --json-schema --goal --plan --ephemeral --search -r --resume --fork-from --keep --keep-turns -n --name --version --help"
   case "$prev" in
-    -r|--resume|--fork-from|resume|attach|export)
+    -r|--resume|--fork-from|resume|export)
       COMPREPLY=( $(compgen -W "$(_hotl_sessions)" -- "$cur") ); return ;;
+    attach)
+      COMPREPLY=( $(compgen -W "--json $(_hotl_sessions)" -- "$cur") ); return ;;
     --json-schema)
       COMPREPLY=( $(compgen -f -- "$cur") ); return ;;
     init) COMPREPLY=( $(compgen -W "zsh bash fish" -- "$cur") ); return ;;

@@ -51,6 +51,7 @@ complete -c hotl -n '__fish_seen_subcommand_from gc' -l dry-run -d 'show what wo
 complete -c hotl -n '__fish_seen_subcommand_from gc' -l days -d 'age cutoff' -r
 complete -c hotl -n '__fish_seen_subcommand_from gc' -l keep -d 'sessions to keep' -r
 complete -c hotl -n '__fish_seen_subcommand_from export resume attach' -a '(__hotl_sessions)'
+complete -c hotl -n '__fish_seen_subcommand_from attach' -l json -d 'list live sessions as JSON lines'
 complete -c hotl -n '__fish_seen_subcommand_from export' -l md -d 'Markdown'
 complete -c hotl -n '__fish_seen_subcommand_from export' -l html -d 'HTML page'
 complete -c hotl -n '__fish_seen_subcommand_from stats' -l days -d 'only the last N days' -r

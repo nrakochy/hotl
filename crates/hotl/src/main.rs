@@ -252,9 +252,7 @@ fn main() {
             bg_name(&args).as_deref(),
             bg_worktree(&args).as_ref(),
         )),
-        Some("attach") => std::process::exit(block_on(attach::attach_main(
-            args.get(1).map(String::as_str),
-        ))),
+        Some("attach") => std::process::exit(block_on(attach::attach_main(&args[1..]))),
         Some("approve") => std::process::exit(block_on(approve_cli::approve_main(&args[1..]))),
         Some("serve") => {
             let ServeArgs {
@@ -337,6 +335,7 @@ fn help_text() -> &'static str {
          hotl --goal \"<cond>\"   headless goal loop with the condition as the prompt (no -p needed)\n  \
          hotl bg [prompt]     background a session (detached socket server; attach later)\n  \
          hotl attach [id]     connect to a backgrounded session (bare: list them)\n  \
+         \x20                   --json lists the live sessions as JSON, one line each\n  \
          hotl approve <id>    answer what a backgrounded session is waiting on\n  \
          hotl watch           tmux agent dashboard (watch)\n  \
          hotl acp             serve the ACP protocol over stdio (for editors and orchestrators)\n  \

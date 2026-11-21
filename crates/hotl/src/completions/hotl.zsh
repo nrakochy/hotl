@@ -72,7 +72,8 @@ _hotl() {
         mcp) _arguments '1:verb:(list show add untrust test)' ;;
         skills|plugins) _arguments '1:verb:(list add update remove)' ;;
         workflows) _arguments '1:verb:(list show check)' '--mermaid[print a Mermaid graph]' ;;
-        resume|attach) _arguments '1:session:_hotl_sessions' ;;
+        resume) _arguments '1:session:_hotl_sessions' ;;
+        attach) _arguments '1:session:_hotl_sessions' '--json[list live sessions as JSON lines]' ;;
       esac
       ;;
   esac

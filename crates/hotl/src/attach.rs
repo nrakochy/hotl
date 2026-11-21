@@ -17,8 +17,14 @@ type ReadHalf = tokio::io::ReadHalf<<hotl_platform::ActiveIpc as hotl_platform::
 type Client = AcpClient<WriteHalf>;
 type Lines = tokio::io::Lines<BufReader<ReadHalf>>;
 
-pub async fn attach_main(id: Option<&str>) -> i32 {
-    let Some(id) = id else {
+pub async fn attach_main(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "--json") {
+        for line in live_json() {
+            println!("{line}");
+        }
+        return 0;
+    }
+    let Some(id) = args.first().map(String::as_str) else {
         return list_sessions();
     };
     if hotl_platform::IPC.liveness(id) != hotl_platform::Liveness::Live {
@@ -45,6 +51,13 @@ fn list_sessions() -> i32 {
         }
     }
     0
+}
+
+pub(crate) fn live_json() -> Vec<String> {
+    crate::run_status::read_live()
+        .iter()
+        .filter_map(|status| serde_json::to_string(status).ok())
+        .collect()
 }
 
 pub(crate) fn initialize_params(token: &str, client: &str) -> Value {
@@ -871,5 +884,50 @@ mod tests {
                 .as_deref(),
             Some("· 1 parked ask(s) expired")
         );
+    }
+
+    #[tokio::test]
+    async fn attach_json_prints_one_object_per_live_session() {
+        use crate::run_status::{RunState, RunStatus};
+        let ids: Vec<String> = ["a", "b"]
+            .iter()
+            .map(|tag| format!("aj-{tag}-{}", std::process::id()))
+            .collect();
+        let statuses: Vec<RunStatus> = ids
+            .iter()
+            .zip([RunState::Idle, RunState::Waiting])
+            .map(|(id, state)| RunStatus {
+                run_id: id.clone(),
+                session_id: format!("stored-{id}"),
+                pid: 7,
+                cwd: std::env::temp_dir(),
+                name: Some(format!("name of {id}")),
+                version: "1.2.3".into(),
+                started_at_ms: 99,
+                state,
+            })
+            .collect();
+        let listeners: Vec<_> = ids
+            .iter()
+            .map(|id| hotl_platform::IPC.bind_private(id).unwrap())
+            .collect();
+        for status in &statuses {
+            crate::run_status::write(status).unwrap();
+        }
+        let lines = live_json();
+        for id in &ids {
+            crate::run_status::remove(id);
+            if let Some(p) = hotl_platform::IPC.artifact_path(id) {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        drop(listeners);
+        let ours: Vec<RunStatus> = lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<RunStatus>(line).ok())
+            .filter(|s| ids.contains(&s.run_id))
+            .collect();
+        assert_eq!(ours, statuses, "{lines:?}");
+        assert!(lines.iter().all(|line| !line.contains('\n')), "{lines:?}");
     }
 }
