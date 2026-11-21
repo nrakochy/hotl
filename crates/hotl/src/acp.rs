@@ -491,6 +491,7 @@ pub enum SessionSpec {
         name: Option<String>,
         /// `-w [name]` (0065): open a git worktree for this session.
         worktree: Option<WorktreeArg>,
+        ephemeral: bool,
         cwd: std::path::PathBuf,
         mcp: Vec<hotl_mcp::config::ServerConfig>,
     },
@@ -2477,6 +2478,7 @@ struct OpenMeta {
     name: Option<String>,
     worktree: Option<WorktreeArg>,
     no_worktree: bool,
+    ephemeral: bool,
 }
 
 fn session_name_param(v: Option<&Value>, field: &str) -> Result<Option<String>, String> {
@@ -2502,6 +2504,10 @@ fn open_meta(meta: Option<&crate::acp_types::Meta>) -> Result<OpenMeta, String> 
             .map(WorktreeArg::from_wire),
         no_worktree: open
             .get("noWorktree")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        ephemeral: open
+            .get("ephemeral")
             .and_then(Value::as_bool)
             .unwrap_or(false),
     })
@@ -2532,6 +2538,8 @@ fn parse_params<T: serde::de::DeserializeOwned>(method: &str, msg: &Value) -> Re
         .map_err(|e| format!("invalid {method} params: {e}"))
 }
 
+const EPHEMERAL_ON_NEW_ONLY: &str = "ephemeral only applies to session/new";
+
 fn parse_open(method: &str, msg: &Value) -> Result<Opening, String> {
     if method == "session/new" {
         parse_new(method, msg)
@@ -2550,10 +2558,14 @@ fn parse_new(method: &str, msg: &Value) -> Result<Opening, String> {
     if meta.no_worktree {
         return Err("noWorktree only applies to session/load or session/resume".into());
     }
+    if meta.ephemeral && meta.worktree.is_some() {
+        return Err("an ephemeral session cannot own a worktree".into());
+    }
     Ok(Opening {
         spec: SessionSpec::New {
             name: meta.name,
             worktree: meta.worktree,
+            ephemeral: meta.ephemeral,
             cwd: cwd.clone(),
             mcp: mcp.clone(),
         },
@@ -2582,6 +2594,9 @@ fn parse_load(method: &str, msg: &Value) -> Result<Opening, String> {
     };
     let cwd = session_root(&cwd)?;
     let meta = open_meta(meta.as_ref())?;
+    if meta.ephemeral {
+        return Err(EPHEMERAL_ON_NEW_ONLY.into());
+    }
     if meta.worktree.is_some() {
         return Err(
             "worktree only applies to a new session or a fork — a resumed session \
@@ -2610,6 +2625,9 @@ fn parse_fork(method: &str, msg: &Value) -> Result<Opening, String> {
         .pointer("/params/sessionId")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{method} requires params.sessionId"))?;
+    if open_meta(msg.pointer("/params/_meta").and_then(Value::as_object))?.ephemeral {
+        return Err(EPHEMERAL_ON_NEW_ONLY.into());
+    }
     let mcp = mcp_servers_param(msg)?;
     let keep = keep_spec(msg)?;
     let name = session_name_param(msg.pointer("/params/name"), "params.name")?;

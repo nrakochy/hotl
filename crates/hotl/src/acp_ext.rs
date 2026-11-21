@@ -74,6 +74,10 @@ struct OpenParams {
     worktree: Option<String>,
     #[schemars(description = "session/load and session/resume only: do not reuse the worktree")]
     no_worktree: Option<bool>,
+    #[schemars(
+        description = "session/new only: a throwaway session whose log is never stored; cannot be combined with worktree"
+    )]
+    ephemeral: Option<bool>,
 }
 
 #[derive(JsonSchema)]
@@ -306,6 +310,7 @@ pub fn schema() -> Value {
             at("session/new, session/load, session/resume params: _meta", sub::<OpenParams>(g)),
             at("session/new, session/load, session/resume, _hotl/session/fork result: _meta", sub::<SessionOpenExtras>(g)),
         ],
+        (crate::acp::META_SESSION): [at("session/list result: sessions[]._meta", sub::<crate::acp_types::SessionRowMeta>(g))],
         (crate::acp::META_MODEL): [
             at("session/update config_option_update: _meta", sub::<ModelChange>(g)),
             at("session/set_config_option result: _meta", sub::<ModelAck>(g)),

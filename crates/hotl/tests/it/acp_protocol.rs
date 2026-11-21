@@ -7217,3 +7217,55 @@ async fn initialize_advertises_output_schema() {
         "a plain client was sent a hotl.dev/ key: {plain}"
     );
 }
+
+#[tokio::test]
+async fn ephemeral_is_refused_on_load() {
+    let (mut w, mut lines) = connect(scripted_factory(), server_info()).await;
+    let ephemeral = json!({"hotl.dev/open": {"ephemeral": true}});
+    let calls = [
+        (
+            "session/load",
+            json!({"sessionId":"S1","cwd":std::env::temp_dir(),"_meta":ephemeral}),
+        ),
+        (
+            "session/resume",
+            json!({"sessionId":"S1","cwd":std::env::temp_dir(),"_meta":ephemeral}),
+        ),
+        (
+            "_hotl/session/fork",
+            json!({"sessionId":"S1","cwd":std::env::temp_dir(),"_meta":ephemeral}),
+        ),
+    ];
+    for (i, (method, params)) in calls.into_iter().enumerate() {
+        let id = 10 + i as u64;
+        send(
+            &mut w,
+            json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+        )
+        .await;
+        let r = read_until_id(&mut lines, id).await;
+        assert_eq!(r["error"]["code"], -32602, "{method}: {r}");
+        assert_eq!(
+            r["error"]["message"], "ephemeral only applies to session/new",
+            "{method}: {r}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ephemeral_with_worktree_is_refused() {
+    let (mut w, mut lines) = connect(scripted_factory(), server_info()).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{
+            "cwd":std::env::temp_dir(),"mcpServers":[],
+            "_meta":{"hotl.dev/open":{"ephemeral":true,"worktree":"@derived"}}}}),
+    )
+    .await;
+    let r = read_until_id(&mut lines, 2).await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    assert_eq!(
+        r["error"]["message"], "an ephemeral session cannot own a worktree",
+        "{r}"
+    );
+}

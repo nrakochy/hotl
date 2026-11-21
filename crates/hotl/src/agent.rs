@@ -758,6 +758,14 @@ pub(crate) async fn build_acp_with(
         // typing-time trigger (first composer keystroke) has no ACP signal
         // to hang off today — see the task report for that deferral.
         scaffold.provider.arm().detach();
+        scaffold.use_sessions_dir(sessions_dir());
+        let ephemeral = matches!(
+            spec,
+            crate::acp::SessionSpec::New {
+                ephemeral: true,
+                ..
+            }
+        );
         let client_mcp;
         let (resumed, requested, is_fork, worktree_arg, no_worktree, base, replay) = match spec {
             crate::acp::SessionSpec::New {
@@ -765,6 +773,7 @@ pub(crate) async fn build_acp_with(
                 worktree,
                 cwd,
                 mcp,
+                ..
             } => {
                 client_mcp = mcp;
                 (None, name, false, worktree, false, cwd, false)
@@ -810,14 +819,27 @@ pub(crate) async fn build_acp_with(
         if let Some(arg) = &worktree_arg {
             hotl_store::worktree::SessionWorktree::precheck(&base, arg.name())?;
         }
-        let mut log = create_session_log(
-            &sessions_dir(),
-            &scaffold.model,
-            scaffold.masker(),
-            scaffold.clock.now_ms(),
-            resumed.as_ref(),
-            is_fork,
-        )?;
+        let mut log = if ephemeral {
+            let log = create_session_log_in(
+                LogHome::Ephemeral,
+                &scaffold.model,
+                scaffold.masker(),
+                scaffold.clock.now_ms(),
+                None,
+                false,
+            )?;
+            scaffold.use_sessions_dir(log.dir().to_path_buf());
+            log
+        } else {
+            create_session_log(
+                &sessions_dir(),
+                &scaffold.model,
+                scaffold.masker(),
+                scaffold.clock.now_ms(),
+                resumed.as_ref(),
+                is_fork,
+            )?
+        };
         let _ = log.append(
             &hotl_types::EntryPayload::CwdSet {
                 path: dunce::canonicalize(&base)
@@ -10442,12 +10464,12 @@ mod serve_open_tests {
     use crate::run_status::{RunState, RunStatus};
     use hotl_types::{EntryPayload, Item};
 
-    struct Isolated {
+    pub(super) struct Isolated {
         _data: tempfile::TempDir,
         _config: tempfile::TempDir,
     }
 
-    fn isolated() -> Isolated {
+    pub(super) fn isolated() -> Isolated {
         let data = tempfile::tempdir().unwrap();
         let config = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_DATA_HOME", data.path());
@@ -10634,5 +10656,184 @@ mod serve_open_tests {
         let result = hosting(served).resume_result();
         assert_eq!(result["modes"]["currentModeId"], default_mode.as_str());
         assert_eq!(plan_option(&result), default_plan);
+    }
+}
+
+#[cfg(test)]
+mod ephemeral_acp_tests {
+    use super::*;
+    use hotl_testkit::fake_anthropic::{text, tool_use, FakeAnthropic, Script};
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    struct Client {
+        write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        next_id: u64,
+    }
+
+    impl Client {
+        async fn start(fake: &FakeAnthropic) -> Client {
+            std::env::set_var("HOTL_PROVIDER_BASE_URL", fake.base_url());
+            let (factory, info, _) = build_acp().await.expect("acp starts");
+            let (client, server) = tokio::io::duplex(256 * 1024);
+            let (sread, swrite) = tokio::io::split(server);
+            tokio::spawn(crate::acp::serve(sread, swrite, factory, info, None));
+            let (cread, write) = tokio::io::split(client);
+            let mut client = Client {
+                write,
+                lines: tokio::io::BufReader::new(cread).lines(),
+                next_id: 0,
+            };
+            let init = client
+                .call(
+                    "initialize",
+                    json!({"protocolVersion": 1, "clientCapabilities": {"_meta": {"hotl.dev/extensions": 1}}}),
+                )
+                .await;
+            assert!(init.get("error").is_none(), "{init}");
+            client
+        }
+
+        async fn call(&mut self, method: &str, params: Value) -> Value {
+            self.next_id += 1;
+            let id = self.next_id;
+            let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+            self.write
+                .write_all(format!("{msg}\n").as_bytes())
+                .await
+                .unwrap();
+            loop {
+                let line = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    self.lines.next_line(),
+                )
+                .await
+                .expect("acp frame timeout")
+                .unwrap()
+                .expect("server closed");
+                let v: Value = serde_json::from_str(&line).unwrap();
+                if v["id"] == json!(id) && v.get("method").is_none() {
+                    return v;
+                }
+                if v["method"] == "session/request_permission" {
+                    let answer = json!({"jsonrpc": "2.0", "id": v["id"].clone(),
+                        "result": {"outcome": {"outcome": "selected", "optionId": "allow"}}});
+                    self.write
+                        .write_all(format!("{answer}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+
+        async fn open(&mut self, cwd: &std::path::Path, open: Value) -> String {
+            let reply = self
+                .call(
+                    "session/new",
+                    json!({"cwd": cwd, "mcpServers": [], "_meta": {"hotl.dev/open": open}}),
+                )
+                .await;
+            reply["result"]["sessionId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{reply}"))
+                .to_string()
+        }
+
+        async fn prompt(&mut self, sid: &str, text: &str) -> Value {
+            self.call(
+                "session/prompt",
+                json!({"sessionId": sid, "prompt": [{"type": "text", "text": text}]}),
+            )
+            .await
+        }
+    }
+
+    fn stored() -> Vec<String> {
+        hotl_store::list_sessions(&sessions_dir())
+            .into_iter()
+            .map(|(id, ..)| id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_ephemeral_session_is_never_listed_and_cannot_be_loaded() {
+        let _home = super::serve_open_tests::isolated();
+        let work = tempfile::tempdir().unwrap();
+        let fake = FakeAnthropic::start(Script::default()).await;
+        let mut client = Client::start(&fake).await;
+        let sid = client.open(work.path(), json!({"ephemeral": true})).await;
+        let reply = client.prompt(&sid, "hello").await;
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+        let closed = client
+            .call("session/close", json!({"sessionId": sid}))
+            .await;
+        assert_eq!(closed["result"], json!({}), "{closed}");
+        let listed = client.call("session/list", json!({})).await;
+        assert_eq!(listed["result"]["sessions"], json!([]), "{listed}");
+        let loaded = client
+            .call(
+                "session/load",
+                json!({"sessionId": sid, "cwd": work.path(), "mcpServers": []}),
+            )
+            .await;
+        assert_eq!(loaded["error"]["code"], -32002, "{loaded}");
+        assert_eq!(stored(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_normal_session_after_an_ephemeral_one_is_stored() {
+        let _home = super::serve_open_tests::isolated();
+        let work = tempfile::tempdir().unwrap();
+        let fake = FakeAnthropic::start(
+            Script::default()
+                .route(
+                    "PARENT-ASK",
+                    tool_use(
+                        "t1",
+                        "spawn",
+                        json!({"agent_type": "explore", "task": "CHILD-TASK look around"}),
+                    ),
+                )
+                .route("CHILD-TASK", text("child result")),
+        )
+        .await;
+        let mut client = Client::start(&fake).await;
+        let throwaway = client.open(work.path(), json!({"ephemeral": true})).await;
+        client.prompt(&throwaway, "hello").await;
+        client
+            .call("session/close", json!({"sessionId": throwaway}))
+            .await;
+        let kept = client.open(work.path(), json!({})).await;
+        let reply = client.prompt(&kept, "PARENT-ASK").await;
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+        let logs = stored();
+        assert!(logs.contains(&kept), "{logs:?}");
+        assert!(!logs.contains(&throwaway), "{logs:?}");
+        assert_eq!(logs.len(), 2, "the session and its child: {logs:?}");
+    }
+
+    #[tokio::test]
+    async fn a_schema_prompt_works_in_an_ephemeral_session() {
+        let _home = super::serve_open_tests::isolated();
+        let work = tempfile::tempdir().unwrap();
+        let fake = FakeAnthropic::start(Script::queue(vec![text(r#"{"n": 3}"#).into()])).await;
+        let mut client = Client::start(&fake).await;
+        let sid = client.open(work.path(), json!({"ephemeral": true})).await;
+        let reply = client
+            .call(
+                "session/prompt",
+                json!({"sessionId": sid, "prompt": [{"type": "text", "text": "count"}],
+                       "_meta": {"hotl.dev/outputSchema": {"type": "object", "required": ["n"],
+                                 "properties": {"n": {"type": "integer"}}}}}),
+            )
+            .await;
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+        assert_eq!(
+            reply["result"]["_meta"]["hotl.dev/output"],
+            json!({"n": 3}),
+            "{reply}"
+        );
+        assert_eq!(stored(), Vec::<String>::new());
     }
 }

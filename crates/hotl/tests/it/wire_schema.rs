@@ -9,7 +9,7 @@ use hotl_engine::{EngineEvent, Outcome};
 use hotl_types::TokenUsage;
 use serde_json::{json, Value};
 
-use crate::{acp, acp_ext, acp_map, features, schema_cli, wire};
+use crate::{acp, acp_ext, acp_map, acp_types, features, schema_cli, wire};
 
 fn server_info() -> acp::ServerInfo {
     acp::ServerInfo {
@@ -306,6 +306,11 @@ fn every_hotl_meta_payload_validates_against_the_published_schema() {
         json!({"outcome": {"outcome": "selected", "optionId": "deny"}, "_meta": {acp_map::META_REPLY: {"message": "no"}}}),
         json!({"_meta": {acp_ext::META_EXT: 1, acp_ext::META_SOCKET_TOKEN: "t"}}),
         json!({"_meta": {acp::META_OPEN: {"name": "n", "worktree": "w"}}}),
+        json!({"_meta": {acp::META_OPEN: {"ephemeral": true}}}),
+        json!({"sessionId": "s", "cwd": "/w", "_meta": {acp::META_SESSION: acp_types::SessionRowMeta {
+            parent_id: Some("p".into()),
+            run_id: Some("bg-1".into()),
+        }}}),
     ];
     let events = [
         EngineEvent::TextDelta("hi".into()),

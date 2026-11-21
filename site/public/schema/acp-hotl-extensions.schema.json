@@ -1770,6 +1770,13 @@
     },
     "OpenParams": {
       "properties": {
+        "ephemeral": {
+          "description": "session/new only: a throwaway session whose log is never stored; cannot be combined with worktree",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "name": {
           "description": "A session name, 1 to 64 characters",
           "type": [
@@ -2406,6 +2413,25 @@
       },
       "type": "object"
     },
+    "SessionRowMeta": {
+      "properties": {
+        "parentId": {
+          "description": "The listed session this one was forked from",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runId": {
+          "description": "The run id of the live hotl serve process holding this session",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "SteerParams": {
       "properties": {
         "images": {
@@ -2844,6 +2870,14 @@
         "on": "session/request_permission result (sent by the client): _meta",
         "schema": {
           "$ref": "#/$defs/Reply"
+        }
+      }
+    ],
+    "hotl.dev/session": [
+      {
+        "on": "session/list result: sessions[]._meta",
+        "schema": {
+          "$ref": "#/$defs/SessionRowMeta"
         }
       }
     ],
