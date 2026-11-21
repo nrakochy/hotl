@@ -8739,6 +8739,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_session_opened_on_another_root_keeps_its_memory_under_that_root() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let secrets = MapSecrets::from([
+            ("ANTHROPIC_API_KEY", "sk-ant-x"),
+            ("HOTL_ANTHROPIC_BASE_URL", "http://127.0.0.1:9"),
+        ]);
+        let (factory, info, _) = build_acp_with(config_from_toml(""), &secrets)
+            .await
+            .expect("acp starts");
+        let root = tempfile::tempdir().unwrap();
+        let root_path = dunce::canonicalize(root.path()).unwrap();
+        let (client, serve_end) = tokio::io::duplex(64 * 1024);
+        let (sread, swrite) = tokio::io::split(serve_end);
+        tokio::spawn(crate::acp::serve(sread, swrite, factory, info, None));
+        let (cread, mut cwrite) = tokio::io::split(client);
+        let mut lines = tokio::io::BufReader::new(cread).lines();
+        let calls = [
+            serde_json::json!({"method":"initialize","params":{"protocolVersion":1}}),
+            serde_json::json!({"method":"session/new","params":{"cwd": root_path, "mcpServers": []}}),
+            serde_json::json!({"method":"_hotl/session/remember","params":{}}),
+        ];
+        let mut last = serde_json::Value::Null;
+        for (i, call) in calls.iter().enumerate() {
+            let mut call = call.clone();
+            call["jsonrpc"] = serde_json::json!("2.0");
+            call["id"] = serde_json::json!(i + 1);
+            cwrite
+                .write_all(format!("{call}\n").as_bytes())
+                .await
+                .unwrap();
+            last = loop {
+                let line = lines.next_line().await.unwrap().expect("server closed");
+                let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if v["id"] == serde_json::json!(i + 1) {
+                    assert!(v.get("error").is_none(), "{v}");
+                    break v;
+                }
+            };
+        }
+        let path = last["result"]["path"].as_str().expect("a memory path");
+        let under_root = data_dir()
+            .join("memory")
+            .join(hotl_store::project::id(&root_path));
+        let under_process = data_dir()
+            .join("memory")
+            .join(hotl_store::project::id(&std::env::current_dir().unwrap()));
+        assert_ne!(under_root, under_process);
+        assert!(
+            std::path::Path::new(path).starts_with(&under_root),
+            "{path} is not under {}",
+            under_root.display()
+        );
+    }
+
+    #[test]
+    fn plan_and_memory_files_follow_the_root_they_are_given() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let plan = plan_files_at(Some("notes"), elsewhere.path());
+        let memory = memory_files_at(hotl_engine::MemoryMode::ReadWrite, elsewhere.path());
+        let (plan, memory) =
+            files_for_root(plan.as_ref(), Some("notes"), memory.as_ref(), root.path());
+        let (plan, memory) = (plan.unwrap(), memory.unwrap());
+        let project = hotl_store::project::id(root.path());
+        assert_eq!(plan.project, project);
+        assert_eq!(plan.dir, data_dir().join("plans").join(&project));
+        assert_eq!(
+            plan.repo_mirror,
+            Some(root.path().join("notes").join("hotl-plan.md"))
+        );
+        assert_eq!(memory.dir, data_dir().join("memory").join(&project));
+        assert_eq!(memory.mode, hotl_engine::MemoryMode::ReadWrite);
+        assert!(matches!(
+            files_for_root(None, None, None, root.path()),
+            (None, None)
+        ));
+    }
+
+    #[tokio::test]
     async fn a_placeholder_provider_refuses_before_any_network_io() {
         use futures_util::StreamExt;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
