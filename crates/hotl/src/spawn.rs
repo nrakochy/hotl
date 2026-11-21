@@ -937,7 +937,7 @@ struct ChildRun {
     validate_cmd: Option<String>,
     forward: Forward,
     lead: Option<LeadGuard>,
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    permit: Option<hotl_tools::concurrency::AgentPermit>,
     deadlines: ChildDeadlines,
     notify: Option<tokio::sync::mpsc::WeakSender<hotl_engine::SessionCmd>>,
     /// Weak: the registry holds this child's senders, so a strong reference

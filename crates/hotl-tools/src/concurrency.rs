@@ -42,6 +42,32 @@ pub struct AgentQueueFull {
     pub cap: usize,
 }
 
+pub struct AgentPermit {
+    _permit: OwnedSemaphorePermit,
+    _admitted: Admitted,
+}
+
+struct Admitted {
+    counter: Arc<AtomicUsize>,
+    count: usize,
+}
+
+impl Admitted {
+    fn enter(counter: &Arc<AtomicUsize>) -> Self {
+        let count = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        Self {
+            counter: counter.clone(),
+            count,
+        }
+    }
+}
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// The three governed resources. Deliberately small and fixed — not
 /// `num_cpus` — because concurrent LLM calls and subprocesses cost money,
 /// hit rate limits, and consume OS resources; a 32-core box must not default
@@ -77,9 +103,7 @@ pub struct SessionConcurrency {
     /// The configured `agents` width, kept because a `Semaphore` reports only
     /// what is *available* — the queue cap is a multiple of the width.
     agents_width: usize,
-    /// Children admitted and waiting for an `agents` permit. Shared with
-    /// every clone, like the semaphores beside it.
-    agents_queued: Arc<AtomicUsize>,
+    agents_admitted: Arc<AtomicUsize>,
     /// Callers waiting on a `subprocs` permit right now (0061 T17).
     subprocs_queued: Arc<AtomicUsize>,
     requests: Arc<Semaphore>,
@@ -103,7 +127,7 @@ impl SessionConcurrency {
         Self {
             agents: mk(limits.agents),
             agents_width: limits.agents.max(1),
-            agents_queued: Arc::new(AtomicUsize::new(0)),
+            agents_admitted: Arc::new(AtomicUsize::new(0)),
             subprocs_queued: Arc::new(AtomicUsize::new(0)),
             requests: mk(limits.requests),
             subprocs: mk(limits.subprocs),
@@ -113,16 +137,18 @@ impl SessionConcurrency {
     /// [`Self::agent`], but refusing rather than queueing without bound past
     /// [`AGENT_QUEUE_FACTOR`] × the configured width. The error carries both
     /// numbers so the refusal can name them.
-    pub async fn agent_queued(&self) -> Result<OwnedSemaphorePermit, AgentQueueFull> {
+    pub async fn agent_queued(&self) -> Result<AgentPermit, AgentQueueFull> {
         let cap = self.agents_width * AGENT_QUEUE_FACTOR;
-        let queued = self.agents_queued.fetch_add(1, Ordering::SeqCst) + 1;
+        let admitted = Admitted::enter(&self.agents_admitted);
+        let queued = admitted.count.saturating_sub(self.agents_width);
         if queued > cap {
-            self.agents_queued.fetch_sub(1, Ordering::SeqCst);
             return Err(AgentQueueFull { queued, cap });
         }
         let permit = self.agent().await;
-        self.agents_queued.fetch_sub(1, Ordering::SeqCst);
-        Ok(permit)
+        Ok(AgentPermit {
+            _permit: permit,
+            _admitted: admitted,
+        })
     }
 
     /// Acquire one of the `agents` permits. `await` here *paces* (queues)
@@ -314,6 +340,65 @@ mod tests {
         }
         // The queue drained, so the next arrival is admitted again.
         assert!(sc.agent_queued().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_waiter_handed_the_slot_no_longer_counts_as_queued() {
+        let sc = SessionConcurrency::new(ConcurrencyLimits {
+            agents: 1,
+            requests: 4,
+            subprocs: 8,
+        });
+        let running = sc.agent_queued().await.expect("the first runs");
+        let mut waiting = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let sc = sc.clone();
+            waiting.spawn(async move { sc.agent_queued().await.map(drop) });
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(running);
+        let arrival = sc.agent_queued();
+        tokio::pin!(arrival);
+        let first_poll = futures_util::poll!(arrival.as_mut());
+        assert!(
+            !matches!(first_poll, std::task::Poll::Ready(Err(_))),
+            "three are waiting and one runs, so a fourth waiter fits under the cap of four"
+        );
+        while let Some(j) = waiting.join_next().await {
+            assert!(j.expect("task").is_ok());
+        }
+        assert!(arrival.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_wait_that_is_cancelled_gives_its_queue_place_back() {
+        let sc = SessionConcurrency::new(ConcurrencyLimits {
+            agents: 1,
+            requests: 4,
+            subprocs: 8,
+        });
+        let running = sc.agent_queued().await.expect("the first runs");
+        for _ in 0..8 {
+            let gave_up = tokio::time::timeout(Duration::from_millis(5), sc.agent_queued()).await;
+            assert!(
+                gave_up.is_err(),
+                "the wait is still pending when it is cancelled"
+            );
+        }
+        let mut waiting = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let sc = sc.clone();
+            waiting.spawn(async move { sc.agent_queued().await.map(drop) });
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            sc.agent_queued().await.err(),
+            Some(AgentQueueFull { queued: 5, cap: 4 })
+        );
+        drop(running);
+        while let Some(j) = waiting.join_next().await {
+            assert!(j.expect("task").is_ok());
+        }
     }
 
     #[tokio::test]
