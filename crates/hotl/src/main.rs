@@ -41,6 +41,7 @@ mod images;
 mod keysource;
 mod mcp_cli;
 mod plugins_cli;
+mod run_status;
 mod schema_cli;
 mod session_server;
 mod setup;

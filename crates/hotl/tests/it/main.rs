@@ -31,6 +31,9 @@ mod features;
 #[path = "../../src/images.rs"]
 #[allow(dead_code)]
 mod images;
+#[path = "../../src/run_status.rs"]
+#[allow(dead_code)]
+mod run_status;
 #[path = "../../src/schema_cli.rs"]
 #[allow(dead_code)]
 mod schema_cli;

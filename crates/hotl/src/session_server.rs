@@ -94,10 +94,7 @@ fn sweep_period(ask_expiry: std::time::Duration) -> std::time::Duration {
 
 /// Directory holding one `<id>.sock` per live backgrounded session.
 pub fn run_dir() -> PathBuf {
-    crate::agent::sessions_dir()
-        .parent()
-        .map(|p| p.join("run"))
-        .unwrap_or_else(|| PathBuf::from("run"))
+    crate::run_status::run_dir()
 }
 
 /// The per-session auth-token file, next to the socket. Written 0600 by the
