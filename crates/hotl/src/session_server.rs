@@ -168,11 +168,13 @@ pub async fn serve(served: Served) -> i32 {
     // A *live* endpoint means this id collides with a running session (pid
     // reuse, a repeated --id) — refuse rather than silently steal it. A dead
     // one is cleared by `bind_private`.
-    if hotl_platform::IPC.liveness(&session_id) == hotl_platform::Liveness::Live {
-        eprintln!("hotl serve: session `{session_id}` is already running");
-        return 1;
+    if let Some((code, msg)) =
+        refuse_live_run(&session_id, hotl_platform::IPC.liveness(&session_id))
+    {
+        eprintln!("hotl serve: {msg}");
+        return code;
     }
-    let listener = match hotl_platform::IPC.bind_private(&session_id) {
+    let listener = match bind_run(&session_id) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("hotl serve: cannot bind session `{session_id}`: {e}");
@@ -190,6 +192,19 @@ pub async fn serve(served: Served) -> i32 {
     let _token_guard = TokenGuard(token_path(&session_id));
     serve_on(listener, served, token).await;
     0
+}
+
+pub(crate) fn refuse_live_run(
+    run_id: &str,
+    liveness: hotl_platform::Liveness,
+) -> Option<(i32, String)> {
+    (liveness == hotl_platform::Liveness::Live)
+        .then(|| (1, format!("session `{run_id}` is already running")))
+}
+
+fn bind_run(run_id: &str) -> std::io::Result<Listener> {
+    crate::run_status::remove(run_id);
+    hotl_platform::IPC.bind_private(run_id)
 }
 
 /// Removes the token file when the server exits.
@@ -705,7 +720,7 @@ mod tests {
         ask_expiry: std::time::Duration,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let id = endpoint_id("serve");
-        let listener = hotl_platform::IPC.bind_private(&id).unwrap();
+        let listener = bind_run(&id).unwrap();
         let task = tokio::spawn(serve_on(
             listener,
             served(&id, handle, ask_expiry),
@@ -1863,6 +1878,51 @@ mod tests {
         crate::run_status::remove(&stale);
         assert!(!listed.contains(&stale), "{listed:?}");
         assert!(listed.contains(&live), "{listed:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stale_status_of_the_same_run_id_is_gone_once_the_run_binds() {
+        use crate::run_status::{RunState, RunStatus};
+        let id = endpoint_id("reused");
+        crate::run_status::write(&RunStatus {
+            run_id: id.clone(),
+            session_id: "01JSTALESESSION".into(),
+            pid: 1,
+            cwd: std::env::temp_dir(),
+            name: None,
+            version: "0.0.0".into(),
+            started_at_ms: 1,
+            state: RunState::Running,
+        })
+        .unwrap();
+        let listener = bind_run(&id).unwrap();
+        let listed_at_bind: Vec<RunStatus> = crate::run_status::read_live()
+            .into_iter()
+            .filter(|s| s.run_id == id)
+            .collect();
+        let _task = tokio::spawn(serve_on(
+            listener,
+            served(&id, scripted_session(), std::time::Duration::ZERO),
+            "tok".into(),
+        ));
+        state_becomes(&id, RunState::Idle).await;
+        let listed: Vec<RunStatus> = crate::run_status::read_live()
+            .into_iter()
+            .filter(|s| s.run_id == id)
+            .collect();
+        assert!(listed_at_bind.is_empty(), "{listed_at_bind:?}");
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].session_id, STORED);
+        assert_eq!(listed[0].pid, std::process::id());
+    }
+
+    #[test]
+    fn a_live_run_id_is_refused_and_a_dead_one_is_not() {
+        assert_eq!(
+            refuse_live_run("bg-7", hotl_platform::Liveness::Live),
+            Some((1, "session `bg-7` is already running".to_string()))
+        );
+        assert_eq!(refuse_live_run("bg-7", hotl_platform::Liveness::Dead), None);
     }
 
     #[test]

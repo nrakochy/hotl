@@ -1246,11 +1246,8 @@ pub async fn serve_main(
     worktree: Option<crate::tui::WorktreeArg>,
     resume: Option<String>,
 ) -> i32 {
-    let live = match resume {
-        Some(_) => crate::run_status::read_live(),
-        None => Vec::new(),
-    };
-    let (mut served, _lease) = match serve_open(&id, name, worktree, resume.as_deref(), &live).await
+    let run = hotl_platform::Ipc::liveness(&hotl_platform::IPC, &id);
+    let (mut served, _lease) = match serve_start(&id, name, worktree, resume.as_deref(), run).await
     {
         Ok(opened) => opened,
         Err((code, msg)) => {
@@ -1263,6 +1260,29 @@ pub async fn serve_main(
     }
     served.prompt = prompt;
     crate::session_server::serve(served).await
+}
+
+async fn serve_start(
+    id: &str,
+    name: Option<String>,
+    worktree: Option<crate::tui::WorktreeArg>,
+    resume: Option<&str>,
+    run: hotl_platform::Liveness,
+) -> Result<
+    (
+        crate::session_server::Served,
+        Option<hotl_store::worktree::Leased>,
+    ),
+    (i32, String),
+> {
+    if let Some(refused) = crate::session_server::refuse_live_run(id, run) {
+        return Err(refused);
+    }
+    let live = match resume {
+        Some(_) => crate::run_status::read_live(),
+        None => Vec::new(),
+    };
+    serve_open(id, name, worktree, resume, &live).await
 }
 
 pub(crate) fn running_as(
@@ -10627,6 +10647,29 @@ mod serve_open_tests {
             )
         );
         assert_eq!(logs_in_store(), before, "a refusal writes no new log");
+    }
+
+    #[tokio::test]
+    async fn a_live_run_id_is_refused_before_anything_is_written() {
+        let _home = isolated();
+        let old = stored_with_one_turn(&[]);
+        let before = logs_in_store();
+        for resume in [None, Some(old.as_str())] {
+            let err = serve_start("bg-live", None, None, resume, hotl_platform::Liveness::Live)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(
+                err,
+                (1, "session `bg-live` is already running".to_string()),
+                "{resume:?}"
+            );
+            assert_eq!(
+                logs_in_store(),
+                before,
+                "a refusal writes no log: {resume:?}"
+            );
+        }
     }
 
     #[tokio::test]
