@@ -70,6 +70,42 @@ semver promise of their own.
   and fails if any message hotl writes does not decode through its types.
   Run it with `cargo build -p hotl -p hotl-testkit --bins --examples` then
   `cargo test --manifest-path conformance/acp/Cargo.toml`. CI runs it.
+- Another program can now start, find, drive and restart hotl sessions. The
+  new page [Driving hotl from another program](site/src/content/docs/embedding.md)
+  walks through it. hotl stays one process per session on one machine; the
+  program that drives it owns the list of processes.
+  - **Find running sessions.** Each background session keeps a small status
+    file beside its socket, and `hotl attach --json` prints one JSON line per
+    live session: run id, session id, pid, folder, name, version, start time
+    and `state` (`idle`, `running`, or `waiting` when it needs a person's
+    answer). `hotl gc` now also removes a dead session's status file and
+    access key.
+  - **Restart on stored history.** `hotl serve --resume <session-id>` and
+    `hotl bg --resume <session-id> [prompt]` reopen a stored session and
+    carry on an unfinished turn. A session that is already running elsewhere
+    is refused with the run id that holds it. `--resume` with no id, or with
+    `--worktree`, exits 2.
+  - **Ask for a JSON answer.** Put a JSON Schema in
+    `_meta["hotl.dev/outputSchema"]` on `session/prompt`; the reply carries
+    the checked value in `_meta["hotl.dev/output"]`. An answer that does not
+    fit is retried up to twice, and after that the request fails with the new
+    error code `-32003`. A schema that is not valid is refused with `-32602`
+    before any model call. Any client may use this.
+  - **Throwaway sessions.** `session/new` with
+    `_meta["hotl.dev/open"].ephemeral: true` opens a session whose log is
+    never stored. It cannot be listed, loaded, resumed or forked, and cannot
+    own a worktree. Memory notes and plan files are still written.
+  - For clients that opted in to hotl's extensions: each `session/list` row
+    carries `_meta["hotl.dev/session"]` with `parentId` (the listed session it
+    was forked from) and `runId` (the live background run holding it), and
+    each retry notice carries `_meta["hotl.dev/retry"]` (`attempt`, `max`,
+    `status`, `delayMs`, `scope`) so a program can pace its own launches.
+
+### Fixed
+
+- `hotl serve --id` with a run id that is already live is refused before the
+  session is opened. Before, it wrote a session log and started its tools
+  first.
 
 ## [0.32.0] - 2026-11-17
 
