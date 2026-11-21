@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-11-21
+
 ### Changed (breaking)
 
 - `hotl acp` now speaks standard [ACP](https://agentclientprotocol.com) v1,
