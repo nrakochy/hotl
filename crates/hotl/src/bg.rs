@@ -34,12 +34,38 @@ pub fn session_id() -> String {
     format!("bg-{}", std::process::id())
 }
 
+pub fn serve_command(
+    exe: &std::path::Path,
+    id: &str,
+    prompt: Option<&str>,
+    name: Option<&str>,
+    worktree: Option<&crate::tui::WorktreeArg>,
+    resume: Option<&str>,
+) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.arg("serve").arg("--id").arg(id);
+    if let Some(p) = prompt {
+        cmd.arg("--prompt").arg(p);
+    }
+    if let Some(n) = name {
+        cmd.arg("--name").arg(n);
+    }
+    if let Some(w) = worktree {
+        cmd.arg("--worktree").arg(w.wire());
+    }
+    if let Some(r) = resume {
+        cmd.arg("--resume").arg(r);
+    }
+    cmd
+}
+
 /// `hotl bg [prompt]`: spawn a detached `hotl serve` and report how to attach.
 /// `-w [name]` (0065) rides along as `--worktree <name|@derived>`.
 pub fn bg_main(
     prompt: Option<&str>,
     name: Option<&str>,
     worktree: Option<&crate::tui::WorktreeArg>,
+    resume: Option<&str>,
 ) -> i32 {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -53,17 +79,7 @@ pub fn bg_main(
     let _ = std::fs::create_dir_all(crate::session_server::run_dir());
     let logfile = std::fs::File::create(&log).ok();
 
-    let mut cmd = Command::new(&exe);
-    cmd.arg("serve").arg("--id").arg(&id);
-    if let Some(p) = prompt {
-        cmd.arg("--prompt").arg(p);
-    }
-    if let Some(n) = name {
-        cmd.arg("--name").arg(n);
-    }
-    if let Some(w) = worktree {
-        cmd.arg("--worktree").arg(w.wire());
-    }
+    let mut cmd = serve_command(&exe, &id, prompt, name, worktree, resume);
     // Detach: no controlling terminal input, output to a log, own process
     // group so the shell's SIGHUP on exit doesn't reach it.
     cmd.stdin(Stdio::null())

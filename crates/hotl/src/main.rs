@@ -247,11 +247,20 @@ fn main() {
             std::process::exit(block_on(tui::tui_main(rest)));
         }
         Some("acp") => std::process::exit(block_on(agent::acp_main())),
-        Some("bg") => std::process::exit(bg::bg_main(
-            bg_prompt(&args),
-            bg_name(&args).as_deref(),
-            bg_worktree(&args).as_ref(),
-        )),
+        Some("bg") => {
+            let resume = bg_resume(&args);
+            let worktree = bg_worktree(&args);
+            if let Some((code, msg)) = resume_conflict(resume.as_deref(), worktree.as_ref()) {
+                eprintln!("hotl bg: {msg}");
+                std::process::exit(code);
+            }
+            std::process::exit(bg::bg_main(
+                bg_prompt(&args),
+                bg_name(&args).as_deref(),
+                worktree.as_ref(),
+                resume.as_deref(),
+            ))
+        }
         Some("attach") => std::process::exit(block_on(attach::attach_main(&args[1..]))),
         Some("approve") => std::process::exit(block_on(approve_cli::approve_main(&args[1..]))),
         Some("serve") => {
@@ -260,7 +269,12 @@ fn main() {
                 prompt,
                 name,
                 worktree,
+                resume,
             } = parse_serve_args(&args);
+            if let Some((code, msg)) = resume_conflict(resume.as_deref(), worktree.as_ref()) {
+                eprintln!("hotl serve: {msg}");
+                std::process::exit(code);
+            }
             std::process::exit(block_on(agent::serve_main(id, prompt, name, worktree)));
         }
         Some("setup") => {
@@ -395,7 +409,7 @@ fn bg_prompt(args: &[String]) -> Option<&str> {
     let mut it = args.iter().skip(1).peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "-n" | "--name" => {
+            "-n" | "--name" | "--resume" => {
                 it.next(); // skip the flag's value
             }
             "-w" | "--worktree" => {
@@ -437,6 +451,26 @@ fn bg_name(args: &[String]) -> Option<String> {
     None
 }
 
+fn bg_resume(args: &[String]) -> Option<String> {
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--resume" {
+            return it.next().cloned();
+        }
+    }
+    None
+}
+
+fn resume_conflict(
+    resume: Option<&str>,
+    worktree: Option<&tui::WorktreeArg>,
+) -> Option<(i32, &'static str)> {
+    (resume.is_some() && worktree.is_some()).then_some((
+        2,
+        "--resume reopens the session's own worktree; drop --worktree",
+    ))
+}
+
 /// What `hotl serve` was started with: `--id <id>`, `--prompt <p>`,
 /// `--name <n>`, `--worktree <name|@derived>` (0065). A missing id is
 /// generated.
@@ -445,6 +479,7 @@ struct ServeArgs {
     prompt: Option<String>,
     name: Option<String>,
     worktree: Option<tui::WorktreeArg>,
+    resume: Option<String>,
 }
 
 fn parse_serve_args(args: &[String]) -> ServeArgs {
@@ -452,6 +487,7 @@ fn parse_serve_args(args: &[String]) -> ServeArgs {
     let mut prompt = None;
     let mut name = None;
     let mut worktree = None;
+    let mut resume = None;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -461,6 +497,7 @@ fn parse_serve_args(args: &[String]) -> ServeArgs {
             // Always spelled on the wire: `@derived` is a request, an absent
             // flag is none.
             "--worktree" => worktree = it.next().map(|w| tui::WorktreeArg::from_wire(w)),
+            "--resume" => resume = it.next().cloned(),
             _ => {}
         }
     }
@@ -469,6 +506,7 @@ fn parse_serve_args(args: &[String]) -> ServeArgs {
         prompt,
         name,
         worktree,
+        resume,
     }
 }
 
@@ -744,6 +782,68 @@ mod tests {
         let a = super::parse_serve_args(&v(&["serve", "--id", "x", "--name", "fix-auth"]));
         assert_eq!(a.name.as_deref(), Some("fix-auth"));
         assert_eq!(a.worktree, None);
+    }
+
+    #[test]
+    fn serve_args_carry_a_resume_id() {
+        let a = super::parse_serve_args(&v(&["serve", "--id", "x", "--resume", "01ABC"]));
+        assert_eq!(a.resume.as_deref(), Some("01ABC"));
+        assert_eq!(a.id, "x");
+        let a = super::parse_serve_args(&v(&["serve", "--id", "x"]));
+        assert_eq!(a.resume, None);
+    }
+
+    #[test]
+    fn bg_forwards_resume_to_serve() {
+        let args = v(&["bg", "--resume", "01ABC", "keep going"]);
+        assert_eq!(super::bg_resume(&args).as_deref(), Some("01ABC"));
+        assert_eq!(super::bg_prompt(&args), Some("keep going"));
+        let cmd = crate::bg::serve_command(
+            std::path::Path::new("/bin/hotl"),
+            "bg-1",
+            super::bg_prompt(&args),
+            None,
+            None,
+            super::bg_resume(&args).as_deref(),
+        );
+        let got: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            got,
+            [
+                "serve",
+                "--id",
+                "bg-1",
+                "--prompt",
+                "keep going",
+                "--resume",
+                "01ABC"
+            ]
+        );
+        let fresh = crate::bg::serve_command(
+            std::path::Path::new("/bin/hotl"),
+            "bg-2",
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!fresh.get_args().any(|a| a == "--resume"));
+    }
+
+    #[test]
+    fn resume_with_worktree_is_refused() {
+        assert_eq!(
+            super::resume_conflict(Some("01ABC"), Some(&crate::tui::WorktreeArg::Derived)),
+            Some((
+                2,
+                "--resume reopens the session's own worktree; drop --worktree"
+            ))
+        );
+        assert_eq!(super::resume_conflict(Some("01ABC"), None), None);
+        assert_eq!(
+            super::resume_conflict(None, Some(&crate::tui::WorktreeArg::Derived)),
+            None
+        );
     }
 
     /// 0065: the derived case is spelled on the wire, so an absent flag and a
