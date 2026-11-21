@@ -20,10 +20,20 @@ use hotl_engine::{EngineEvent, Outcome};
 use hotl_tools::net::EgressState;
 use hotl_tools::rules::Rules;
 use hotl_tools::sandbox::SandboxStatus;
-use serde_json::{json, Value};
+use serde::de::{DeserializeOwned, IgnoredAny};
+use serde::Serialize;
+use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+
+use crate::acp_types::client::{
+    CancelNotification, ClientCapabilities, ErrorResponse, Field, FileSystemCapability,
+    InitializeRequest, InitializeResponse, Message, NewSessionRequest, NewSessionResponse,
+    Notification, PromptRequest, PromptResponse, Request, RequestPermissionRequest, Response,
+    SessionNotification, SessionUpdate, SetSessionModeRequest, ToolCallUpdate,
+};
+use crate::acp_types::{ContentBlock, ErrorObject, Implementation, StopReason, ToolCallStatus};
 
 /// The ACP major version this client speaks.
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -187,7 +197,7 @@ type Streams = (
 /// What the reader, the prompt task and the handle share.
 struct Shared {
     next_id: AtomicU64,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Value>>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Message>>>,
     writer: Mutex<Option<Arc<Writer>>>,
     stderr: Mutex<StderrRing>,
     /// Why the connection died, once it has.
@@ -247,11 +257,13 @@ impl Shared {
         }
     }
 
-    async fn send(&self, msg: &Value) -> Result<(), String> {
+    async fn send(&self, msg: &impl Serialize) -> Result<(), String> {
         let Some(writer) = lock(&self.writer).clone() else {
             return Err("the agent is not running".into());
         };
-        let mut line = msg.to_string();
+        let mut line = serde_json::to_value(msg)
+            .map_err(|e| format!("hotl could not encode a message for the agent: {e}"))?
+            .to_string();
         line.push('\n');
         let write = async {
             let mut w = writer.lock().await;
@@ -280,18 +292,15 @@ impl Shared {
     async fn issue(
         &self,
         method: &str,
-        params: Value,
-    ) -> Result<(u64, oneshot::Receiver<Value>), String> {
+        params: impl Serialize,
+    ) -> Result<(u64, oneshot::Receiver<Message>), String> {
         if lock(&self.dead).is_some() {
             return Err(self.death_note("the agent is gone").await);
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         lock(&self.pending).insert(id, tx);
-        if let Err(e) = self
-            .send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
-            .await
-        {
+        if let Err(e) = self.send(&Request::new(id, method, params)).await {
             lock(&self.pending).remove(&id);
             return Err(e);
         }
@@ -299,10 +308,17 @@ impl Shared {
     }
 
     /// A request answered within `leash`, its `result` or its error as text.
-    async fn request(&self, method: &str, params: Value, leash: Duration) -> Result<Value, String> {
+    async fn request<R: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: impl Serialize,
+        leash: Duration,
+    ) -> Result<Field<R>, String> {
         let (id, rx) = self.issue(method, params).await?;
         match tokio::time::timeout(leash, rx).await {
-            Ok(Ok(reply)) => reply_result(method, reply).map_err(|e| self.with_tail(e)),
+            Ok(Ok(reply)) => reply_result(method, reply)
+                .map(Field::from_value)
+                .map_err(|e| self.with_tail(e)),
             Ok(Err(_)) => Err(self.death_note("the agent closed its output").await),
             Err(_) => {
                 lock(&self.pending).remove(&id);
@@ -327,15 +343,16 @@ impl Shared {
     }
 }
 
-fn reply_result(method: &str, reply: Value) -> Result<Value, String> {
-    if let Some(err) = reply.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown error");
-        return Err(format!("the agent refused `{method}`: {msg}"));
+fn reply_result(method: &str, reply: Message) -> Result<Value, String> {
+    if reply.error.is_absent() {
+        return Ok(reply.result.unwrap_or(Value::Null));
     }
-    Ok(reply.get("result").cloned().unwrap_or(Value::Null))
+    let msg = reply
+        .error
+        .valid()
+        .and_then(|e| e.message.valid())
+        .map_or("unknown error", String::as_str);
+    Err(format!("the agent refused `{method}`: {msg}"))
 }
 
 /// One external agent, driven like a native child. Created unstarted;
@@ -448,25 +465,31 @@ impl AcpChild {
         *lock(&self.shared.writer) = Some(Arc::new(tokio::sync::Mutex::new(write)));
         tokio::spawn(reader_task(read, Arc::downgrade(&self.shared)));
 
-        let init = self
+        let init: Field<InitializeResponse> = self
             .shared
             .request(
                 "initialize",
-                json!({
-                    "protocolVersion": PROTOCOL_VERSION,
-                    // D3: the agent uses its own file and shell access, inside
-                    // the floor; hotl serves neither.
-                    "clientCapabilities": {
-                        "fs": {"readTextFile": false, "writeTextFile": false},
-                        "terminal": false,
+                InitializeRequest {
+                    protocol_version: PROTOCOL_VERSION,
+                    client_capabilities: ClientCapabilities {
+                        fs: FileSystemCapability {
+                            read_text_file: false,
+                            write_text_file: false,
+                        },
+                        terminal: false,
                     },
-                    "clientInfo": {"name": "hotl", "version": env!("CARGO_PKG_VERSION")},
-                }),
+                    client_info: Implementation {
+                        name: "hotl".into(),
+                        title: None,
+                        version: env!("CARGO_PKG_VERSION").into(),
+                        meta: None,
+                    },
+                },
                 HANDSHAKE_TIMEOUT,
             )
             .await?;
-        match init.get("protocolVersion").and_then(Value::as_u64) {
-            Some(PROTOCOL_VERSION) => {}
+        match init.valid().and_then(|i| i.protocol_version.valid()) {
+            Some(&PROTOCOL_VERSION) => {}
             other => {
                 let n = other.map_or_else(|| "?".to_string(), |n| n.to_string());
                 return Err(self.shared.with_tail(format!(
@@ -474,15 +497,19 @@ impl AcpChild {
                 )));
             }
         }
-        let new = self
+        let new: Field<NewSessionResponse> = self
             .shared
             .request(
                 "session/new",
-                json!({"cwd": self.spec.root, "mcpServers": []}),
+                NewSessionRequest {
+                    cwd: self.spec.root.clone(),
+                    mcp_servers: Vec::new(),
+                },
                 HANDSHAKE_TIMEOUT,
             )
             .await?;
-        let Some(sid) = new.get("sessionId").and_then(Value::as_str) else {
+        let new = new.valid();
+        let Some(sid) = new.and_then(|n| n.session_id.valid()) else {
             return Err(self
                 .shared
                 .with_tail("the agent's `session/new` reply has no sessionId".into()));
@@ -490,9 +517,13 @@ impl AcpChild {
         *lock(&self.shared.session_id) = Some(sid.to_string());
         if let Some(mode) = &self.spec.mode {
             let offered: Vec<&str> = new
-                .pointer("/modes/availableModes")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|m| m.get("id")?.as_str()).collect())
+                .and_then(|n| n.modes.valid())
+                .map(|m| {
+                    m.available_modes
+                        .valid()
+                        .filter_map(|m| m.id.valid().map(String::as_str))
+                        .collect()
+                })
                 .unwrap_or_default();
             if !offered.contains(&mode.as_str()) {
                 return Err(format!(
@@ -504,9 +535,12 @@ impl AcpChild {
                 ));
             }
             self.shared
-                .request(
+                .request::<IgnoredAny>(
                     "session/set_mode",
-                    json!({"sessionId": sid, "modeId": mode}),
+                    SetSessionModeRequest {
+                        session_id: sid.clone(),
+                        mode_id: mode.clone(),
+                    },
                     HANDSHAKE_TIMEOUT,
                 )
                 .await?;
@@ -570,10 +604,7 @@ impl AcpChild {
         self.interrupt();
         let sid = lock(&self.shared.session_id).clone();
         if let Some(sid) = sid {
-            let _ = self
-                .shared
-                .send(&json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": sid}}))
-                .await;
+            let _ = self.shared.send(&cancel_notice(sid)).await;
         }
         *lock(&self.shared.writer) = None;
         if let Some(p) = self.process.as_mut() {
@@ -652,7 +683,10 @@ async fn prompt_outcome(
     let (_, mut rx) = match shared
         .issue(
             "session/prompt",
-            json!({"sessionId": sid, "prompt": [{"type": "text", "text": text}]}),
+            PromptRequest {
+                session_id: sid.clone(),
+                prompt: vec![ContentBlock::text(text)],
+            },
         )
         .await
     {
@@ -677,9 +711,7 @@ async fn prompt_outcome(
         },
     };
     // D8: ask, wait the grace for the prompt's answer, then kill.
-    let _ = shared
-        .send(&json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": sid}}))
-        .await;
+    let _ = shared.send(&cancel_notice(sid)).await;
     // An answer keeps the agent for the next prompt; silence or an exit
     // (its group may still hold children) gets the kill.
     if !matches!(tokio::time::timeout(grace, &mut rx).await, Ok(Ok(_))) {
@@ -693,8 +725,12 @@ async fn prompt_outcome(
     }
 }
 
+fn cancel_notice(session_id: String) -> Notification<'static, CancelNotification> {
+    Notification::new("session/cancel", CancelNotification { session_id })
+}
+
 /// A `session/prompt` reply as the turn's outcome.
-async fn settle(shared: &Arc<Shared>, reply: Value, report_path: Option<&Path>) -> Outcome {
+async fn settle(shared: &Arc<Shared>, reply: Message, report_path: Option<&Path>) -> Outcome {
     let result = match reply_result("session/prompt", reply) {
         Ok(r) => r,
         Err(e) => {
@@ -704,17 +740,21 @@ async fn settle(shared: &Arc<Shared>, reply: Value, report_path: Option<&Path>) 
         }
     };
     let text = lock(&shared.text).clone();
-    match result.get("stopReason").and_then(Value::as_str) {
-        Some("end_turn") => {
+    let response = match Field::<PromptResponse>::from_value(result) {
+        Field::Valid(r) => r,
+        _ => PromptResponse::default(),
+    };
+    match response.stop_reason() {
+        Ok(StopReason::EndTurn) => {
             if let Some(path) = report_path {
                 record_report(shared, &text, path).await;
             }
             Outcome::Done { text }
         }
-        Some("cancelled") => Outcome::Cancelled,
-        Some("refusal") => Outcome::Refused,
-        Some("max_tokens") | Some("max_turn_requests") => Outcome::TurnLimit,
-        other => Outcome::Error {
+        Ok(StopReason::Cancelled) => Outcome::Cancelled,
+        Ok(StopReason::Refusal) => Outcome::Refused,
+        Ok(StopReason::MaxTokens | StopReason::MaxTurnRequests) => Outcome::TurnLimit,
+        Err(other) => Outcome::Error {
             message: format!("the agent ended its turn with stopReason {other:?}"),
         },
     }
@@ -824,18 +864,17 @@ async fn reader_task(read: impl AsyncRead + Send + Unpin, shared: Weak<Shared>) 
                 return;
             }
         }
-        let Ok(msg) = serde_json::from_slice::<Value>(&buf) else {
+        let Ok(Field::Valid(msg)) = serde_json::from_slice::<Field<Message>>(&buf) else {
             continue;
         };
         dispatch(&shared, msg).await;
     }
 }
 
-async fn dispatch(shared: &Arc<Shared>, msg: Value) {
-    let method = msg.get("method").and_then(Value::as_str);
-    let id = msg.get("id").cloned();
-    match (method, id) {
-        // A reply to one of ours.
+async fn dispatch(shared: &Arc<Shared>, msg: Message) {
+    let method = msg.method.valid().cloned();
+    let id = msg.id.clone();
+    match (method.as_deref(), id) {
         (None, Some(id)) => {
             if let Some(n) = id.as_u64() {
                 if let Some(tx) = lock(&shared.pending).remove(&n) {
@@ -844,28 +883,35 @@ async fn dispatch(shared: &Arc<Shared>, msg: Value) {
             }
         }
         (Some("session/update"), _) => {
-            if let Some(update) = msg.pointer("/params/update") {
-                on_update(shared, update).await;
+            let params = msg.params.unwrap_or(Value::Null);
+            if let Field::Valid(n) = Field::<SessionNotification>::from_value(params) {
+                if let Field::Valid(update) = &n.update {
+                    on_update(shared, update).await;
+                }
             }
         }
         (Some("session/request_permission"), Some(id)) => {
-            // Answered off the reader so a slow hook never stalls the pipe.
             let shared = shared.clone();
-            let params = msg.get("params").cloned().unwrap_or(Value::Null);
+            let params = msg.params.unwrap_or(Value::Null);
+            let req = match Field::<RequestPermissionRequest>::from_value(params) {
+                Field::Valid(r) => r,
+                _ => RequestPermissionRequest::default(),
+            };
             tokio::spawn(async move {
                 let d = gate::decide(
                     &shared.rules,
                     shared.hooks.as_deref(),
-                    &params,
+                    &req,
                     &shared.root,
                     shared.sandbox_enforced,
                 )
                 .await;
                 if !d.allowed {
-                    let tool_id = params
-                        .pointer("/toolCall/toolCallId")
-                        .and_then(Value::as_str)
-                        .unwrap_or("acp-denied")
+                    let tool_id = req
+                        .tool_call
+                        .valid()
+                        .and_then(|tc| tc.tool_call_id.valid())
+                        .map_or("acp-denied", String::as_str)
                         .to_string();
                     lock(&shared.open_tools).remove(&tool_id);
                     lock(&shared.denied).insert(tool_id.clone());
@@ -876,104 +922,67 @@ async fn dispatch(shared: &Arc<Shared>, msg: Value) {
                         })
                         .await;
                 }
-                let _ = shared
-                    .send(&json!({"jsonrpc": "2.0", "id": id, "result": d.reply()}))
-                    .await;
+                let _ = shared.send(&Response::new(&id, d.reply())).await;
             });
         }
-        // fs/*, terminal/*, elicitation: hotl advertised none of them.
         (Some(m), Some(id)) => {
-            let _ = shared
-                .send(&json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "error": {"code": -32601, "message": format!("hotl does not serve `{m}`")},
-                }))
-                .await;
+            let error = ErrorObject::new(-32601, format!("hotl does not serve `{m}`"));
+            let _ = shared.send(&ErrorResponse::new(&id, error)).await;
         }
         _ => {}
     }
 }
 
-fn text_of(content: Option<&Value>) -> Option<String> {
-    let c = content?;
-    match c.get("type").and_then(Value::as_str) {
-        Some("text") => c.get("text").and_then(Value::as_str).map(str::to_string),
-        _ => None,
-    }
-}
-
-async fn on_update(shared: &Arc<Shared>, u: &Value) {
-    let s = |k: &str| u.get(k).and_then(Value::as_str);
-    match s("sessionUpdate") {
-        Some("agent_message_chunk") => {
-            if let Some(t) = text_of(u.get("content")) {
-                lock(&shared.text).push_str(&t);
-                shared.emit(EngineEvent::TextDelta(t)).await;
+async fn on_update(shared: &Arc<Shared>, u: &SessionUpdate) {
+    match u {
+        SessionUpdate::AgentMessageChunk(c) => {
+            if let Some(t) = c.text() {
+                lock(&shared.text).push_str(t);
+                shared.emit(EngineEvent::TextDelta(t.to_string())).await;
             }
         }
-        Some("agent_thought_chunk") => {
-            if let Some(t) = text_of(u.get("content")) {
-                shared.emit(EngineEvent::ThinkingDelta(t)).await;
+        SessionUpdate::AgentThoughtChunk(c) => {
+            if let Some(t) = c.text() {
+                shared.emit(EngineEvent::ThinkingDelta(t.to_string())).await;
             }
         }
-        Some("tool_call") => {
-            let Some(id) = s("toolCallId").map(str::to_string) else {
+        SessionUpdate::ToolCall(tc) => {
+            let Some(id) = tc.tool_call_id.valid().cloned() else {
                 return;
             };
-            let name = tool_name(u);
-            let summary = s("title")
-                .map(str::to_string)
-                .unwrap_or_else(|| name.clone());
+            let name = tool_name(tc);
             lock(&shared.open_tools).insert(id.clone(), name.clone());
-            shared
-                .emit(EngineEvent::ToolStart {
-                    id: id.clone(),
-                    name: name.clone(),
-                    summary: hotl_types::sanitize::safe_summary(&summary),
-                    input: u.get("rawInput").cloned().unwrap_or(Value::Null),
-                })
-                .await;
-            if let Some(ok) = settled(s("status")) {
+            shared.emit(tool_start(tc, id.clone(), name.clone())).await;
+            if let Some(ok) = settled(&tc.status) {
                 lock(&shared.open_tools).remove(&id);
                 shared.emit(tool_done(id, name, ok)).await;
             }
         }
-        Some("tool_call_update") => {
-            let Some(id) = s("toolCallId").map(str::to_string) else {
+        SessionUpdate::ToolCallUpdate(tc) => {
+            let Some(id) = tc.tool_call_id.valid().cloned() else {
                 return;
             };
-            let Some(ok) = settled(s("status")) else {
+            let Some(ok) = settled(&tc.status) else {
                 return;
             };
             if lock(&shared.denied).contains(&id) {
                 return;
             }
             let opened = lock(&shared.open_tools).remove(&id);
-            let name = opened.clone().unwrap_or_else(|| tool_name(u));
-            // An update for a call never announced is a start and a settle in one.
+            let name = opened.clone().unwrap_or_else(|| tool_name(tc));
             if opened.is_none() {
-                let summary = s("title")
-                    .map(str::to_string)
-                    .unwrap_or_else(|| name.clone());
-                shared
-                    .emit(EngineEvent::ToolStart {
-                        id: id.clone(),
-                        name: name.clone(),
-                        summary: hotl_types::sanitize::safe_summary(&summary),
-                        input: u.get("rawInput").cloned().unwrap_or(Value::Null),
-                    })
-                    .await;
+                shared.emit(tool_start(tc, id.clone(), name.clone())).await;
             }
             shared.emit(tool_done(id, name, ok)).await;
         }
-        Some("usage_update") => {
-            // D6: informational only, never folded into the cap.
-            let Some(cost) = u.get("cost") else { return };
-            let amount = cost
-                .get("amount")
-                .map(|a| a.to_string())
-                .unwrap_or_default();
-            let currency = cost.get("currency").and_then(Value::as_str).unwrap_or("");
+        SessionUpdate::UsageUpdate(usage) => {
+            let cost = match &usage.cost {
+                Field::Absent => return,
+                Field::Valid(c) => c.clone(),
+                Field::Invalid => Default::default(),
+            };
+            let amount = cost.amount.map(|a| a.to_string()).unwrap_or_default();
+            let currency = cost.currency.valid().map_or("", String::as_str);
             let line = format!("spend reported by the agent: {amount} {currency}");
             let fresh = {
                 let mut last = lock(&shared.last_cost);
@@ -987,23 +996,34 @@ async fn on_update(shared: &Arc<Shared>, u: &Value) {
                     .await;
             }
         }
-        _ => {}
+        SessionUpdate::Other => {}
     }
 }
 
-fn tool_name(u: &Value) -> String {
-    u.get("name")
-        .or_else(|| u.get("kind"))
-        .and_then(Value::as_str)
-        .unwrap_or("tool")
-        .to_string()
+fn tool_name(tc: &ToolCallUpdate) -> String {
+    match &tc.name {
+        Field::Absent => tc.kind.valid(),
+        name => name.valid(),
+    }
+    .map_or("tool", String::as_str)
+    .to_string()
 }
 
-fn settled(status: Option<&str>) -> Option<bool> {
-    match status {
-        Some("completed") => Some(true),
-        Some("failed") => Some(false),
-        _ => None,
+fn tool_start(tc: &ToolCallUpdate, id: String, name: String) -> EngineEvent {
+    let summary = tc.title.valid().cloned().unwrap_or_else(|| name.clone());
+    EngineEvent::ToolStart {
+        id,
+        name,
+        summary: hotl_types::sanitize::safe_summary(&summary),
+        input: tc.raw_input.clone().unwrap_or(Value::Null),
+    }
+}
+
+fn settled(status: &Field<ToolCallStatus>) -> Option<bool> {
+    match status.valid()? {
+        ToolCallStatus::Completed => Some(true),
+        ToolCallStatus::Failed => Some(false),
+        ToolCallStatus::Pending | ToolCallStatus::InProgress => None,
     }
 }
 
@@ -1028,6 +1048,12 @@ pub mod gate {
     use hotl_tools::{Permission, Tool as _};
     use serde_json::{json, Value};
 
+    use crate::acp_types::client::{RequestPermissionRequest, ToolCallContent, ToolCallUpdate};
+    use crate::acp_types::{
+        PermissionOptionKind, RequestPermissionOutcome, RequestPermissionResponse,
+        SelectedPermissionOutcome,
+    };
+
     /// The hotl tool and input an ACP tool call is judged as.
     #[derive(Debug, Clone, PartialEq)]
     pub struct GateInput {
@@ -1047,32 +1073,45 @@ pub mod gate {
     }
 
     impl Decision {
-        pub fn reply(&self) -> Value {
-            match &self.option_id {
-                Some(id) => json!({"outcome": {"outcome": "selected", "optionId": id}}),
-                None => json!({"outcome": {"outcome": "cancelled"}}),
+        pub fn reply(&self) -> RequestPermissionResponse {
+            let outcome = match &self.option_id {
+                Some(id) => RequestPermissionOutcome::Selected(SelectedPermissionOutcome {
+                    option_id: id.clone(),
+                    meta: None,
+                }),
+                None => RequestPermissionOutcome::Cancelled,
+            };
+            RequestPermissionResponse {
+                outcome,
+                meta: None,
             }
         }
     }
 
-    fn path_of(tc: &Value) -> Option<String> {
-        tc.pointer("/locations/0/path")
-            .and_then(Value::as_str)
+    fn raw_str<'a>(tc: &'a ToolCallUpdate, key: &str) -> Option<&'a str> {
+        tc.raw_input.as_ref()?.get(key)?.as_str()
+    }
+
+    fn path_of(tc: &ToolCallUpdate) -> Option<String> {
+        tc.locations
+            .0
+            .first()
+            .and_then(|l| l.valid()?.path.valid())
             .or_else(|| {
-                tc.get("content")?
-                    .as_array()?
-                    .iter()
-                    .find(|c| c.get("type").and_then(Value::as_str) == Some("diff"))?
-                    .get("path")?
-                    .as_str()
+                let diff = tc.content.valid().find_map(|c| match c {
+                    ToolCallContent::Diff(d) => Some(d),
+                    ToolCallContent::Other => None,
+                })?;
+                diff.path.valid()
             })
-            .or_else(|| tc.pointer("/rawInput/path").and_then(Value::as_str))
-            .or_else(|| tc.pointer("/rawInput/file_path").and_then(Value::as_str))
+            .map(String::as_str)
+            .or_else(|| raw_str(tc, "path"))
+            .or_else(|| raw_str(tc, "file_path"))
             .map(str::to_string)
     }
 
-    fn command_of(tc: &Value) -> Option<String> {
-        let raw = tc.get("rawInput");
+    fn command_of(tc: &ToolCallUpdate) -> Option<String> {
+        let raw = tc.raw_input.as_ref();
         let from = |v: Option<&Value>| match v? {
             Value::String(s) => Some(s.clone()),
             Value::Array(a) => {
@@ -1083,25 +1122,23 @@ pub mod gate {
         };
         from(raw.and_then(|r| r.get("command")))
             .or_else(|| from(raw.and_then(|r| r.get("cmd"))))
-            .or_else(|| tc.get("title").and_then(Value::as_str).map(str::to_string))
+            .or_else(|| tc.title.valid().cloned())
             .filter(|c| !c.trim().is_empty())
     }
 
     /// An ACP `toolCall` as a hotl call, or `None` when it cannot be judged
     /// (an unknown kind, or one whose input is not where D3 looks).
-    pub fn translate(tc: &Value) -> Option<GateInput> {
-        let kind = tc.get("kind").and_then(Value::as_str)?;
-        let (tool, input) = match kind {
+    pub fn translate(tc: &ToolCallUpdate) -> Option<GateInput> {
+        let kind = tc.kind.valid()?;
+        let (tool, input) = match kind.as_str() {
             "execute" => ("bash", json!({"command": command_of(tc)?})),
             "edit" => ("edit", json!({"path": path_of(tc)?})),
             "delete" | "move" => ("write", json!({"path": path_of(tc)?})),
             "read" => ("read", json!({"path": path_of(tc)?})),
             "search" => ("grep", json!({"path": path_of(tc)?})),
             "fetch" => {
-                let url = tc
-                    .pointer("/rawInput/url")
-                    .and_then(Value::as_str)
-                    .or_else(|| tc.get("title").and_then(Value::as_str))
+                let url = raw_str(tc, "url")
+                    .or_else(|| tc.title.valid().map(String::as_str))
                     .filter(|u| u.starts_with("http://") || u.starts_with("https://"))?;
                 ("web_fetch", json!({"urls": [url]}))
             }
@@ -1196,43 +1233,34 @@ pub mod gate {
         }
     }
 
-    fn option(req: &Value, kind: &str) -> Option<String> {
-        req.get("options")?
-            .as_array()?
-            .iter()
-            .find(|o| o.get("kind").and_then(Value::as_str) == Some(kind))?
-            .get("optionId")?
-            .as_str()
-            .map(str::to_string)
-    }
-
     /// Decide one `session/request_permission`. Never `allow_always` or
     /// `reject_always`: hotl persists no grant (the rules.rs rule).
     pub async fn decide(
         rules: &Rules,
         hooks: Option<&dyn Hooks>,
-        req: &Value,
+        req: &RequestPermissionRequest,
         root: &Path,
         sandbox_enforced: bool,
     ) -> Decision {
-        let tc = req.get("toolCall").cloned().unwrap_or(Value::Null);
-        let g = translate(&tc);
+        let g = req.tool_call.valid().and_then(translate);
         let tool = g.as_ref().map_or("unknown", |g| g.tool).to_string();
         let allow = match &g {
             Some(g) => allowed(rules, hooks, g, root, sandbox_enforced).await,
             None => false,
         };
         if allow {
-            if let Some(id) = option(req, "allow_once") {
+            if let Some(id) = req.option(PermissionOptionKind::AllowOnce) {
                 return Decision {
-                    option_id: Some(id),
+                    option_id: Some(id.to_string()),
                     allowed: true,
                     tool,
                 };
             }
         }
         Decision {
-            option_id: option(req, "reject_once"),
+            option_id: req
+                .option(PermissionOptionKind::RejectOnce)
+                .map(str::to_string),
             allowed: false,
             tool,
         }
@@ -1242,6 +1270,7 @@ pub mod gate {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     pub(crate) type Handler = Box<dyn FnMut(&Value) -> Vec<Value> + Send>;
@@ -1796,7 +1825,9 @@ pub(crate) mod tests {
                 json!({"jsonrpc": "2.0", "id": 902, "method": "session/request_permission", "params": {"sessionId": "s1", "toolCall": {"toolCallId": "t2", "kind": "execute", "title": "ls"}, "options": [{"optionId": "aa", "name": "Always", "kind": "allow_always"}]}}),
                 json!({"jsonrpc": "2.0", "id": 903, "method": "session/request_permission", "params": req(json!({"toolCallId": "t3", "kind": "read", "locations": [{"path": inside}]}))}),
             ],
-            "session/cancel" => vec![json!({"jsonrpc": "2.0", "id": 4, "result": {"stopReason": "cancelled"}})],
+            "session/cancel" => {
+                vec![json!({"jsonrpc": "2.0", "id": 4, "result": {"stopReason": "cancelled"}})]
+            }
             _ => handshake(m).unwrap_or_default(),
         });
         let mut s = spec(&root, None);
@@ -1890,7 +1921,13 @@ pub(crate) mod tests {
         c.prompt("go".into());
         let mut events = turn(&mut c).await;
         let t0 = std::time::Instant::now();
-        while fake.seen().iter().filter(|m| m.get("method").is_none()).count() < 4 {
+        while fake
+            .seen()
+            .iter()
+            .filter(|m| m.get("method").is_none())
+            .count()
+            < 4
+        {
             assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", fake.raw());
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1910,7 +1947,9 @@ pub(crate) mod tests {
                     summary,
                     input,
                 } => Some(format!("start {id} {name} {summary} {input}")),
-                EngineEvent::ToolDone { id, name, ok, .. } => Some(format!("done {id} {name} {ok}")),
+                EngineEvent::ToolDone { id, name, ok, .. } => {
+                    Some(format!("done {id} {name} {ok}"))
+                }
                 EngineEvent::ToolDenied { id, name } => Some(format!("denied {id} {name}")),
                 _ => None,
             })
@@ -2118,8 +2157,20 @@ pub(crate) mod tests {
         json!({"sessionId": "s1", "toolCall": tool_call, "options": options()})
     }
 
+    fn ask(v: Value) -> crate::acp_types::client::RequestPermissionRequest {
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn call(v: Value) -> crate::acp_types::client::ToolCallUpdate {
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn answer(d: &gate::Decision) -> Value {
+        serde_json::to_value(d.reply()).unwrap()
+    }
+
     async fn decide_with(rules: &Rules, root: &Path, tc: Value, sandbox: bool) -> gate::Decision {
-        gate::decide(rules, None, &req(tc), root, sandbox).await
+        gate::decide(rules, None, &ask(req(tc)), root, sandbox).await
     }
 
     fn root() -> (tempfile::TempDir, PathBuf) {
@@ -2130,7 +2181,10 @@ pub(crate) mod tests {
 
     #[test]
     fn execute_requests_are_gated_as_bash_with_the_raw_command() {
-        let g = gate::translate(&json!({"kind": "execute", "title": "Run tests", "rawInput": {"command": "cargo test"}})).unwrap();
+        let g = gate::translate(&call(
+            json!({"kind": "execute", "title": "Run tests", "rawInput": {"command": "cargo test"}}),
+        ))
+        .unwrap();
         assert_eq!(
             g,
             gate::GateInput {
@@ -2138,11 +2192,12 @@ pub(crate) mod tests {
                 input: json!({"command": "cargo test"})
             }
         );
-        let g =
-            gate::translate(&json!({"kind": "execute", "rawInput": {"cmd": ["git", "status"]}}))
-                .unwrap();
+        let g = gate::translate(&call(
+            json!({"kind": "execute", "rawInput": {"cmd": ["git", "status"]}}),
+        ))
+        .unwrap();
         assert_eq!(g.input, json!({"command": "git status"}));
-        let g = gate::translate(&json!({"kind": "execute", "title": "ls -la"})).unwrap();
+        let g = gate::translate(&call(json!({"kind": "execute", "title": "ls -la"}))).unwrap();
         assert_eq!(g.input, json!({"command": "ls -la"}));
     }
 
@@ -2233,7 +2288,7 @@ pub(crate) mod tests {
             json!({"toolCallId": "t", "kind": "fetch", "title": "the docs"}),
             json!({"toolCallId": "t", "kind": "execute", "title": "  "}),
         ] {
-            assert!(gate::translate(&tc).is_none(), "{tc}");
+            assert!(gate::translate(&call(tc.clone())).is_none(), "{tc}");
             assert!(!decide_with(&rules, &root, tc, true).await.allowed);
         }
     }
@@ -2251,9 +2306,9 @@ pub(crate) mod tests {
         // Only the `always` kinds on offer: hotl cancels rather than persist.
         let tc = json!({"toolCallId": "t", "kind": "execute", "title": "ls"});
         let r = json!({"toolCall": tc, "options": [{"optionId": "aa", "kind": "allow_always"}, {"optionId": "ra", "kind": "reject_always"}]});
-        let d = gate::decide(&allow, None, &r, &root, true).await;
+        let d = gate::decide(&allow, None, &ask(r), &root, true).await;
         assert_eq!(d.option_id, None);
-        assert_eq!(d.reply(), json!({"outcome": {"outcome": "cancelled"}}));
+        assert_eq!(answer(&d), json!({"outcome": {"outcome": "cancelled"}}));
     }
 
     #[tokio::test]
@@ -2269,10 +2324,10 @@ pub(crate) mod tests {
             }
         });
         let tc = json!({"toolCallId": "t", "kind": "execute", "title": "rm -rf build"});
-        let d = gate::decide(&rules, Some(&hooks), &req(tc), &root, true).await;
+        let d = gate::decide(&rules, Some(&hooks), &ask(req(tc)), &root, true).await;
         assert_eq!((d.allowed, d.option_id.as_deref()), (false, Some("r1")));
         let tc = json!({"toolCallId": "t", "kind": "execute", "title": "ls"});
-        let d = gate::decide(&rules, Some(&hooks), &req(tc), &root, true).await;
+        let d = gate::decide(&rules, Some(&hooks), &ask(req(tc)), &root, true).await;
         assert!(d.allowed);
     }
 
@@ -2336,8 +2391,8 @@ pub(crate) mod tests {
         let (_d, root) = root();
         let tc = json!({"toolCallId": "t", "kind": "execute", "title": "ls"});
         let r = json!({"toolCall": tc, "options": [{"optionId": "a1", "kind": "allow_once"}]});
-        let d = gate::decide(&Rules::default(), None, &r, &root, true).await;
+        let d = gate::decide(&Rules::default(), None, &ask(r), &root, true).await;
         assert_eq!((d.allowed, d.option_id.clone()), (false, None));
-        assert_eq!(d.reply(), json!({"outcome": {"outcome": "cancelled"}}));
+        assert_eq!(answer(&d), json!({"outcome": {"outcome": "cancelled"}}));
     }
 }

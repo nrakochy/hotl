@@ -588,7 +588,7 @@ pub enum ToolKind {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCallStatus {
     Pending,
@@ -987,4 +987,385 @@ pub enum ElicitationContentValue {
     Number(f64),
     Boolean(bool),
     StringArray(Vec<String>),
+}
+
+pub mod client {
+    use serde::de::{DeserializeOwned, Deserializer};
+    use serde::{Deserialize, Serialize};
+    use serde_json::Value;
+
+    use super::{
+        ContentBlock, ErrorObject, Implementation, McpServer, PermissionOptionKind, StopReason,
+        ToolCallStatus,
+    };
+
+    pub const JSONRPC: &str = "2.0";
+
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub enum Field<T> {
+        #[default]
+        Absent,
+        Invalid,
+        Valid(T),
+    }
+
+    impl<T: DeserializeOwned> Field<T> {
+        pub fn from_value(v: Value) -> Self {
+            if v.is_array() {
+                return Self::Invalid;
+            }
+            match serde_json::from_value(v) {
+                Ok(t) => Self::Valid(t),
+                Err(_) => Self::Invalid,
+            }
+        }
+    }
+
+    impl<T> Field<T> {
+        pub fn valid(&self) -> Option<&T> {
+            match self {
+                Self::Valid(t) => Some(t),
+                _ => None,
+            }
+        }
+
+        pub fn is_absent(&self) -> bool {
+            matches!(self, Self::Absent)
+        }
+    }
+
+    impl<'de, T: DeserializeOwned> Deserialize<'de> for Field<T> {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            Ok(Self::from_value(Value::deserialize(d)?))
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Items<T>(pub Vec<Field<T>>);
+
+    impl<T> Default for Items<T> {
+        fn default() -> Self {
+            Self(Vec::new())
+        }
+    }
+
+    impl<T> Items<T> {
+        pub fn valid(&self) -> impl Iterator<Item = &T> {
+            self.0.iter().filter_map(Field::valid)
+        }
+    }
+
+    impl<'de, T: DeserializeOwned> Deserialize<'de> for Items<T> {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            Ok(match Value::deserialize(d)? {
+                Value::Array(a) => Self(a.into_iter().map(Field::from_value).collect()),
+                _ => Self::default(),
+            })
+        }
+    }
+
+    fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+        Value::deserialize(d).map(Some)
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct Request<'a, P> {
+        pub jsonrpc: &'static str,
+        pub id: u64,
+        pub method: &'a str,
+        pub params: P,
+    }
+
+    impl<'a, P> Request<'a, P> {
+        pub fn new(id: u64, method: &'a str, params: P) -> Self {
+            Self {
+                jsonrpc: JSONRPC,
+                id,
+                method,
+                params,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct Notification<'a, P> {
+        pub jsonrpc: &'static str,
+        pub method: &'a str,
+        pub params: P,
+    }
+
+    impl<'a, P> Notification<'a, P> {
+        pub fn new(method: &'a str, params: P) -> Self {
+            Self {
+                jsonrpc: JSONRPC,
+                method,
+                params,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct Response<'a, R> {
+        pub jsonrpc: &'static str,
+        pub id: &'a Value,
+        pub result: R,
+    }
+
+    impl<'a, R> Response<'a, R> {
+        pub fn new(id: &'a Value, result: R) -> Self {
+            Self {
+                jsonrpc: JSONRPC,
+                id,
+                result,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct ErrorResponse<'a> {
+        pub jsonrpc: &'static str,
+        pub id: &'a Value,
+        pub error: ErrorObject,
+    }
+
+    impl<'a> ErrorResponse<'a> {
+        pub fn new(id: &'a Value, error: ErrorObject) -> Self {
+            Self {
+                jsonrpc: JSONRPC,
+                id,
+                error,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct Message {
+        #[serde(default)]
+        pub method: Field<String>,
+        #[serde(default, deserialize_with = "present")]
+        pub id: Option<Value>,
+        #[serde(default)]
+        pub params: Option<Value>,
+        #[serde(default)]
+        pub result: Option<Value>,
+        #[serde(default)]
+        pub error: Field<ResponseError>,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct ResponseError {
+        #[serde(default)]
+        pub message: Field<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct InitializeRequest {
+        pub protocol_version: u64,
+        pub client_capabilities: ClientCapabilities,
+        pub client_info: Implementation,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct ClientCapabilities {
+        pub fs: FileSystemCapability,
+        pub terminal: bool,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FileSystemCapability {
+        pub read_text_file: bool,
+        pub write_text_file: bool,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct InitializeResponse {
+        #[serde(default)]
+        pub protocol_version: Field<u64>,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct NewSessionRequest {
+        pub cwd: std::path::PathBuf,
+        pub mcp_servers: Vec<McpServer>,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct NewSessionResponse {
+        #[serde(default)]
+        pub session_id: Field<String>,
+        #[serde(default)]
+        pub modes: Field<SessionModeState>,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct SessionModeState {
+        #[serde(default)]
+        pub available_modes: Items<SessionMode>,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct SessionMode {
+        #[serde(default)]
+        pub id: Field<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct SetSessionModeRequest {
+        pub session_id: String,
+        pub mode_id: String,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct PromptRequest {
+        pub session_id: String,
+        pub prompt: Vec<ContentBlock>,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct PromptResponse {
+        #[serde(default)]
+        pub stop_reason: Field<String>,
+    }
+
+    impl PromptResponse {
+        pub fn stop_reason(&self) -> Result<StopReason, Option<&str>> {
+            let raw = self.stop_reason.valid().map(String::as_str);
+            match raw.map(|r| Field::<StopReason>::from_value(Value::from(r))) {
+                Some(Field::Valid(reason)) => Ok(reason),
+                _ => Err(raw),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct CancelNotification {
+        pub session_id: String,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct SessionNotification {
+        #[serde(default)]
+        pub update: Field<SessionUpdate>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(tag = "sessionUpdate", rename_all = "snake_case")]
+    pub enum SessionUpdate {
+        AgentMessageChunk(ContentChunk),
+        AgentThoughtChunk(ContentChunk),
+        ToolCall(ToolCallUpdate),
+        ToolCallUpdate(ToolCallUpdate),
+        UsageUpdate(UsageUpdate),
+        #[serde(other)]
+        Other,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct ContentChunk {
+        #[serde(default)]
+        pub content: Field<ContentBlock>,
+    }
+
+    impl ContentChunk {
+        pub fn text(&self) -> Option<&str> {
+            match self.content.valid()? {
+                ContentBlock::Text(t) => Some(&t.text),
+                _ => None,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ToolCallUpdate {
+        #[serde(default)]
+        pub tool_call_id: Field<String>,
+        #[serde(default)]
+        pub name: Field<String>,
+        #[serde(default)]
+        pub kind: Field<String>,
+        #[serde(default)]
+        pub title: Field<String>,
+        #[serde(default)]
+        pub status: Field<ToolCallStatus>,
+        #[serde(default)]
+        pub raw_input: Option<Value>,
+        #[serde(default)]
+        pub locations: Items<ToolCallLocation>,
+        #[serde(default)]
+        pub content: Items<ToolCallContent>,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct ToolCallLocation {
+        #[serde(default)]
+        pub path: Field<String>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum ToolCallContent {
+        Diff(DiffContent),
+        #[serde(other)]
+        Other,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct DiffContent {
+        #[serde(default)]
+        pub path: Field<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct UsageUpdate {
+        #[serde(default)]
+        pub cost: Field<Cost>,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct Cost {
+        #[serde(default, deserialize_with = "present")]
+        pub amount: Option<Value>,
+        #[serde(default)]
+        pub currency: Field<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct RequestPermissionRequest {
+        #[serde(default)]
+        pub tool_call: Field<ToolCallUpdate>,
+        #[serde(default)]
+        pub options: Items<PermissionOption>,
+    }
+
+    impl RequestPermissionRequest {
+        pub fn option(&self, kind: PermissionOptionKind) -> Option<&str> {
+            self.options
+                .valid()
+                .find(|o| o.kind.valid() == Some(&kind))?
+                .option_id
+                .valid()
+                .map(String::as_str)
+        }
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct PermissionOption {
+        #[serde(default)]
+        pub option_id: Field<String>,
+        #[serde(default)]
+        pub kind: Field<PermissionOptionKind>,
+    }
 }
