@@ -27,8 +27,9 @@ use crate::acp_types::{
     LoadSessionResponse, McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse, Notice,
     NoticeSeverity, PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionRequest,
     ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionInfo,
-    SessionInfoUpdate, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, TurnErrorData, UsageUpdate,
+    SessionInfoUpdate, SessionNotification, SessionRowMeta, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    TurnErrorData, UsageUpdate,
 };
 
 pub const ACP_PROTOCOL_VERSION: u16 = 1;
@@ -1433,10 +1434,17 @@ async fn handle_request(
                 },
             };
             let dir = info.sessions_dir.clone();
-            let listed =
-                tokio::task::spawn_blocking(move || list_sessions(dir.as_deref(), &request))
-                    .await
-                    .unwrap_or_else(|e| Err(format!("session/list failed: {e}")));
+            let ext = client_caps.ext;
+            let listed = tokio::task::spawn_blocking(move || {
+                let live = if ext {
+                    crate::run_status::read_live()
+                } else {
+                    Vec::new()
+                };
+                list_sessions(dir.as_deref(), &request, ext, &live)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("session/list failed: {e}")));
             match listed {
                 Ok(list) => reply_ok(writer, id, to_json(&list)).await,
                 Err(e) => reply_err(writer, id, codes::INVALID_PARAMS, &e).await,
@@ -2644,6 +2652,12 @@ fn canonical(path: &std::path::Path) -> String {
         .to_string()
 }
 
+struct Chains<'a> {
+    rows: std::collections::HashSet<&'a str>,
+    row_of: HashMap<&'a str, &'a str>,
+    root_of: HashMap<&'a str, &'a str>,
+}
+
 fn chain_rows(
     logs: &[(
         String,
@@ -2651,39 +2665,74 @@ fn chain_rows(
         std::time::SystemTime,
         hotl_store::LogHead,
     )],
-) -> std::collections::HashSet<&str> {
+) -> Chains<'_> {
     let present: std::collections::HashSet<&str> =
         logs.iter().map(|(id, ..)| id.as_str()).collect();
     let mut newest: HashMap<&str, &str> = HashMap::new();
+    let mut continues: HashMap<&str, &str> = HashMap::new();
     let mut roots = Vec::new();
     for (id, .., head) in logs {
         match head.parent.as_deref() {
             Some(parent) if !head.fork && present.contains(parent) => {
                 let listable = if head.cwd.is_some() { id.as_str() } else { "" };
                 newest.entry(parent).or_insert(listable);
+                continues.insert(id.as_str(), parent);
             }
             _ => roots.push(id.as_str()),
         }
     }
-    roots
-        .into_iter()
-        .map(|root| {
-            let mut seen = std::collections::HashSet::from([root]);
-            let mut row = root;
-            for _ in 0..hotl_store::LINEAGE_DEPTH_CAP {
-                match newest.get(row) {
-                    Some(next) if !next.is_empty() && seen.insert(next) => row = next,
-                    _ => break,
-                }
+    let mut chains = Chains {
+        rows: std::collections::HashSet::new(),
+        row_of: HashMap::new(),
+        root_of: HashMap::new(),
+    };
+    let mut row_of_root: HashMap<&str, &str> = HashMap::new();
+    for root in roots {
+        let mut seen = std::collections::HashSet::from([root]);
+        let mut row = root;
+        for _ in 0..hotl_store::LINEAGE_DEPTH_CAP {
+            match newest.get(row) {
+                Some(next) if !next.is_empty() && seen.insert(next) => row = next,
+                _ => break,
             }
-            row
-        })
-        .collect()
+        }
+        chains.rows.insert(row);
+        chains.root_of.insert(row, root);
+        row_of_root.insert(root, row);
+    }
+    for &id in &present {
+        let mut at = id;
+        for _ in 0..hotl_store::LINEAGE_DEPTH_CAP {
+            match continues.get(at) {
+                Some(parent) => at = parent,
+                None => break,
+            }
+        }
+        if let Some(&row) = row_of_root.get(at) {
+            chains.row_of.insert(id, row);
+        }
+    }
+    chains
 }
 
-fn list_sessions(
+fn forked_from<'a>(
+    chains: &Chains<'a>,
+    heads: &HashMap<&str, &'a hotl_store::LogHead>,
+    row: &str,
+) -> Option<&'a str> {
+    let head = heads.get(chains.root_of.get(row)?)?;
+    if !head.fork {
+        return None;
+    }
+    let source = *chains.row_of.get(head.parent.as_deref()?)?;
+    chains.rows.contains(source).then_some(source)
+}
+
+pub(crate) fn list_sessions(
     dir: Option<&std::path::Path>,
     request: &ListSessionsRequest,
+    ext: bool,
+    live: &[crate::run_status::RunStatus],
 ) -> Result<ListSessionsResponse, String> {
     let start = match request.cursor.as_deref() {
         None => 0,
@@ -2701,20 +2750,39 @@ fn list_sessions(
             Some((session_id, path, modified, head))
         })
         .collect();
-    let rows = chain_rows(&logs);
+    let chains = chain_rows(&logs);
+    let heads: HashMap<&str, &hotl_store::LogHead> = logs
+        .iter()
+        .map(|(id, .., head)| (id.as_str(), head))
+        .collect();
     let mut sessions: Vec<SessionInfo> = logs
         .iter()
-        .filter(|(session_id, ..)| rows.contains(session_id.as_str()))
+        .filter(|(session_id, ..)| chains.rows.contains(session_id.as_str()))
         .filter_map(|(session_id, path, modified, head)| {
             let cwd = head.cwd.clone()?;
             if want.as_ref().is_some_and(|w| *w != cwd) {
                 return None;
             }
+            let meta = ext
+                .then(|| SessionRowMeta {
+                    parent_id: forked_from(&chains, &heads, session_id).map(str::to_string),
+                    run_id: live
+                        .iter()
+                        .find(|status| status.session_id == *session_id)
+                        .map(|status| status.run_id.clone()),
+                })
+                .filter(|row| *row != SessionRowMeta::default())
+                .map(|row| {
+                    let mut m = serde_json::Map::new();
+                    m.insert(META_SESSION.into(), to_json(&row));
+                    m
+                });
             Some(SessionInfo {
                 session_id: session_id.clone(),
                 cwd: cwd.into(),
                 title: hotl_store::session_label_from_tail(path).or_else(|| head.label.clone()),
                 updated_at: Some(crate::acp_map::rfc3339(*modified)),
+                meta,
             })
         })
         .skip(start)
@@ -4303,6 +4371,7 @@ pub struct WorktreeInfo {
 }
 
 pub const META_OPEN: &str = "hotl.dev/open";
+pub const META_SESSION: &str = "hotl.dev/session";
 pub const META_MODEL: &str = "hotl.dev/model";
 
 /// Absent keys mean something different from `null` (probe failed / never

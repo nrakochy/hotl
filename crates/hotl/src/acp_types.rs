@@ -325,6 +325,19 @@ pub struct SessionInfo {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRowMeta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "The listed session this one was forked from")]
+    pub parent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "The run id of the live hotl serve process holding this session")]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]

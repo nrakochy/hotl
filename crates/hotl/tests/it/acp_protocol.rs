@@ -6689,6 +6689,138 @@ async fn sibling_continuations_list_as_one_row_the_one_a_load_resolves_to() {
     assert_eq!(ids, [newer.as_str()], "{listed}");
 }
 
+async fn listed_rows(dir: &std::path::Path, init: Value) -> Vec<Value> {
+    let (client, server) = tokio::io::duplex(256 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    let info = acp::ServerInfo {
+        sessions_dir: Some(dir.to_path_buf()),
+        fallback_models: Vec::new(),
+        ..server_info()
+    };
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), info, None));
+    let (cread, mut w) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":init}),
+    )
+    .await;
+    read_until_id(&mut lines, 1).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/list","params":{"cwd":"/work/chain"}}),
+    )
+    .await;
+    let listed = read_until_id(&mut lines, 2).await;
+    listed["result"]["sessions"].as_array().unwrap().clone()
+}
+
+fn row<'a>(rows: &'a [Value], id: &str) -> &'a Value {
+    rows.iter()
+        .find(|r| r["sessionId"] == id)
+        .unwrap_or_else(|| panic!("no row {id} in {rows:?}"))
+}
+
+#[tokio::test]
+async fn list_rows_name_the_row_they_were_forked_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = logged_turn(dir.path(), None, false, "first ask", 1_700_000_000);
+    let fork = logged_turn(dir.path(), Some(&source), true, "forked", 1_700_000_100);
+    let rows = listed_rows(dir.path(), init_params()).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        row(&rows, &fork)["_meta"]["hotl.dev/session"],
+        json!({"parentId": source}),
+        "{rows:?}"
+    );
+    assert!(row(&rows, &source).get("_meta").is_none(), "{rows:?}");
+}
+
+#[tokio::test]
+async fn a_fork_of_a_reopened_session_names_the_chain_s_current_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = logged_turn(dir.path(), None, false, "first ask", 1_700_000_000);
+    let a2 = logged_turn(dir.path(), Some(&a), false, "reopened", 1_700_000_100);
+    let fork = logged_turn(dir.path(), Some(&a), true, "forked", 1_700_000_200);
+    let rows = listed_rows(dir.path(), init_params()).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        row(&rows, &fork)["_meta"]["hotl.dev/session"]["parentId"],
+        a2.as_str(),
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_reopened_session_has_no_parent_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = logged_turn(dir.path(), None, false, "first ask", 1_700_000_000);
+    let a2 = logged_turn(dir.path(), Some(&a), false, "reopened", 1_700_000_100);
+    let rows = listed_rows(dir.path(), init_params()).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["sessionId"], a2.as_str());
+    assert!(rows[0].get("_meta").is_none(), "{rows:?}");
+}
+
+#[tokio::test]
+async fn a_fork_that_was_itself_reopened_keeps_its_parent_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = logged_turn(dir.path(), None, false, "first ask", 1_700_000_000);
+    let fork = logged_turn(dir.path(), Some(&source), true, "forked", 1_700_000_100);
+    let reopened = logged_turn(dir.path(), Some(&fork), false, "reopened", 1_700_000_200);
+    let rows = listed_rows(dir.path(), init_params()).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        row(&rows, &reopened)["_meta"]["hotl.dev/session"]["parentId"],
+        source.as_str(),
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_rows_carry_no_hotl_key_for_a_plain_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = logged_turn(dir.path(), None, false, "first ask", 1_700_000_000);
+    logged_turn(dir.path(), Some(&source), true, "forked", 1_700_000_100);
+    let rows = listed_rows(dir.path(), json!({"protocolVersion": 1})).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for r in &rows {
+        assert!(r.get("_meta").is_none(), "{r}");
+    }
+}
+
+#[test]
+fn a_row_held_by_a_live_run_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let held = logged_turn(dir.path(), None, false, "held", 1_700_000_000);
+    let idle = logged_turn(dir.path(), None, false, "idle", 1_700_000_100);
+    let live = [crate::run_status::RunStatus {
+        run_id: "bg-7".into(),
+        session_id: held.clone(),
+        pid: std::process::id(),
+        cwd: std::env::temp_dir(),
+        name: None,
+        version: "0".into(),
+        started_at_ms: 1,
+        state: crate::run_status::RunState::Idle,
+    }];
+    let request = acp_types::ListSessionsRequest::default();
+    let listed = acp::list_sessions(Some(dir.path()), &request, true, &live).unwrap();
+    let meta_of = |id: &str| {
+        serde_json::to_value(listed.sessions.iter().find(|s| s.session_id == id).unwrap())
+            .unwrap()
+            .get("_meta")
+            .cloned()
+    };
+    assert_eq!(
+        meta_of(&held),
+        Some(json!({"hotl.dev/session": {"runId": "bg-7"}}))
+    );
+    assert_eq!(meta_of(&idle), None);
+    let plain = acp::list_sessions(Some(dir.path()), &request, false, &live).unwrap();
+    assert!(plain.sessions.iter().all(|s| s.meta.is_none()));
+}
+
 #[tokio::test]
 async fn a_synthetic_ask_is_announced_then_settled_by_its_answer() {
     for (option, status) in [("allow", "completed"), ("deny", "failed")] {
