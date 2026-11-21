@@ -14,6 +14,7 @@ mod context_estimate;
 mod continuation;
 mod denials;
 mod digest_files;
+mod drop_queued;
 mod durability;
 mod effort;
 mod egress_ask;

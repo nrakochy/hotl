@@ -1183,8 +1183,10 @@ pub enum SessionCmd {
         text: String,
         images: Vec<hotl_types::UserImage>,
         tag: Option<u64>,
+        epoch: u64,
     },
     DropQueued {
+        upto: u64,
         reply: oneshot::Sender<Vec<u64>>,
     },
     /// A prompt whose committed item carries a provenance tag (T2: schema
@@ -1504,9 +1506,37 @@ impl Meter {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct CancelEpochs {
+    requested: std::sync::atomic::AtomicU64,
+    handled: std::sync::atomic::AtomicU64,
+}
+
+impl CancelEpochs {
+    fn requested(&self) -> u64 {
+        self.requested.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn request(&self) -> u64 {
+        self.requested
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
+    }
+
+    pub(crate) fn handle(&self, upto: u64) {
+        self.handled
+            .fetch_max(upto, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn holds(&self, epoch: u64) -> bool {
+        let requested = self.requested();
+        epoch < requested && self.handled.load(std::sync::atomic::Ordering::SeqCst) < requested
+    }
+}
+
 pub struct SessionHandle {
     meter: Meter,
-    prompts_held: Arc<std::sync::atomic::AtomicBool>,
+    cancels: Arc<CancelEpochs>,
     cmd: mpsc::Sender<SessionCmd>,
     pub events: mpsc::Receiver<EngineEvent>,
     current_turn: Arc<Mutex<CancellationToken>>,
@@ -1551,6 +1581,7 @@ impl SessionHandle {
                 text,
                 images,
                 tag: None,
+                epoch: self.cancels.requested(),
             })
             .await;
     }
@@ -1567,16 +1598,16 @@ impl SessionHandle {
                 text,
                 images,
                 tag: Some(tag),
+                epoch: self.cancels.requested(),
             })
             .await;
     }
 
     pub fn drop_queued(&self) -> oneshot::Receiver<Vec<u64>> {
-        self.prompts_held
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let upto = self.cancels.request();
         let (reply, rx) = oneshot::channel();
         if let Err(mpsc::error::TrySendError::Full(cmd)) =
-            self.cmd.try_send(SessionCmd::DropQueued { reply })
+            self.cmd.try_send(SessionCmd::DropQueued { upto, reply })
         {
             let cmd_tx = self.cmd.clone();
             tokio::spawn(async move {
@@ -1941,7 +1972,7 @@ pub fn spawn_session_with_channels(
     // `Sender` and never gives it up.
     let (head_tx, head_rx) = actor::head_channel();
     let meter = Meter::default();
-    let prompts_held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancels = Arc::new(CancelEpochs::default());
     // The actor gets only a weak sender: strong senders are the handle and
     // any in-flight turn task, so dropping the handle lets the command
     // channel close and the actor task exit instead of leaking.
@@ -1954,11 +1985,11 @@ pub fn spawn_session_with_channels(
         notifications.clone(),
         head_tx,
         meter.clone(),
-        prompts_held.clone(),
+        cancels.clone(),
     ));
     SessionHandle {
         meter,
-        prompts_held,
+        cancels,
         cmd: cmd_tx,
         events: event_rx,
         current_turn,

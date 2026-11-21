@@ -675,7 +675,7 @@ pub(crate) struct SharedDeps {
     /// cannot run forever, and a fresh turn is not a fresh budget.
     tool_calls: AtomicU64,
     pub(crate) meter: crate::Meter,
-    pub(crate) prompts_held: Arc<AtomicBool>,
+    pub(crate) cancels: Arc<crate::CancelEpochs>,
     /// Which budget thresholds have already been announced (bit 0 = 50%,
     /// 1 = 80%, 2 = 100%), so each fires once per session.
     budget_notices: AtomicU8,
@@ -850,7 +850,7 @@ impl SharedDeps {
             effort_pinned,
             tool_calls,
             meter: crate::Meter::default(),
-            prompts_held: Arc::new(AtomicBool::new(false)),
+            cancels: Arc::new(crate::CancelEpochs::default()),
             budget_notices,
             keepalive_rejected,
             last_batch_verified,
@@ -1232,7 +1232,7 @@ pub(crate) async fn run(
     notifications: crate::hooks::NotificationDrain,
     head_tx: tokio::sync::watch::Sender<Arc<ProjectionHead>>,
     meter: crate::Meter,
-    prompts_held: Arc<AtomicBool>,
+    cancels: Arc<crate::CancelEpochs>,
 ) {
     // Resumed history is repaired on the way in, both for a steer that landed
     // mid-batch (`pair_tool_results`) and for a crash that persisted an
@@ -1339,7 +1339,7 @@ pub(crate) async fn run(
     ));
     let (mut shared, mut log) = SharedDeps::new(deps, notifications, head_rx, jobs, children);
     shared.meter = meter;
-    shared.prompts_held = prompts_held;
+    shared.cancels = cancels;
     let shared = Arc::new(shared);
     // Usage carried across compaction respawns within one logical turn.
     let mut carry_usage = TokenUsage::default();
@@ -1422,7 +1422,12 @@ pub(crate) async fn run(
             }
         };
         match cmd {
-            SessionCmd::Prompt { text, images, tag } => {
+            SessionCmd::Prompt {
+                text,
+                images,
+                tag,
+                epoch,
+            } => {
                 running = admit_prompt(
                     &shared,
                     &mut log,
@@ -1436,6 +1441,7 @@ pub(crate) async fn run(
                         synthetic: None,
                         output_format: None,
                         tags: tag.into_iter().collect(),
+                        epoch,
                     },
                     &cmd_tx,
                     &events,
@@ -1462,6 +1468,7 @@ pub(crate) async fn run(
                         synthetic: Some(synthetic),
                         output_format,
                         tags: Vec::new(),
+                        epoch: 0,
                     },
                     &cmd_tx,
                     &events,
@@ -1470,16 +1477,16 @@ pub(crate) async fn run(
                 )
                 .await;
             }
-            SessionCmd::DropQueued { reply } => {
+            SessionCmd::DropQueued { upto, reply } => {
                 let mut dropped = Vec::new();
                 queue.retain(|q| {
-                    if q.tags.is_empty() {
+                    if q.tags.is_empty() || q.epoch >= upto {
                         return true;
                     }
                     dropped.extend(q.tags.iter().copied());
                     false
                 });
-                shared.prompts_held.store(false, Ordering::SeqCst);
+                shared.cancels.handle(upto);
                 let _ = reply.send(dropped);
             }
             SessionCmd::Continue => {
@@ -1552,6 +1559,7 @@ pub(crate) async fn run(
                             synthetic: Some(synthetic),
                             output_format: None,
                             tags: Vec::new(),
+                            epoch: 0,
                         },
                         &cmd_tx,
                         &events,
@@ -2820,6 +2828,7 @@ async fn on_turn_finished(
                                     synthetic: Some(SyntheticReason::GoalGuidance),
                                     output_format: None,
                                     tags: Vec::new(),
+                                    epoch: 0,
                                 },
                                 ctx.cmd_tx,
                                 ctx.events,
@@ -3096,14 +3105,10 @@ async fn end_turn(
         )
         .await;
     }
-    let next = if shared.prompts_held.load(Ordering::SeqCst) {
-        queue
-            .iter()
-            .position(|q| q.tags.is_empty())
-            .and_then(|i| queue.remove(i))
-    } else {
-        queue.pop_front()
-    };
+    let next = queue
+        .iter()
+        .position(|q| q.tags.is_empty() || !shared.cancels.holds(q.epoch))
+        .and_then(|i| queue.remove(i));
     match next {
         Some(next) => {
             start_turn(
@@ -4075,6 +4080,17 @@ struct QueuedPrompt {
     /// 0073 D8: the retry turn's schema; a folded prompt inherits the entry's.
     output_format: Option<Arc<serde_json::Value>>,
     tags: Vec<u64>,
+    epoch: u64,
+}
+
+impl QueuedPrompt {
+    fn folds_with(&self, other: &QueuedPrompt) -> bool {
+        match (self.tags.is_empty(), other.tags.is_empty()) {
+            (true, true) => true,
+            (false, false) => self.epoch == other.epoch,
+            _ => false,
+        }
+    }
 }
 
 /// Start a turn now, or queue the prompt if one is running (one-at-a-time
@@ -4095,19 +4111,24 @@ async fn admit_prompt(
 ) -> bool {
     if running {
         let full = queue.len() >= QUEUE_MAX;
-        match queue.back_mut() {
-            // Past the cap the prompt is folded into the last pending entry
-            // rather than pushed: memory is bounded and nothing vanishes
-            // without the model being told. It *was* absorbed, so the event is
-            // still `PromptQueued`. A folded prompt inherits the tag of the
-            // entry it joins — only reachable past QUEUE_MAX pending prompts,
-            // where provenance has already stopped being per-prompt. Its
-            // images ride along up to `HELD_IMAGE_B64_MAX`; the overflow is
+        let joins = if full {
+            queue.iter_mut().rev().find(|q| q.folds_with(&prompt))
+        } else {
+            None
+        };
+        match joins {
+            // Past the cap the prompt is folded into the newest pending entry
+            // of its kind rather than pushed: memory is bounded and nothing
+            // vanishes without the model being told. It *was* absorbed, so the
+            // event is still `PromptQueued`. A folded prompt inherits the tag
+            // of the entry it joins — only reachable past QUEUE_MAX pending
+            // prompts, where provenance has already stopped being per-prompt.
+            // Its images ride along up to `HELD_IMAGE_B64_MAX`; the overflow is
             // dropped and disclosed. Two folded prompts may then both say
             // `[Image #1]`, and renumbering would mean parsing message text,
             // which types-layer policy forbids — accepted on this
             // pathological path (text folding already truncates far worse).
-            Some(last) if full && (prompt.tags.is_empty() || !last.tags.is_empty()) => {
+            Some(last) => {
                 // Images first, disclosure on the INCOMING text, one fold_into
                 // call — keeps FOLD_MARK the literal tail so it never stacks.
                 let dropped = fold_images(&mut last.images, prompt.images, HELD_IMAGE_B64_MAX);
@@ -4120,7 +4141,7 @@ async fn admit_prompt(
                 fold_into(&mut last.text, &text, HELD_BYTES_MAX);
                 last.tags.extend(prompt.tags);
             }
-            _ => queue.push_back(prompt),
+            None => queue.push_back(prompt),
         }
         let _ = events.send(EngineEvent::PromptQueued).await;
         return true;
