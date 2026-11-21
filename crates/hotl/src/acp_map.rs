@@ -531,7 +531,7 @@ pub fn outgoing(event: &EngineEvent, caps: &ClientCaps, calls: &mut ToolCalls) -
     if matches!(event, EngineEvent::ModelChanged { .. }) {
         return None;
     }
-    let frame = crate::wire::update_frame(event)?;
+    let frame = wire_frame(crate::wire::update_frame(event)?);
     match standard(event, caps, calls) {
         Some(mut update) => {
             if caps.ext {
@@ -541,6 +541,23 @@ pub fn outgoing(event: &EngineEvent, caps: &ClientCaps, calls: &mut ToolCalls) -
         }
         None => caps.ext.then_some(Outgoing::Ext(frame)),
     }
+}
+
+fn wire_frame(mut frame: Value) -> Value {
+    let key = match frame.get("type").and_then(Value::as_str) {
+        Some(
+            "tool_start" | "tool_done" | "tool_queued" | "tool_progress" | "tool_denied"
+            | "tool_auto_allowed" | "tool_flagged",
+        ) => "id",
+        Some("child_tool" | "child_text") => "parent_id",
+        _ => return frame,
+    };
+    if let Some(slot) = frame.get_mut(key) {
+        if let Some(id) = slot.as_str() {
+            *slot = Value::String(wire_id(id));
+        }
+    }
+    frame
 }
 
 fn standard(
@@ -672,7 +689,7 @@ fn standard(
             if !calls.open.contains_key(parent_id) {
                 return None;
             }
-            let meta = ext_meta(META_CHILD, crate::wire::update_frame(event)?)?;
+            let meta = ext_meta(META_CHILD, wire_frame(crate::wire::update_frame(event)?))?;
             SessionUpdate::ToolCallUpdate(ToolCallUpdate {
                 tool_call_id: wire_id(parent_id),
                 fields: ToolCallUpdateFields::default(),
@@ -2451,6 +2468,52 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(update["toolCallId"], "tool-egress-1", "{update}");
+    }
+
+    #[test]
+    fn the_frame_meta_names_a_tool_call_by_its_wire_id() {
+        let mut calls = ToolCalls::default();
+        let start = EngineEvent::ToolStart {
+            id: "loop-1".into(),
+            name: "spawn".into(),
+            summary: "spawn".into(),
+            input: json!({"prompt": "look"}),
+        };
+        let started = update_json(outgoing(&start, &opted_in(), &mut calls));
+        assert_eq!(started["toolCallId"], "tool-loop-1");
+        assert_eq!(
+            started["_meta"][META_FRAME]["id"], "tool-loop-1",
+            "{started}"
+        );
+        let child_tool = EngineEvent::ChildTool {
+            parent_id: "loop-1".into(),
+            id: "egress-2".into(),
+            name: "read".into(),
+            summary: "read x".into(),
+            ok: None,
+            tokens: None,
+        };
+        let child = update_json(outgoing(&child_tool, &opted_in(), &mut calls));
+        assert_eq!(child["toolCallId"], "tool-loop-1");
+        assert_eq!(
+            child["_meta"][META_CHILD]["parent_id"], "tool-loop-1",
+            "{child}"
+        );
+        assert_eq!(child["_meta"][META_CHILD]["id"], "egress-2", "{child}");
+        let done = EngineEvent::ToolDone {
+            id: "loop-1".into(),
+            name: "spawn".into(),
+            ok: true,
+            output: "ok".into(),
+            before: None,
+            lines: 1,
+            bytes: 2,
+        };
+        let finished = update_json(outgoing(&done, &opted_in(), &mut calls));
+        assert_eq!(
+            finished["_meta"][META_FRAME]["id"], "tool-loop-1",
+            "{finished}"
+        );
     }
 
     #[test]
