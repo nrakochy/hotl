@@ -25,6 +25,7 @@ _hotl() {
   esac
   local sub="${COMP_WORDS[1]}"
   case "$sub" in
+    bg) COMPREPLY=( $(compgen -W "--resume -n --name -w --worktree" -- "$cur") ); return ;;
     gc) COMPREPLY=( $(compgen -W "--dry-run --days --keep" -- "$cur") ); return ;;
     export) COMPREPLY=( $(compgen -W "--md --html $(_hotl_sessions)" -- "$cur") ); return ;;
     stats) COMPREPLY=( $(compgen -W "--days --json" -- "$cur") ); return ;;

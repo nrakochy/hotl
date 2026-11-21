@@ -350,6 +350,7 @@ fn help_text() -> &'static str {
          \x20                   --resume <id|name|@last> continues a session from a script (hotl resume <s> -p works too)\n  \
          hotl --goal \"<cond>\"   headless goal loop with the condition as the prompt (no -p needed)\n  \
          hotl bg [prompt]     background a session (detached socket server; attach later)\n  \
+         \x20                   --resume <session-id> reopens a stored session in the background (not with -w)\n  \
          hotl attach [id]     connect to a backgrounded session (bare: list them)\n  \
          \x20                   --json lists the live sessions as JSON, one line each\n  \
          hotl approve <id>    answer what a backgrounded session is waiting on\n  \
@@ -821,6 +822,7 @@ mod tests {
                 "01ABC"
             ]
         );
+        assert!(super::help_text().contains("--resume <session-id> reopens a stored session"));
         let fresh = crate::bg::serve_command(
             std::path::Path::new("/bin/hotl"),
             "bg-2",

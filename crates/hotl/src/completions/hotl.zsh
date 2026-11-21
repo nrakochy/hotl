@@ -62,6 +62,7 @@ _hotl() {
       ;;
     args)
       case $line[1] in
+        bg) _arguments '--resume[reopen a stored session]:session:_hotl_sessions' '(-n --name)'{-n,--name}'[name the session]:name:' '(-w --worktree)'{-w,--worktree}'[work in a git worktree]::branch:' ;;
         gc) _arguments '--dry-run[show what would be deleted]' '--days[age cutoff]:days:' '--keep[sessions to keep]:count:' ;;
         export) _arguments '1:session:_hotl_sessions' '--md[Markdown]' '--html[HTML page]' ;;
         stats) _arguments '--days[only the last N days]:days:' '--json[JSON output]' ;;
