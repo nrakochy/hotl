@@ -64,11 +64,11 @@ your program wants to own the process and choose its run id.
 
 | Flag | What it does |
 |---|---|
-| `--id <id>` | The run id. Without it, hotl uses `bg-` and its own process number. Pick an id no running session uses. If one does, hotl exits with code 1, but only after it has opened the session and written a new session log for it. |
+| `--id <id>` | The run id. Without it, hotl uses `bg-` and its own process number. Pick an id no running session uses. If one does, hotl exits with code 1 and says ``session `<id>` is already running``. It checks this first, so nothing is opened or written. |
 | `--prompt <text>` | A first prompt to start on. |
 | `--name <name>` | A session name. |
 | `--worktree <name>` | Run in a new git worktree, a second checkout of your repository in its own folder (`@derived` lets hotl pick the name). |
-| `--resume <session-id>` | Reopen a stored session (see [Restart after a crash](#restart-after-a-crash)). |
+| `--resume <session-id>` | Reopen a stored session (see [Restart after a crash](#restart-after-a-crash)). With no id after it, hotl exits with code 2. |
 
 A served session waits for a program to connect. When it needs a permission
 answer or approval for outgoing network access, it holds the ask for a program
@@ -157,8 +157,9 @@ session was holding arrives next:
 | A question from the model | `elicitation/create` if your program offered `clientCapabilities.elicitation.form`, else `_hotl/session/request_question` if it opted in. A program with neither never receives the question. |
 
 Earlier history is not sent again. `session/new` and `session/load` are
-refused on the socket, because the session already exists. `session/close`, or closing the
-connection, leaves the session running. `_hotl/session/stop` ends it.
+refused on the socket, because the session already exists. `session/close`,
+or closing the connection, leaves the session running. `_hotl/session/stop`
+ends it.
 
 ## Ask for a JSON answer
 
@@ -293,8 +294,10 @@ hotl bg --resume <session-id> [prompt]
 hotl serve --id <id> --resume <session-id> [--prompt <text>]
 ```
 
-`<session-id>` is the word right after `--resume`, whatever it is. Put the
-id there, not another flag or the prompt. It must be the full id of a stored
+`<session-id>` is the word right after `--resume`. Put the id there, not the
+prompt: any word that does not start with `-` is taken as the id. If nothing
+follows `--resume`, or the next word starts with `-`, hotl exits with code 2
+and says `--resume needs a session id`. It must be the full id of a stored
 session, such as the `sessionId` from `hotl attach --json`. Names, id
 prefixes and `@last` are not accepted here. If the session was reopened
 before, hotl continues from its newest log.
@@ -327,11 +330,14 @@ Refusals:
 | No stored session with that id | `hotl serve` exits with code 1: ``no stored session `<id>` `` |
 | The session is already running in another process | `hotl serve` exits with code 1: `session <id> is already running as <runId> — attach to it instead` |
 | `--resume` together with `--worktree` (or `-w`, which only `hotl bg` reads) | Exits with code 2. A resumed session reopens its own worktree. |
-| `--id` names a session that is already running | `hotl serve` exits with code 1, but only after it has opened the stored session and written a new log for it. That empty log then counts as the session's newest, so a later `--resume` of the same session no longer sees that it is running. Pick a fresh `--id`. |
+| `--resume` with no id after it, or with a word starting with `-` after it | Exits with code 2: `--resume needs a session id` |
+| `--id` is a run id that is already live | `hotl serve` exits with code 1: ``session `<id>` is already running``. Nothing is opened or written. Pick a fresh `--id`. |
 
-`hotl bg` prints its start message before the background process opens the
-session. If the resume is refused, the reason is in the log file `hotl bg`
-printed, and the session never appears in `hotl attach --json`.
+`hotl bg` checks the two code 2 cases itself and prints the message before
+it starts anything. For the other cases, `hotl bg` prints its start message
+before the background process opens the session. If the resume is refused,
+the reason is in the log file `hotl bg` printed, and the session never
+appears in `hotl attach --json`.
 
 ## Pace your launches
 
@@ -380,14 +386,20 @@ slowed down.
 - **No shared rate limit.** Each process retries on its own. Pacing many
   sessions is your program's job.
 - **No lock on two resumes at once.** The already-running check reads the
-  status files once, before the session opens. Two `--resume` commands for
-  the same session started at the same moment can both pass it and continue
-  the session into two separate logs. Do not launch two.
+  status files once, before the session opens. A resumed process writes its
+  own status file only after it has loaded its settings, the model
+  connection and its tools, which can take seconds. A second `--resume` of
+  the same session started anywhere in that time passes the check too, and
+  the session continues into two separate logs. Wait until the first one
+  shows up in `hotl attach --json` before you start another.
 - **The current todo list and goal are not sent on connect.** A program that
   connects to a served session learns them only when one of them changes.
-- **`--resume` takes the next word.** It reads whatever follows it as the
-  session id, even another flag or your prompt. With nothing after it, it is
-  ignored and a fresh session starts instead.
+- **`--resume` takes the next word.** It reads the word that follows it as
+  the session id when that word does not start with `-`, even if it is your
+  prompt. `hotl bg --resume "fix it"` takes `fix it` as the id. No stored
+  session has that id, so the background process stops with
+  ``no stored session `fix it` `` in the log file `hotl bg` printed. With
+  nothing after it, or a flag after it, hotl exits with code 2.
 - **`hotl fleet` is not this.** The `hotl fleet` command is reserved and does
   nothing yet. A program that manages many sessions is a separate project
   that drives hotl as described on this page.
