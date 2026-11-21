@@ -63,6 +63,8 @@ pub(crate) struct Writer {
     sink: Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>,
     client: Arc<std::sync::atomic::AtomicU64>,
     seen: Option<u64>,
+    connection: Arc<std::sync::atomic::AtomicU64>,
+    seen_connection: Option<u64>,
 }
 
 impl Writer {
@@ -71,7 +73,24 @@ impl Writer {
             sink: Arc::new(Mutex::new(Box::new(sink))),
             client: Arc::default(),
             seen: None,
+            connection: Arc::default(),
+            seen_connection: None,
         }
+    }
+
+    fn linked(&self) -> Writer {
+        Writer {
+            seen: None,
+            seen_connection: Some(self.connection.load(std::sync::atomic::Ordering::SeqCst)),
+            ..self.clone()
+        }
+    }
+
+    fn stale(&self) -> bool {
+        let moved = |seen: Option<u64>, now: &std::sync::atomic::AtomicU64| {
+            seen.is_some_and(|seen| seen != now.load(std::sync::atomic::Ordering::SeqCst))
+        };
+        moved(self.seen, &self.client) || moved(self.seen_connection, &self.connection)
     }
 
     fn stamped(&self) -> Writer {
@@ -90,9 +109,17 @@ impl Writer {
             .unwrap_or_else(|| self.client.load(std::sync::atomic::Ordering::SeqCst))
     }
 
-    pub(crate) async fn next_client(&self, change: impl FnOnce()) {
+    pub(crate) async fn next_client(&self, new_connection: bool, change: impl FnOnce()) {
         let _held = self.sink.lock().await;
         change();
+        self.reinitialized();
+        if new_connection {
+            self.connection
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn reinitialized(&self) {
         self.client
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
@@ -349,6 +376,29 @@ struct PromptBook {
 fn lock_prompts(book: &PendingPrompt) -> std::sync::MutexGuard<'_, PromptBook> {
     book.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn answer_dropped(
+    writer: &Writer,
+    book: PendingPrompt,
+    dropped: oneshot::Receiver<Vec<u64>>,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let writer = writer.linked();
+    async move {
+        let Ok(tags) = dropped.await else {
+            return;
+        };
+        for tag in tags {
+            let id = {
+                let mut b = lock_prompts(&book);
+                b.cancelled.remove(&tag);
+                b.ids.remove(&tag)
+            };
+            if let Some(id) = id {
+                reply_cancelled(&writer, id).await;
+            }
+        }
+    }
 }
 
 async fn reply_cancelled(writer: &Writer, id: Value) {
@@ -1756,7 +1806,7 @@ async fn handle_request(
             // Off the read loop: the owner's answer to the confirm arrives
             // through this very loop, so awaiting here would deadlock it.
             let pending = state.handle.remember(note);
-            let writer = writer.stamped();
+            let writer = writer.linked();
             tokio::spawn(async move {
                 match pending.await {
                     Ok(()) => reply_ok(&writer, id, to_json(&Ack { ok: true })).await,
@@ -1900,23 +1950,7 @@ async fn handle_request(
             {
                 let _ = slot.reply.send(hotl_tools::net::EgressDecision::NoAnswer);
             }
-            let book = state.book.clone();
-            let writer = writer.stamped();
-            tokio::spawn(async move {
-                let Ok(tags) = dropped.await else {
-                    return;
-                };
-                for tag in tags {
-                    let id = {
-                        let mut b = lock_prompts(&book);
-                        b.cancelled.remove(&tag);
-                        b.ids.remove(&tag)
-                    };
-                    if let Some(id) = id {
-                        reply_cancelled(&writer, id).await;
-                    }
-                }
-            });
+            tokio::spawn(answer_dropped(writer, state.book.clone(), dropped));
         }
         // Re-read `config.toml` and rebuild the engine behind this connection,
         // then re-open the live session through the ordinary resume path so its
@@ -3099,6 +3133,7 @@ async fn drain_events(
                     }),
                 )
                 .await;
+                let replies = writer.linked();
                 let answered: Vec<(u64, Value, bool)> = {
                     let mut book = lock_prompts(&pending_prompt);
                     let tags = std::mem::take(&mut book.current);
@@ -3115,7 +3150,7 @@ async fn drain_events(
                     mispredictions: misses,
                 };
                 for (tag, id, cancelled) in answered {
-                    reply_turn_end(&out, id, &outcome, cancelled, ext, turn.clone()).await;
+                    reply_turn_end(&replies, id, &outcome, cancelled, ext, turn.clone()).await;
                     let mut book = lock_prompts(&pending_prompt);
                     book.ids.remove(&tag);
                     book.cancelled.remove(&tag);
@@ -3224,10 +3259,7 @@ pub(crate) async fn send(writer: &Writer, msg: &Value) {
     let mut line = msg.to_string();
     line.push('\n');
     let mut w = writer.sink.lock().await;
-    if writer
-        .seen
-        .is_some_and(|seen| seen != writer.client.load(std::sync::atomic::Ordering::SeqCst))
-    {
+    if writer.stale() {
         return;
     }
     let _ = w.write_all(line.as_bytes()).await;
@@ -3296,6 +3328,72 @@ mod drain_tests {
         let mut buf = String::new();
         read.read_to_string(&mut buf).await.unwrap();
         buf.lines().map(str::to_string).collect()
+    }
+
+    #[tokio::test]
+    async fn a_prompt_reply_in_flight_survives_a_new_initialize_on_the_same_connection() {
+        let book = PendingPrompt::default();
+        lock_prompts(&book).ids.insert(1, json!(7));
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(EngineEvent::TurnStarted { tags: vec![1] })
+            .await
+            .unwrap();
+        tx.send(turn_done()).await.unwrap();
+        drop(tx);
+        let (write, mut read) = tokio::io::duplex(1 << 20);
+        let writer = Writer::new(write);
+        let held = writer.sink.lock().await;
+        let drain = tokio::spawn(drain_events(
+            rx,
+            writer.clone(),
+            Pending::default(),
+            PendingQuestions::default(),
+            PendingEgress::default(),
+            book,
+            "acp-test".into(),
+            0,
+            "test-model".into(),
+            test_config(),
+            EngineLink {
+                meter: hotl_engine::Meter::default(),
+            },
+            Arc::new(std::sync::Mutex::new(ClientCaps::default())),
+            crate::acp_map::ToolCalls::default(),
+        ));
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        writer.reinitialized();
+        drop(held);
+        drain.await.unwrap();
+        drop(writer);
+        let mut buf = String::new();
+        read.read_to_string(&mut buf).await.unwrap();
+        assert!(
+            buf.lines()
+                .any(|l| l.contains("\"id\":7") && l.contains("end_turn")),
+            "{buf}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_replies_for_dropped_prompts_survive_a_new_initialize() {
+        let book = PendingPrompt::default();
+        lock_prompts(&book).ids.insert(2, json!(8));
+        let (write, mut read) = tokio::io::duplex(1 << 20);
+        let writer = Writer::new(write);
+        let (dropped_tx, dropped) = oneshot::channel();
+        let answering = answer_dropped(&writer, book, dropped);
+        writer.reinitialized();
+        dropped_tx.send(vec![2]).unwrap();
+        answering.await;
+        drop(writer);
+        let mut buf = String::new();
+        read.read_to_string(&mut buf).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(buf.trim()).unwrap(),
+            json!({"jsonrpc": "2.0", "id": 8, "result": {"stopReason": "cancelled"}})
+        );
     }
 
     fn turn_done() -> EngineEvent {

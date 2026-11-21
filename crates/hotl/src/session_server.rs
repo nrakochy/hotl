@@ -384,7 +384,7 @@ async fn switch_client(
     let adopt = connection.caps_adopter();
     let writer = connection.writer().clone();
     writer
-        .next_client(|| {
+        .next_client(write.is_some(), || {
             adopt();
             if let Some(write) = write {
                 slot.replace(write);
