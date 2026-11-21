@@ -6619,6 +6619,35 @@ async fn list_keeps_a_chain_whose_continuation_names_no_cwd() {
 }
 
 #[tokio::test]
+async fn sibling_continuations_list_as_one_row_the_one_a_load_resolves_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let s1 = logged_turn(dir.path(), None, false, "first ask", 1_700_000_000);
+    let older = logged_turn(dir.path(), Some(&s1), false, "one resume", 1_700_000_100);
+    let newer = logged_turn(dir.path(), Some(&s1), false, "another", 1_700_000_200);
+    logged_turn(dir.path(), Some(&older), false, "on", 1_700_000_300);
+    assert_eq!(hotl_store::newest_continuation(dir.path(), &s1), newer);
+    let info = acp::ServerInfo {
+        sessions_dir: Some(dir.path().to_path_buf()),
+        fallback_models: Vec::new(),
+        ..server_info()
+    };
+    let (mut w, mut lines) = connect(scripted_factory(), info).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/list","params":{"cwd":"/work/chain"}}),
+    )
+    .await;
+    let listed = read_until_id(&mut lines, 2).await;
+    let ids: Vec<&str> = listed["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["sessionId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [newer.as_str()], "{listed}");
+}
+
+#[tokio::test]
 async fn a_synthetic_ask_is_announced_then_settled_by_its_answer() {
     for (option, status) in [("allow", "completed"), ("deny", "failed")] {
         let dir = tempfile::tempdir().unwrap();

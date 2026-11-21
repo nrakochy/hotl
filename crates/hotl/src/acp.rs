@@ -2427,6 +2427,43 @@ fn canonical(path: &std::path::Path) -> String {
         .to_string()
 }
 
+fn chain_rows(
+    logs: &[(
+        String,
+        std::path::PathBuf,
+        std::time::SystemTime,
+        hotl_store::LogHead,
+    )],
+) -> std::collections::HashSet<&str> {
+    let present: std::collections::HashSet<&str> =
+        logs.iter().map(|(id, ..)| id.as_str()).collect();
+    let mut newest: HashMap<&str, &str> = HashMap::new();
+    let mut roots = Vec::new();
+    for (id, .., head) in logs {
+        match head.parent.as_deref() {
+            Some(parent) if !head.fork && present.contains(parent) => {
+                let listable = if head.cwd.is_some() { id.as_str() } else { "" };
+                newest.entry(parent).or_insert(listable);
+            }
+            _ => roots.push(id.as_str()),
+        }
+    }
+    roots
+        .into_iter()
+        .map(|root| {
+            let mut seen = std::collections::HashSet::from([root]);
+            let mut row = root;
+            for _ in 0..hotl_store::LINEAGE_DEPTH_CAP {
+                match newest.get(row) {
+                    Some(next) if !next.is_empty() && seen.insert(next) => row = next,
+                    _ => break,
+                }
+            }
+            row
+        })
+        .collect()
+}
+
 fn list_sessions(
     dir: Option<&std::path::Path>,
     request: &ListSessionsRequest,
@@ -2447,14 +2484,10 @@ fn list_sessions(
             Some((session_id, path, modified, head))
         })
         .collect();
-    let continued: std::collections::HashSet<&str> = logs
-        .iter()
-        .filter(|(.., head)| !head.fork && head.cwd.is_some())
-        .filter_map(|(.., head)| head.parent.as_deref())
-        .collect();
+    let rows = chain_rows(&logs);
     let mut sessions: Vec<SessionInfo> = logs
         .iter()
-        .filter(|(session_id, ..)| !continued.contains(session_id.as_str()))
+        .filter(|(session_id, ..)| rows.contains(session_id.as_str()))
         .filter_map(|(session_id, path, modified, head)| {
             let cwd = head.cwd.clone()?;
             if want.as_ref().is_some_and(|w| *w != cwd) {
