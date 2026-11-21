@@ -5577,6 +5577,48 @@ async fn cancel_gets_no_reply_and_the_prompt_answers_cancelled() {
 }
 
 #[tokio::test]
+async fn an_ask_nobody_answers_is_denied_when_its_turn_ends_without_a_cancel() {
+    let (provider, sid, mut w, mut lines) = open_with(
+        vec![
+            ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
+            ScriptedProvider::text_reply("unused"),
+        ],
+        init_params(),
+    )
+    .await;
+    send(
+        &mut w,
+        prompt_msg(3, &sid, json!([{"type": "text", "text": "go"}])),
+    )
+    .await;
+    let ask = next_matching_raw(&mut lines, |m| m["method"] == "session/request_permission").await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/close","params":{"sessionId": sid}}),
+    )
+    .await;
+    let got = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stop_reasons_for(&mut lines, 3..4),
+    )
+    .await
+    .expect("the turn ended and its prompt was answered");
+    assert_eq!(got[&3], "cancelled");
+    read_until_id(&mut lines, 4).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":ask["id"].clone(),"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        provider.request_count(),
+        1,
+        "the unanswered ask resolved as a denial and the tool never ran"
+    );
+}
+
+#[tokio::test]
 async fn cancel_denies_an_open_permission_request() {
     let (_provider, sid, mut w, mut lines) = open_with(
         vec![

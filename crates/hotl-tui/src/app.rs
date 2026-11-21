@@ -7535,6 +7535,27 @@ mod tests {
     // never a reachability check to begin with.
 
     #[test]
+    fn an_unframed_notice_reaches_the_transcript() {
+        let mut s = State::test_default();
+        let line = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s", "update": {"sessionUpdate": "notice", "severity": "warning", "title": "1 parked ask(s) expired"}}});
+        let decoded = crate::client::decode(&line).expect("a notice decodes");
+        let msg = crate::client::translate(
+            decoded,
+            &mut std::collections::VecDeque::new(),
+            &mut std::collections::VecDeque::new(),
+            &mut std::collections::VecDeque::new(),
+            &mut std::collections::VecDeque::new(),
+        )
+        .expect("a notice is a message for the app");
+        update(&mut s, msg);
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if &**text == "1 parked ask(s) expired"),
+            "{:?}",
+            s.transcript.last()
+        );
+    }
+
+    #[test]
     fn compacted_and_retrying_become_notices() {
         let mut s = State::test_default();
         upd(&mut s, json!({"type":"compacted","degraded":false}));
