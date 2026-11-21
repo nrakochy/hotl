@@ -275,7 +275,9 @@ fn main() {
                 eprintln!("hotl serve: {msg}");
                 std::process::exit(code);
             }
-            std::process::exit(block_on(agent::serve_main(id, prompt, name, worktree)));
+            std::process::exit(block_on(agent::serve_main(
+                id, prompt, name, worktree, resume,
+            )));
         }
         Some("setup") => {
             let force = args.iter().any(|a| a == "--force" || a == "-f");

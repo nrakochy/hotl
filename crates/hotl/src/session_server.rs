@@ -22,7 +22,7 @@ use hotl_engine::SessionHandle;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, BufReader};
 
-use crate::acp::{ClientCaps, Connection, Hosted, RunSignal};
+use crate::acp::{ClientCaps, Connection, Hosted, HostedOpen, RunSignal};
 use crate::acp_ext::codes;
 use crate::run_status::{RunState, RunStatus};
 use hotl_platform::{Ipc as _, IpcListener as _};
@@ -64,6 +64,7 @@ pub struct Served {
     pub prompt: Option<String>,
     pub ask_expiry: std::time::Duration,
     pub client_write_timeout: std::time::Duration,
+    pub open: Option<HostedOpen>,
 }
 
 pub const CLIENT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -368,6 +369,7 @@ pub async fn serve_on(listener: Listener, served: Served, token: String) {
             effort: served.effort,
             caps: detached_caps(),
             signal: Some(signal.clone()),
+            open: served.open,
         },
     );
     if let (Some(p), Some(handle)) = (served.prompt, connection.handle()) {
@@ -694,6 +696,7 @@ mod tests {
             prompt: None,
             ask_expiry,
             client_write_timeout: CLIENT_WRITE_TIMEOUT,
+            open: None,
         }
     }
 

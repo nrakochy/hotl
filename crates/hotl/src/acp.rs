@@ -742,6 +742,15 @@ pub(crate) struct Hosted {
     pub(crate) effort: Option<String>,
     pub(crate) caps: ClientCaps,
     pub(crate) signal: Option<RunSignal>,
+    pub(crate) open: Option<HostedOpen>,
+}
+
+pub struct HostedOpen {
+    pub mode: String,
+    pub plan: bool,
+    pub model: Option<String>,
+    pub store_id: String,
+    pub lease: Option<hotl_store::worktree::Leased>,
 }
 
 impl Connection {
@@ -772,9 +781,25 @@ impl Connection {
         let mut connection = Connection::new(writer, factory, info, None);
         connection.client_caps = hosted.caps;
         connection.run_signal = hosted.signal.clone();
+        let (mode, plan, model, store_id, lease) = match hosted.open {
+            Some(open) => (
+                open.mode,
+                open.plan,
+                open.model.unwrap_or_else(|| connection.info.model.clone()),
+                open.store_id,
+                open.lease,
+            ),
+            None => (
+                connection.info.default_mode.clone(),
+                connection.info.default_plan,
+                connection.info.model.clone(),
+                hosted.session_id.clone(),
+                None,
+            ),
+        };
         let config = Arc::new(std::sync::Mutex::new(crate::acp_map::ConfigState {
-            model: connection.info.model.clone(),
-            plan: connection.info.default_plan,
+            model,
+            plan,
             effort: hosted.effort.unwrap_or_else(|| "default".into()),
             models: std::iter::once(connection.info.model.clone())
                 .chain(connection.info.fallback_models.iter().cloned())
@@ -787,8 +812,8 @@ impl Connection {
             config,
             hosted.caps,
             crate::acp_map::ToolCalls::rooted(&hosted.cwd),
-            hosted.session_id.clone(),
             hosted.session_id,
+            store_id,
             connection.writer.clone(),
             connection.pending.clone(),
             connection.pending_questions.clone(),
@@ -797,7 +822,8 @@ impl Connection {
             connection.info.model.clone(),
             hosted.signal,
         );
-        state.mode = connection.info.default_mode.clone();
+        state._lease = lease;
+        state.mode = mode;
         state.cwd = hosted.cwd;
         state.release_drain();
         connection.session = Some(state);
@@ -2549,7 +2575,7 @@ fn parse_fork(method: &str, msg: &Value) -> Result<Opening, String> {
 
 const SESSION_LIST_PAGE: usize = 50;
 
-fn stored_session(dir: &std::path::Path, session_id: &str) -> bool {
+pub(crate) fn stored_session(dir: &std::path::Path, session_id: &str) -> bool {
     !session_id.is_empty()
         && session_id.chars().all(|c| c.is_ascii_alphanumeric())
         && dir.join(format!("{session_id}.jsonl")).is_file()

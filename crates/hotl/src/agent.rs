@@ -1222,54 +1222,85 @@ pub async fn serve_main(
     prompt: Option<String>,
     name: Option<String>,
     worktree: Option<crate::tui::WorktreeArg>,
+    resume: Option<String>,
 ) -> i32 {
+    let live = match resume {
+        Some(_) => crate::run_status::read_live(),
+        None => Vec::new(),
+    };
+    let (mut served, _lease) = match serve_open(&id, name, worktree, resume.as_deref(), &live).await
+    {
+        Ok(opened) => opened,
+        Err((code, msg)) => {
+            eprintln!("hotl serve: {msg}");
+            return code;
+        }
+    };
+    if resume.is_some() {
+        served.handle.continue_turn().await;
+    }
+    served.prompt = prompt;
+    crate::session_server::serve(served).await
+}
+
+pub(crate) fn running_as(
+    session_id: &str,
+    live: &[crate::run_status::RunStatus],
+) -> Option<String> {
+    live.iter()
+        .find(|status| status.session_id == session_id)
+        .map(|status| status.run_id.clone())
+}
+
+async fn serve_open(
+    id: &str,
+    name: Option<String>,
+    worktree: Option<crate::tui::WorktreeArg>,
+    resume: Option<&str>,
+    live: &[crate::run_status::RunStatus],
+) -> Result<
+    (
+        crate::session_server::Served,
+        Option<hotl_store::worktree::Leased>,
+    ),
+    (i32, String),
+> {
+    if let Some(asked) = resume {
+        return serve_resumed(id, name, asked, live)
+            .await
+            .map(|served| (served, None));
+    }
     // `-w name` names the session like the console does (0065 T4).
     let name = name.or_else(|| crate::tui::implied_name(worktree.as_ref()));
     if let Some(arg) = &worktree {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         if let Err(e) = hotl_store::worktree::SessionWorktree::precheck(&cwd, arg.name()) {
-            eprintln!("hotl serve: {e}");
-            return 2;
+            return Err((2, e.to_string()));
         }
     }
     let secrets = EnvSecrets;
     let cfg = crate::config::Config::load(&config_dir());
-    let (provider, model, key_source) = match select_provider(&cfg, &secrets) {
-        Ok(triple) => triple,
-        Err(msg) => {
-            eprintln!("hotl serve: {msg}");
-            return 1;
-        }
-    };
+    let (provider, model, key_source) = select_provider(&cfg, &secrets).map_err(|msg| (1, msg))?;
     // Read before `cfg` moves into the scaffold: a parked ask nobody answers
     // must not hold a detached session open forever (0059 T5).
     let ask_expiry = cfg.behavior.ask_expiry();
-    let mut scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
-        Ok(s) => s,
-        Err(msg) => {
-            eprintln!("hotl: {msg}");
-            return 1;
-        }
-    };
+    let mut scaffold = scaffold(provider, model, &secrets, cfg, key_source)
+        .await
+        .map_err(|msg| (1, msg))?;
     print_warnings(&scaffold.warnings);
     // §Task 4 (mode-derived 1h TTL): attach-at-any-time is `hotl bg`'s design
     // center — sessions are long-lived and human-supervised, same rationale
     // as `acp_factory`. Set AFTER `scaffold()` returns; see that comment for
     // why children stay unaffected.
     scaffold.config.cache_ttl = CacheTtl::OneHour;
-    let mut log = match SessionLog::create(
+    let mut log = SessionLog::create(
         &sessions_dir(),
         &scaffold.model,
         None,
         scaffold.masker(),
         scaffold.clock.now_ms(),
-    ) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("hotl serve: could not create session log: {e}");
-            return 1;
-        }
-    };
+    )
+    .map_err(|e| (1, format!("could not create session log: {e}")))?;
     if let Some(n) = &name {
         let _ = log.append(
             &hotl_types::EntryPayload::Rename { name: n.clone() },
@@ -1279,13 +1310,10 @@ pub async fn serve_main(
     let session_id = log.session_id.clone();
     // The worktree (0065): held across `serve` so a clean `/stop` unlocks.
     let opened = match &worktree {
-        Some(arg) => match open_worktree(&scaffold.cwd, scaffold.clock.now_ms(), &mut log, arg) {
-            Ok(o) => Some(o),
-            Err(e) => {
-                eprintln!("hotl serve: {e}");
-                return 1;
-            }
-        },
+        Some(arg) => Some(
+            open_worktree(&scaffold.cwd, scaffold.clock.now_ms(), &mut log, arg)
+                .map_err(|e| (1, e))?,
+        ),
         None => None,
     };
     let root = opened.as_ref().map(|o| o.lease.path().to_path_buf());
@@ -1298,7 +1326,7 @@ pub async fn serve_main(
     );
     print_warnings(&notices);
     record_fresh_seed(&mut log, &initial_items, scaffold.clock.now_ms());
-    let _lease = opened.map(|o| o.lease);
+    let lease = opened.map(|o| o.lease);
     let handle = spawn_interactive_session(
         scaffold.registry_rooted(root.as_deref()),
         Some(scaffold.spawn_registration(session_id.clone(), root.as_deref())),
@@ -1324,19 +1352,81 @@ pub async fn serve_main(
     let mut warnings = Vec::new();
     let info = acp_server_info(&scaffold, true, &mut warnings);
     print_warnings(&warnings);
-    crate::session_server::serve(crate::session_server::Served {
-        session_id: id,
-        stored_session_id: session_id,
+    Ok((
+        crate::session_server::Served {
+            session_id: id.to_string(),
+            stored_session_id: session_id,
+            name,
+            info,
+            cwd: root.unwrap_or_else(|| scaffold.cwd.clone()),
+            effort: scaffold.config.effort.map(|e| e.as_str().to_string()),
+            handle,
+            prompt: None,
+            ask_expiry,
+            client_write_timeout: crate::session_server::CLIENT_WRITE_TIMEOUT,
+            open: None,
+        },
+        lease,
+    ))
+}
+
+async fn serve_resumed(
+    id: &str,
+    name: Option<String>,
+    asked: &str,
+    live: &[crate::run_status::RunStatus],
+) -> Result<crate::session_server::Served, (i32, String)> {
+    let dir = sessions_dir();
+    if !crate::acp::stored_session(&dir, asked) {
+        return Err((1, format!("no stored session `{asked}`")));
+    }
+    let session_id = hotl_store::newest_continuation(&dir, asked);
+    if let Some(run_id) = running_as(&session_id, live) {
+        return Err((
+            1,
+            format!("session {asked} is already running as {run_id} — attach to it instead"),
+        ));
+    }
+    let (mut factory, info, warnings) = build_acp_strict().await.map_err(|e| (1, e))?;
+    print_warnings(&warnings);
+    let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let open = factory(crate::acp::SessionSpec::Load {
+        session_id,
         name,
-        info,
-        cwd: root.unwrap_or_else(|| scaffold.cwd.clone()),
-        effort: scaffold.config.effort.map(|e| e.as_str().to_string()),
-        handle,
-        prompt,
-        ask_expiry,
-        client_write_timeout: crate::session_server::CLIENT_WRITE_TIMEOUT,
+        no_worktree: false,
+        cwd: here.clone(),
+        replay: false,
+        mcp: Vec::new(),
     })
-    .await
+    .map_err(|e| (1, e))?;
+    print_warnings(&open.warnings);
+    print_warnings(&open.mcp_warnings);
+    let effort = Some(crate::acp_map::effort_wire(&open));
+    let cwd = open
+        .worktree
+        .as_ref()
+        .map_or(here, |(path, _)| PathBuf::from(path));
+    Ok(crate::session_server::Served {
+        session_id: id.to_string(),
+        stored_session_id: open.session_id.clone(),
+        name: open.name,
+        info,
+        cwd,
+        effort,
+        handle: open.handle,
+        prompt: None,
+        ask_expiry: crate::config::Config::load(&config_dir())
+            .behavior
+            .ask_expiry(),
+        client_write_timeout: crate::session_server::CLIENT_WRITE_TIMEOUT,
+        open: Some(crate::acp::HostedOpen {
+            mode: open.mode,
+            plan: open.plan,
+            model: open.model,
+            store_id: open.session_id,
+            lease: open.lease,
+        }),
+    })
 }
 
 /// The deps every session shares (provider, registry-with-spawn, rules, hooks,
@@ -10343,5 +10433,206 @@ mod worktree_session_tests {
         assert_eq!(notices, vec![note]);
         assert!(worktree_note(repo.path(), wt.path(), "x", Some("x"))
             .ends_with("(recreated from branch x)"));
+    }
+}
+
+#[cfg(test)]
+mod serve_open_tests {
+    use super::*;
+    use crate::run_status::{RunState, RunStatus};
+    use hotl_types::{EntryPayload, Item};
+
+    struct Isolated {
+        _data: tempfile::TempDir,
+        _config: tempfile::TempDir,
+    }
+
+    fn isolated() -> Isolated {
+        let data = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_DATA_HOME", data.path());
+        std::env::set_var("XDG_CONFIG_HOME", config.path());
+        std::env::set_var("HOTL_MODEL", DEFAULT_MODEL);
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+        std::env::set_var("HOTL_PROVIDER_BASE_URL", "http://127.0.0.1:9");
+        std::env::set_var("HOTL_SANDBOX", "off");
+        for key in [
+            "HOTL_ANTHROPIC_BASE_URL",
+            "HOTL_PROVIDER_AUTH",
+            "HOTL_PERMISSIONS",
+            "HOTL_PLAN",
+        ] {
+            std::env::remove_var(key);
+        }
+        Isolated {
+            _data: data,
+            _config: config,
+        }
+    }
+
+    fn stored_with_one_turn(extra: &[EntryPayload]) -> String {
+        let dir = sessions_dir();
+        let mut log = SessionLog::create(&dir, DEFAULT_MODEL, None, Masker::empty(), 1).unwrap();
+        for item in [
+            Item::User {
+                text: "what is in the box".into(),
+                synthetic: None,
+                images: Vec::new(),
+            },
+            Item::Assistant {
+                blocks: vec![serde_json::json!({"type":"text","text":"a stored answer"})],
+                model: None,
+            },
+        ] {
+            log.append(&EntryPayload::Item { item }, 2).unwrap();
+        }
+        for payload in extra {
+            log.append(payload, 3).unwrap();
+        }
+        log.session_id.clone()
+    }
+
+    fn logs_in_store() -> usize {
+        hotl_store::list_sessions(&sessions_dir()).len()
+    }
+
+    fn live(run_id: &str, session_id: String) -> RunStatus {
+        RunStatus {
+            run_id: run_id.into(),
+            session_id,
+            pid: std::process::id(),
+            cwd: std::env::temp_dir(),
+            name: None,
+            version: env!("CARGO_PKG_VERSION").into(),
+            started_at_ms: 1,
+            state: RunState::Idle,
+        }
+    }
+
+    fn hosting(served: crate::session_server::Served) -> crate::acp::Connection {
+        crate::acp::Connection::hosting(
+            crate::acp::Writer::new(tokio::io::sink()),
+            served.info,
+            crate::acp::Hosted {
+                handle: served.handle,
+                session_id: served.session_id,
+                cwd: served.cwd,
+                effort: served.effort,
+                caps: crate::session_server::detached_caps(),
+                signal: None,
+                open: served.open,
+            },
+        )
+    }
+
+    fn plan_option(result: &serde_json::Value) -> serde_json::Value {
+        result["configOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == "plan")
+            .unwrap()["currentValue"]
+            .clone()
+    }
+
+    async fn opened(resume: Option<&str>) -> crate::session_server::Served {
+        match serve_open("run-1", None, None, resume, &[]).await {
+            Ok((served, _lease)) => served,
+            Err((code, msg)) => panic!("{code}: {msg}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resumed_serve_continues_the_stored_session() {
+        let _home = isolated();
+        let old = stored_with_one_turn(&[]);
+        let served = opened(Some(&old)).await;
+        assert_ne!(served.stored_session_id, old);
+        let head = hotl_store::log_head(
+            &sessions_dir().join(format!("{}.jsonl", served.stored_session_id)),
+        )
+        .unwrap();
+        assert_eq!(head.parent.as_deref(), Some(old.as_str()));
+        let mut head = served.handle.head();
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            head.wait_for(|h| !h.snapshot().durable.is_empty()),
+        )
+        .await
+        .expect("the session publishes its starting history")
+        .unwrap()
+        .snapshot();
+        assert!(
+            snapshot.durable.iter().any(|item| matches!(
+                item.as_ref(),
+                Item::Assistant { blocks, .. }
+                    if blocks.iter().any(|b| b["text"] == "a stored answer")
+            )),
+            "{:?}",
+            snapshot.durable
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_of_an_unknown_id_fails_with_exit_1() {
+        let _home = isolated();
+        let before = logs_in_store();
+        let err = serve_open("run-1", None, None, Some("01NOSUCHSESSION"), &[])
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err, (1, "no stored session `01NOSUCHSESSION`".to_string()));
+        assert_eq!(logs_in_store(), before);
+    }
+
+    #[tokio::test]
+    async fn a_resume_of_a_session_running_elsewhere_is_refused() {
+        let _home = isolated();
+        let old = stored_with_one_turn(&[]);
+        let first = opened(Some(&old)).await;
+        let newest = hotl_store::newest_continuation(&sessions_dir(), &old);
+        assert_eq!(newest, first.stored_session_id);
+        let before = logs_in_store();
+        let err = serve_open("run-2", None, None, Some(&old), &[live("bg-42", newest)])
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            err,
+            (
+                1,
+                format!("session {old} is already running as bg-42 — attach to it instead")
+            )
+        );
+        assert_eq!(logs_in_store(), before, "a refusal writes no new log");
+    }
+
+    #[tokio::test]
+    async fn a_resumed_serve_reports_the_mode_and_plan_it_inherited() {
+        let _home = isolated();
+        let old = stored_with_one_turn(&[
+            EntryPayload::ModeSet {
+                mode: "dontask".into(),
+            },
+            EntryPayload::PlanSet { on: true },
+        ]);
+        let served = opened(Some(&old)).await;
+        assert_ne!(served.info.default_mode, "dontask");
+        assert!(!served.info.default_plan);
+        let result = hosting(served).resume_result();
+        assert_eq!(result["modes"]["currentModeId"], "dontask");
+        assert_eq!(plan_option(&result), true);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_serve_still_reports_the_defaults() {
+        let _home = isolated();
+        let served = opened(None).await;
+        assert!(served.open.is_none());
+        let default_mode = served.info.default_mode.clone();
+        let default_plan = served.info.default_plan;
+        let result = hosting(served).resume_result();
+        assert_eq!(result["modes"]["currentModeId"], default_mode.as_str());
+        assert_eq!(plan_option(&result), default_plan);
     }
 }
