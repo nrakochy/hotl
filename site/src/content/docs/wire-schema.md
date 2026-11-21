@@ -75,12 +75,13 @@ the JSON-RPC error instead, at `error.data._meta["hotl.dev/turn"]`.
 
 Keys for programs that drive hotl (see [Driving hotl from another program](../embedding/)):
 
-| Key | Rides on | Holds |
-|---|---|---|
-| `hotl.dev/outputSchema` | `session/prompt` params `_meta` (any client), and `initialize` result `agentCapabilities._meta` as `true` (opted-in clients only) | A JSON Schema the answer must fit |
-| `hotl.dev/output` | `session/prompt` result `_meta` (any client that sent a schema) | The checked answer. If it still does not fit after two retries, the prompt fails with error `-32003` instead |
-| `hotl.dev/session` | `session/list` result, each row's `_meta` (opted-in clients) | `parentId`, the listed row the session was forked from, and `runId`, the running `hotl serve` process holding it. Each is left out when it does not apply |
-| `hotl.dev/retry` | `session/update` notice `_meta` (clients that offered `session.notices` and opted in) | `attempt`, `max`, `status` (when there was one), `delayMs` and `scope` |
+| Key | Where it appears | Who gets it | Holds |
+|---|---|---|---|
+| `hotl.dev/outputSchema` | In a prompt the client sends | Any client may send it | A JSON Schema the answer must fit |
+| `hotl.dev/outputSchema` | In hotl's answer to `initialize`, set to `true` | Clients that opted in | That hotl accepts the key above |
+| `hotl.dev/output` | In hotl's reply to that prompt | Any client that sent a schema | The checked answer. If it still does not fit after two retries, the prompt fails with error `-32003` instead |
+| `hotl.dev/session` | On each row of a session list | Clients that opted in | `parentId`, the listed row the session was forked from, and `runId`, the running `hotl serve` process holding it. Each is left out when it does not apply |
+| `hotl.dev/retry` | On a "Retrying" notice | Clients that opted in and offered notices | `attempt` (the try that just failed), `max`, `status` (when there was one), `delayMs` and `scope` |
 
 `hotl.dev/open` on `session/new` also takes `ephemeral: true`, which opens a
 throwaway session whose log is never stored. It is refused on `session/load`,
