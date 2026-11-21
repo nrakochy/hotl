@@ -200,3 +200,32 @@ async fn an_untagged_prompt_past_the_cap_never_folds_into_a_tagged_entry() {
         "the untagged prompt was dropped with the tagged entry it folded into"
     );
 }
+
+#[tokio::test]
+async fn a_prompt_past_the_cap_never_jumps_ahead_of_a_newer_entry_of_the_other_kind() {
+    let (mut s, ask) = parked_at_an_ask(QUEUE_MAX as usize + 4).await;
+    for tag in 2..QUEUE_MAX + 2 {
+        s.handle
+            .prompt_answering(tag, format!("p{tag}"), Vec::new())
+            .await;
+    }
+    s.handle.prompt("engine work".into()).await;
+    s.handle
+        .prompt_answering(1000, "late".into(), Vec::new())
+        .await;
+    let _ = ask.send(AskReply::Allow);
+    let mut started = Vec::new();
+    while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(2), s.events.recv()).await {
+        match ev {
+            EngineEvent::TurnStarted { tags } => started.push(tags),
+            EngineEvent::Ask { reply, .. } => {
+                let _ = reply.send(AskReply::Allow);
+            }
+            _ => {}
+        }
+    }
+    let mut expected: Vec<Vec<u64>> = (2..QUEUE_MAX + 2).map(|t| vec![t]).collect();
+    expected.push(Vec::new());
+    expected.push(vec![1000]);
+    assert_eq!(started, expected);
+}

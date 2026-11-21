@@ -4111,14 +4111,12 @@ async fn admit_prompt(
 ) -> bool {
     if running {
         let full = queue.len() >= QUEUE_MAX;
-        let joins = if full {
-            queue.iter_mut().rev().find(|q| q.folds_with(&prompt))
-        } else {
-            None
-        };
+        let joins = queue
+            .back_mut()
+            .filter(|last| full && last.folds_with(&prompt));
         match joins {
-            // Past the cap the prompt is folded into the newest pending entry
-            // of its kind rather than pushed: memory is bounded and nothing
+            // Past the cap the prompt is folded into the last pending entry,
+            // when it is of the same kind, rather than pushed: memory is bounded and nothing
             // vanishes without the model being told. It *was* absorbed, so the
             // event is still `PromptQueued`. A folded prompt inherits the tag
             // of the entry it joins — only reachable past QUEUE_MAX pending
