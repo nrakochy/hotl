@@ -1325,7 +1325,10 @@ pub(crate) mod tests {
                         lock(&rec_raw).push(line.clone());
                         lock(&rec).push(msg.clone());
                         for out in handler(&msg) {
-                            let mut l = out.to_string();
+                            let mut l = match &out {
+                                Value::String(s) if s.starts_with("RAW:") => s[4..].to_string(),
+                                _ => out.to_string(),
+                            };
                             l.push('\n');
                             if w.write_all(l.as_bytes()).await.is_err() {
                                 return;
@@ -1836,6 +1839,198 @@ pub(crate) mod tests {
         want.sort();
         got.sort();
         assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn malformed_agent_lines_and_fields_are_tolerated_the_same_way() {
+        let (_d, root) = root();
+        let raw_lines: Vec<String> = vec![
+            "not json at all".into(),
+            r#"["text", "hi"]"#.into(),
+            r#""a string""#.into(),
+            r#"{"jsonrpc": "2.0", "method": 5, "id": 77, "result": {}}"#.into(),
+        ];
+        let handler: Handler = Box::new(move |m| {
+            handshake(m).unwrap_or_else(|| match method(m) {
+                "session/prompt" => {
+                    let mut out: Vec<Value> = raw_lines
+                        .iter()
+                        .map(|l| Value::String(format!("RAW:{l}")))
+                        .collect();
+                    out.extend([
+                        update(json!({"sessionUpdate": "agent_message_chunk", "content": ["text", "no"], "extra": 1})),
+                        update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": 5}})),
+                        update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": 0, "text": "no"}})),
+                        update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "image", "data": "x"}})),
+                        update(json!({"sessionUpdate": 3, "content": {"type": "text", "text": "no"}})),
+                        update(json!({"sessionUpdate": "brand_new_kind", "content": {"type": "text", "text": "no"}})),
+                        json!({"jsonrpc": "2.0", "method": "session/update", "params": [{"update": {}}]}),
+                        update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "ok", "annotations": {"x": 1}}, "_meta": {"a": 1}})),
+                        update(json!({"sessionUpdate": "tool_call", "toolCallId": "t1", "name": null, "kind": "read", "title": 5, "status": "pending"})),
+                        update(json!({"sessionUpdate": "tool_call", "toolCallId": "t2", "kind": "custom_kind", "status": "weird"})),
+                        update(json!({"sessionUpdate": "tool_call", "toolCallId": 9, "kind": "read"})),
+                        update(json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed", "unknown": true})),
+                        update(json!({"sessionUpdate": "tool_call_update", "toolCallId": "t2", "status": "failed"})),
+                        update(json!({"sessionUpdate": "usage_update", "cost": null})),
+                        update(json!({"sessionUpdate": "usage_update", "cost": {"amount": "3", "currency": 7}})),
+                        update(json!({"sessionUpdate": "usage_update", "used": 1})),
+                        json!({"jsonrpc": "2.0", "id": null, "method": "fs/write_text_file", "params": {}}),
+                        json!({"jsonrpc": "2.0", "id": [1], "method": "terminal/output"}),
+                        json!({"jsonrpc": "2.0", "id": 950, "method": "session/request_permission", "params": [1]}),
+                        json!({"jsonrpc": "2.0", "id": 951, "method": "session/request_permission", "params": {"toolCall": {"toolCallId": "t5", "kind": "read", "locations": [5, {"path": "/etc/hosts"}]}, "options": [5, {"kind": "reject_once", "optionId": 6}, {"kind": "reject_once", "optionId": "r2"}]}}),
+                        reply(m, json!({"stopReason": "weird", "extra": [1]})),
+                    ]);
+                    out
+                }
+                _ => Vec::new(),
+            })
+        });
+        let (mut c, fake, started) = connect(handler, spec(&root, None)).await;
+        started.unwrap();
+        c.prompt("go".into());
+        let mut events = turn(&mut c).await;
+        let t0 = std::time::Instant::now();
+        while fake.seen().iter().filter(|m| m.get("method").is_none()).count() < 4 {
+            assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", fake.raw());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let done = events.pop().unwrap();
+        while let Ok(e) = c.events().try_recv() {
+            events.push(e);
+        }
+        events.push(done);
+        let seen: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::TextDelta(t) => Some(format!("text {t:?}")),
+                EngineEvent::ThinkingDelta(t) => Some(format!("thought {t:?}")),
+                EngineEvent::ToolStart {
+                    id,
+                    name,
+                    summary,
+                    input,
+                } => Some(format!("start {id} {name} {summary} {input}")),
+                EngineEvent::ToolDone { id, name, ok, .. } => Some(format!("done {id} {name} {ok}")),
+                EngineEvent::ToolDenied { id, name } => Some(format!("denied {id} {name}")),
+                _ => None,
+            })
+            .collect();
+        let mut sorted = seen.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![
+                "denied acp-denied unknown",
+                "denied t5 unknown",
+                "done t1 tool true",
+                "done t2 custom_kind false",
+                "start t1 tool tool null",
+                "start t2 custom_kind custom_kind null",
+                "text \"\\n[spend reported by the agent: \\\"3\\\"]\\n\"",
+                "text \"\\n[spend reported by the agent:]\\n\"",
+                "text \"ok\"",
+            ],
+            "{seen:?}"
+        );
+        match outcome(&events) {
+            Outcome::Error { message } => {
+                assert_eq!(
+                    message,
+                    "the agent ended its turn with stopReason Some(\"weird\")"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut answers: Vec<String> = fake
+            .raw()
+            .into_iter()
+            .filter(|l| !l.contains("\"method\""))
+            .collect();
+        answers.sort();
+        assert_eq!(
+            answers,
+            vec![
+                r#"{"error":{"code":-32601,"message":"hotl does not serve `fs/write_text_file`"},"id":null,"jsonrpc":"2.0"}"#,
+                r#"{"error":{"code":-32601,"message":"hotl does not serve `terminal/output`"},"id":[1],"jsonrpc":"2.0"}"#,
+                r#"{"id":950,"jsonrpc":"2.0","result":{"outcome":{"outcome":"cancelled"}}}"#,
+                r#"{"id":951,"jsonrpc":"2.0","result":{"outcome":{"outcome":"cancelled"}}}"#,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_handshake_replies_fail_the_start_the_same_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases: Vec<(Value, Value, &str)> = vec![
+            (
+                json!({"error": null}),
+                json!({"sessionId": "s1"}),
+                "the agent refused `initialize`: unknown error",
+            ),
+            (
+                json!({"error": {"code": 1, "message": 5}}),
+                json!({"sessionId": "s1"}),
+                "the agent refused `initialize`: unknown error",
+            ),
+            (
+                json!({"error": {"message": "nope", "data": [1]}}),
+                json!({"sessionId": "s1"}),
+                "the agent refused `initialize`: nope",
+            ),
+            (
+                json!({"result": {"protocolVersion": "1"}}),
+                json!({"sessionId": "s1"}),
+                "the agent speaks ACP v?, hotl speaks v1",
+            ),
+            (
+                json!({"result": [1]}),
+                json!({"sessionId": "s1"}),
+                "the agent speaks ACP v?, hotl speaks v1",
+            ),
+            (
+                json!({"result": {"protocolVersion": 1.0}}),
+                json!({"sessionId": "s1"}),
+                "the agent speaks ACP v?, hotl speaks v1",
+            ),
+            (
+                json!({"result": {"protocolVersion": 1, "agentCapabilities": "odd"}}),
+                json!({"sessionId": 5}),
+                "the agent's `session/new` reply has no sessionId",
+            ),
+            (
+                json!({"result": {"protocolVersion": 1}}),
+                json!(null),
+                "the agent's `session/new` reply has no sessionId",
+            ),
+        ];
+        for (init, new, want) in cases {
+            let handler: Handler = Box::new(move |m| match method(m) {
+                "initialize" => {
+                    let mut r = init.clone();
+                    r["jsonrpc"] = json!("2.0");
+                    r["id"] = m["id"].clone();
+                    vec![r]
+                }
+                "session/new" => vec![reply(m, new.clone())],
+                _ => Vec::new(),
+            });
+            let (_c, _f, started) = connect(handler, spec(dir.path(), None)).await;
+            assert_eq!(started.unwrap_err(), want);
+        }
+        let handler: Handler = Box::new(|m| match method(m) {
+            "session/new" => vec![reply(
+                m,
+                json!({"sessionId": "s1", "modes": {"availableModes": [{"id": "auto"}, 5, {"id": 7}, {"name": "x"}, {"id": "ask", "extra": 1}]}}),
+            )],
+            _ => handshake(m).unwrap_or_default(),
+        });
+        let mut s = spec(dir.path(), None);
+        s.mode = Some("plan".into());
+        let (_c, _f, started) = connect(handler, s).await;
+        assert_eq!(
+            started.unwrap_err(),
+            "the agent does not offer mode `plan` (it offers: auto, ask)"
+        );
     }
 
     #[test]
