@@ -1251,12 +1251,16 @@ pub(crate) mod tests {
     /// handler's caller-side `close` ends the pipe.
     pub(crate) struct Fake {
         seen: Arc<Mutex<Vec<Value>>>,
+        raw: Arc<Mutex<Vec<String>>>,
         close: Option<oneshot::Sender<()>>,
     }
 
     impl Fake {
         pub(crate) fn seen(&self) -> Vec<Value> {
             lock(&self.seen).clone()
+        }
+        pub(crate) fn raw(&self) -> Vec<String> {
+            lock(&self.raw).clone()
         }
         pub(crate) fn methods(&self) -> Vec<String> {
             self.seen()
@@ -1305,8 +1309,10 @@ pub(crate) mod tests {
     pub(crate) fn fake(mut handler: Handler) -> (Fake, tokio::io::DuplexStream) {
         let (client, agent) = tokio::io::duplex(1 << 20);
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let raw = Arc::new(Mutex::new(Vec::new()));
         let (close, mut closed) = oneshot::channel::<()>();
         let rec = seen.clone();
+        let rec_raw = raw.clone();
         tokio::spawn(async move {
             let (r, mut w) = tokio::io::split(agent);
             let mut lines = BufReader::new(r).lines();
@@ -1316,6 +1322,7 @@ pub(crate) mod tests {
                     line = lines.next_line() => {
                         let Ok(Some(line)) = line else { return };
                         let msg: Value = serde_json::from_str(&line).unwrap();
+                        lock(&rec_raw).push(line.clone());
                         lock(&rec).push(msg.clone());
                         for out in handler(&msg) {
                             let mut l = out.to_string();
@@ -1331,6 +1338,7 @@ pub(crate) mod tests {
         (
             Fake {
                 seen,
+                raw,
                 close: Some(close),
             },
             client,
@@ -1767,6 +1775,67 @@ pub(crate) mod tests {
         for e in errs {
             assert_eq!(e["error"]["code"], -32601);
         }
+    }
+
+    #[tokio::test]
+    async fn every_line_hotl_sends_an_agent_is_pinned_byte_for_byte() {
+        let (_d, root) = root();
+        let inside = root.join("a.rs");
+        let handler: Handler = Box::new(move |m| match method(m) {
+            "session/new" => vec![reply(
+                m,
+                json!({"sessionId": "s1", "modes": {"currentModeId": "auto", "availableModes": [{"id": "auto"}, {"id": "ask"}]}}),
+            )],
+            "session/set_mode" => vec![reply(m, json!({}))],
+            "session/prompt" => vec![
+                json!({"jsonrpc": "2.0", "id": 900, "method": "session/request_permission", "params": req(json!({"toolCallId": "t1", "kind": "execute", "title": "rm -rf /"}))}),
+                json!({"jsonrpc": "2.0", "id": "s-901", "method": "fs/read_text_file", "params": {"sessionId": "s1", "path": "/etc/hosts"}}),
+                json!({"jsonrpc": "2.0", "id": 902, "method": "session/request_permission", "params": {"sessionId": "s1", "toolCall": {"toolCallId": "t2", "kind": "execute", "title": "ls"}, "options": [{"optionId": "aa", "name": "Always", "kind": "allow_always"}]}}),
+                json!({"jsonrpc": "2.0", "id": 903, "method": "session/request_permission", "params": req(json!({"toolCallId": "t3", "kind": "read", "locations": [{"path": inside}]}))}),
+            ],
+            "session/cancel" => vec![json!({"jsonrpc": "2.0", "id": 4, "result": {"stopReason": "cancelled"}})],
+            _ => handshake(m).unwrap_or_default(),
+        });
+        let mut s = spec(&root, None);
+        s.mode = Some("ask".into());
+        let (mut c, fake, started) = connect(handler, s).await;
+        started.unwrap();
+        c.prompt("go".into());
+        let answered = |f: &Fake| {
+            f.seen()
+                .iter()
+                .filter(|m| m.get("method").is_none())
+                .count()
+        };
+        let t0 = std::time::Instant::now();
+        while answered(&fake) < 4 {
+            assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", fake.raw());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        c.interrupt();
+        assert_eq!(outcome(&turn(&mut c).await), Outcome::Cancelled);
+        c.finish(Duration::from_millis(50)).await;
+        let cwd = serde_json::to_string(&root).unwrap();
+        let version = env!("CARGO_PKG_VERSION");
+        let mut want = vec![
+            format!(r#"{{"id":1,"jsonrpc":"2.0","method":"initialize","params":{{"clientCapabilities":{{"fs":{{"readTextFile":false,"writeTextFile":false}},"terminal":false}},"clientInfo":{{"name":"hotl","version":"{version}"}},"protocolVersion":1}}}}"#),
+            format!(r#"{{"id":2,"jsonrpc":"2.0","method":"session/new","params":{{"cwd":{cwd},"mcpServers":[]}}}}"#),
+            r#"{"id":3,"jsonrpc":"2.0","method":"session/set_mode","params":{"modeId":"ask","sessionId":"s1"}}"#.to_string(),
+            r#"{"id":4,"jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"go","type":"text"}],"sessionId":"s1"}}"#.to_string(),
+            r#"{"id":900,"jsonrpc":"2.0","result":{"outcome":{"optionId":"r1","outcome":"selected"}}}"#.to_string(),
+            r#"{"error":{"code":-32601,"message":"hotl does not serve `fs/read_text_file`"},"id":"s-901","jsonrpc":"2.0"}"#.to_string(),
+            r#"{"id":902,"jsonrpc":"2.0","result":{"outcome":{"outcome":"cancelled"}}}"#.to_string(),
+            r#"{"id":903,"jsonrpc":"2.0","result":{"outcome":{"optionId":"a1","outcome":"selected"}}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s1"}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s1"}}"#.to_string(),
+        ];
+        while fake.raw().len() < want.len() && t0.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut got = fake.raw();
+        want.sort();
+        got.sort();
+        assert_eq!(got, want);
     }
 
     #[test]
