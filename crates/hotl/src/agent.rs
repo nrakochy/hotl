@@ -1326,6 +1326,8 @@ pub async fn serve_main(
     print_warnings(&warnings);
     crate::session_server::serve(crate::session_server::Served {
         session_id: id,
+        stored_session_id: session_id,
+        name,
         info,
         cwd: root.unwrap_or_else(|| scaffold.cwd.clone()),
         effort: scaffold.config.effort.map(|e| e.as_str().to_string()),

@@ -134,6 +134,8 @@ fn sweep_dead_sockets(dry_run: bool) -> usize {
             if !dry_run {
                 let _ = std::fs::remove_file(&p);
                 let _ = std::fs::remove_file(p.with_extension("log"));
+                let _ = std::fs::remove_file(p.with_extension("status.json"));
+                let _ = std::fs::remove_file(p.with_extension("token"));
             }
             removed += 1;
         }
@@ -201,5 +203,25 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1536), "1.5 KB");
         assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_dead_socket_sweep_takes_the_status_and_token_files_too() {
+        use hotl_platform::PrivateFs as _;
+        let id = format!("gc-dead-{}", std::process::id());
+        let run = crate::session_server::run_dir();
+        hotl_platform::PRIVATE_FS.create_dir_all(&run).unwrap();
+        let sock = run.join(format!("{id}.sock"));
+        let _ = std::fs::remove_file(&sock);
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        let token = crate::session_server::token_path(&id);
+        std::fs::write(&token, "secret").unwrap();
+        let status = crate::run_status::status_path(&id);
+        std::fs::write(&status, "{}").unwrap();
+        assert!(sweep_dead_sockets(false) >= 1);
+        assert!(!sock.exists());
+        assert!(!token.exists(), "a dead session's token is swept");
+        assert!(!status.exists(), "a dead session's status is swept");
     }
 }

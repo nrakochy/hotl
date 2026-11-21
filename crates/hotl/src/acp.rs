@@ -715,6 +715,24 @@ pub(crate) struct Connection {
     pending_egress: PendingEgress,
     next_id: u64,
     session: Option<SessionState>,
+    run_signal: Option<RunSignal>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct RunSignal {
+    pub turn_active: Arc<std::sync::atomic::AtomicBool>,
+    pub changed: Arc<tokio::sync::Notify>,
+}
+
+impl RunSignal {
+    fn turn(&self, active: bool) {
+        self.turn_active
+            .store(active, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn turn_is_active(&self) -> bool {
+        self.turn_active.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 pub(crate) struct Hosted {
@@ -723,6 +741,7 @@ pub(crate) struct Hosted {
     pub(crate) cwd: std::path::PathBuf,
     pub(crate) effort: Option<String>,
     pub(crate) caps: ClientCaps,
+    pub(crate) signal: Option<RunSignal>,
 }
 
 impl Connection {
@@ -743,6 +762,7 @@ impl Connection {
             pending_egress: PendingEgress::default(),
             next_id: 1,
             session: None,
+            run_signal: None,
         }
     }
 
@@ -751,6 +771,7 @@ impl Connection {
             Box::new(|_| Err("this connection hosts one session that is already open".into()));
         let mut connection = Connection::new(writer, factory, info, None);
         connection.client_caps = hosted.caps;
+        connection.run_signal = hosted.signal.clone();
         let config = Arc::new(std::sync::Mutex::new(crate::acp_map::ConfigState {
             model: connection.info.model.clone(),
             plan: connection.info.default_plan,
@@ -774,6 +795,7 @@ impl Connection {
             connection.pending_egress.clone(),
             &mut connection.next_id,
             connection.info.model.clone(),
+            hosted.signal,
         );
         state.mode = connection.info.default_mode.clone();
         state.cwd = hosted.cwd;
@@ -792,6 +814,33 @@ impl Connection {
 
     pub(crate) fn session_id(&self) -> Option<&str> {
         self.session.as_ref().map(|s| s.id.as_str())
+    }
+
+    pub(crate) fn run_state(&self) -> crate::run_status::RunState {
+        fn any_open<V>(
+            slots: &std::sync::Mutex<HashMap<u64, V>>,
+            open: impl Fn(&V) -> bool,
+        ) -> bool {
+            slots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .any(open)
+        }
+        let waiting = any_open(&self.pending, |slot| !slot.reply.is_closed())
+            || any_open(&self.pending_questions, |slot| !slot.reply.is_closed())
+            || any_open(&self.pending_egress, |slot| !slot.reply.is_closed());
+        if waiting {
+            crate::run_status::RunState::Waiting
+        } else if self
+            .run_signal
+            .as_ref()
+            .is_some_and(RunSignal::turn_is_active)
+        {
+            crate::run_status::RunState::Running
+        } else {
+            crate::run_status::RunState::Idle
+        }
     }
 
     pub(crate) fn caps_adopter(&self) -> impl FnOnce() + Send + 'static {
@@ -2727,6 +2776,7 @@ async fn install_session(
         pending_egress.clone(),
         next_id,
         model.to_string(),
+        None,
     );
     state._lease = lease;
     state.mode = mode;
@@ -2751,6 +2801,7 @@ fn start_session(
     pending_egress: PendingEgress,
     next_id: &mut u64,
     model: String,
+    signal: Option<RunSignal>,
 ) -> SessionState {
     // Permission/question request ids for this session are disjoint from
     // every other id.
@@ -2783,6 +2834,7 @@ fn start_session(
                 link,
                 drain_caps,
                 calls,
+                signal,
             )
             .await;
         }
@@ -2868,6 +2920,7 @@ async fn drain_events(
     link: EngineLink,
     shared_caps: SharedCaps,
     mut calls: crate::acp_map::ToolCalls,
+    signal: Option<RunSignal>,
 ) {
     let mut held: Option<EngineEvent> = None;
     loop {
@@ -2969,6 +3022,14 @@ async fn drain_events(
             .await;
             continue;
         }
+        let state_moves = matches!(
+            event,
+            EngineEvent::Ask { .. }
+                | EngineEvent::Question { .. }
+                | EngineEvent::EgressAsk { .. }
+                | EngineEvent::TurnDone { .. }
+                | EngineEvent::TurnStarted { .. }
+        );
         match event {
             EngineEvent::Ask {
                 summary,
@@ -3105,6 +3166,9 @@ async fn drain_events(
                 usage,
                 mispredictions,
             } => {
+                if let Some(signal) = &signal {
+                    signal.turn(false);
+                }
                 // A turn that ended without its asks/questions being answered
                 // left dead reply channels behind — drop them so they can't
                 // leak.
@@ -3166,6 +3230,9 @@ async fn drain_events(
             }
             EngineEvent::TurnStarted { tags } => {
                 lock_prompts(&pending_prompt).current = tags;
+                if let Some(signal) = &signal {
+                    signal.turn(true);
+                }
             }
             other => match crate::acp_map::outgoing(&other, &caps, &mut calls) {
                 Some(crate::acp_map::Outgoing::Update(update)) => {
@@ -3176,6 +3243,9 @@ async fn drain_events(
                 }
                 None => {}
             },
+        }
+        if let (true, Some(signal)) = (state_moves, &signal) {
+            signal.changed.notify_one();
         }
     }
 }
@@ -3330,6 +3400,7 @@ mod drain_tests {
                 ..ClientCaps::default()
             })),
             crate::acp_map::ToolCalls::default(),
+            None,
         )
         .await;
         drop(writer); // close the duplex so read_to_string sees EOF
@@ -3367,6 +3438,7 @@ mod drain_tests {
             },
             Arc::new(std::sync::Mutex::new(ClientCaps::default())),
             crate::acp_map::ToolCalls::default(),
+            None,
         ));
         for _ in 0..16 {
             tokio::task::yield_now().await;

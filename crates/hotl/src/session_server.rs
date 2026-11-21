@@ -22,8 +22,9 @@ use hotl_engine::SessionHandle;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, BufReader};
 
-use crate::acp::{ClientCaps, Connection, Hosted};
+use crate::acp::{ClientCaps, Connection, Hosted, RunSignal};
 use crate::acp_ext::codes;
+use crate::run_status::{RunState, RunStatus};
 use hotl_platform::{Ipc as _, IpcListener as _};
 
 /// The session transport, bound in one place: a unix socket on Unix, a named
@@ -54,6 +55,8 @@ pub fn paste_hint(host: &str) -> String {
 
 pub struct Served {
     pub session_id: String,
+    pub stored_session_id: String,
+    pub name: Option<String>,
     pub info: crate::acp::ServerInfo,
     pub cwd: PathBuf,
     pub effort: Option<String>,
@@ -196,6 +199,36 @@ impl Drop for TokenGuard {
     }
 }
 
+struct StatusGuard(String);
+impl Drop for StatusGuard {
+    fn drop(&mut self) {
+        crate::run_status::remove(&self.0);
+    }
+}
+
+struct StatusFile {
+    status: RunStatus,
+    written: Option<RunState>,
+}
+
+impl StatusFile {
+    fn publish(&mut self, state: RunState) {
+        if self.written == Some(state) {
+            return;
+        }
+        self.status.state = state;
+        if crate::run_status::write(&self.status).is_ok() {
+            self.written = Some(state);
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 fn write_token(id: &str, token: &str) -> std::io::Result<()> {
     use hotl_platform::PrivateFs as _;
     use std::io::Write;
@@ -310,6 +343,21 @@ impl AsyncWrite for ClientSlot {
 pub async fn serve_on(listener: Listener, served: Served, token: String) {
     let slot = ClientSlot::new(served.client_write_timeout);
     let writer = crate::acp::Writer::new(slot.clone());
+    let signal = RunSignal::default();
+    let status = StatusFile {
+        status: RunStatus {
+            run_id: served.session_id.clone(),
+            session_id: served.stored_session_id,
+            pid: std::process::id(),
+            cwd: served.cwd.clone(),
+            name: served.name,
+            version: env!("CARGO_PKG_VERSION").into(),
+            started_at_ms: now_ms(),
+            state: RunState::Idle,
+        },
+        written: None,
+    };
+    let _status_guard = StatusGuard(served.session_id.clone());
     let connection = Connection::hosting(
         writer,
         served.info,
@@ -319,12 +367,21 @@ pub async fn serve_on(listener: Listener, served: Served, token: String) {
             cwd: served.cwd,
             effort: served.effort,
             caps: detached_caps(),
+            signal: Some(signal.clone()),
         },
     );
     if let (Some(p), Some(handle)) = (served.prompt, connection.handle()) {
         handle.prompt(p).await;
     }
-    accept_loop(listener, connection, slot, token, served.ask_expiry).await;
+    accept_loop(
+        listener,
+        connection,
+        slot,
+        token,
+        served.ask_expiry,
+        (status, signal),
+    )
+    .await;
 }
 
 /// Removes the endpoint's on-disk artifact when the server exits — but only
@@ -399,12 +456,15 @@ async fn accept_loop(
     slot: ClientSlot,
     token: String,
     ask_expiry: std::time::Duration,
+    (mut status, signal): (StatusFile, RunSignal),
 ) {
     let mut reader: Option<Lines> = None;
     let mut sweep = tokio::time::interval(sweep_period(ask_expiry));
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        status.publish(connection.run_state());
         tokio::select! {
+            () = signal.changed.notified() => {}
             // A parked ask nobody ever answers holds a turn open forever
             // (0059 T5). Denying it is the fail-closed answer, and the engine
             // commits the `AskResolved` when its await returns.
@@ -618,9 +678,13 @@ mod tests {
         }
     }
 
-    fn served(handle: SessionHandle, ask_expiry: std::time::Duration) -> Served {
+    const STORED: &str = "01STOREDSESSIONLOG";
+
+    fn served(id: &str, handle: SessionHandle, ask_expiry: std::time::Duration) -> Served {
         Served {
-            session_id: "test".into(),
+            session_id: id.into(),
+            stored_session_id: STORED.into(),
+            name: Some("served by a test".into()),
             info: info(),
             cwd: std::env::temp_dir(),
             effort: None,
@@ -637,7 +701,11 @@ mod tests {
     ) -> (String, tokio::task::JoinHandle<()>) {
         let id = endpoint_id("serve");
         let listener = hotl_platform::IPC.bind_private(&id).unwrap();
-        let task = tokio::spawn(serve_on(listener, served(handle, ask_expiry), "tok".into()));
+        let task = tokio::spawn(serve_on(
+            listener,
+            served(&id, handle, ask_expiry),
+            "tok".into(),
+        ));
         (id, task)
     }
 
@@ -645,6 +713,7 @@ mod tests {
         lines: tokio::io::Lines<BufReader<ReadHalf>>,
         write: WriteHalf,
         next_id: u64,
+        session: String,
     }
 
     impl Client {
@@ -654,6 +723,7 @@ mod tests {
                 lines: BufReader::new(read).lines(),
                 write,
                 next_id: 0,
+                session: id.to_string(),
             }
         }
 
@@ -714,10 +784,11 @@ mod tests {
             let init = client.initialize(Some("tok"), caps).await;
             let reply = client.reply_to(init).await;
             assert_eq!(reply["result"]["protocolVersion"], 1, "{reply}");
+            let session = client.session.clone();
             let resume = client
                 .request(
                     "session/resume",
-                    json!({"sessionId": "test", "cwd": std::env::temp_dir()}),
+                    json!({"sessionId": session, "cwd": std::env::temp_dir()}),
                 )
                 .await;
             let reply = client.next().await.expect("the resume reply");
@@ -731,9 +802,10 @@ mod tests {
         }
 
         async fn prompt(&mut self, text: &str) -> u64 {
+            let session = self.session.clone();
             self.request(
                 "session/prompt",
-                json!({"sessionId": "test", "prompt": [{"type": "text", "text": text}]}),
+                json!({"sessionId": session, "prompt": [{"type": "text", "text": text}]}),
             )
             .await
         }
@@ -812,7 +884,7 @@ mod tests {
         let done = second
             .until(|m| m["params"]["update"]["sessionUpdate"] == "usage_update")
             .await;
-        assert_eq!(done["params"]["sessionId"], "test");
+        assert_eq!(done["params"]["sessionId"], json!(id));
     }
 
     #[tokio::test]
@@ -917,7 +989,7 @@ mod tests {
         let resume = client
             .request(
                 "session/resume",
-                json!({"sessionId": "test", "cwd": std::env::temp_dir()}),
+                json!({"sessionId": id, "cwd": std::env::temp_dir()}),
             )
             .await;
         let reply = client.reply_to(resume).await;
@@ -929,7 +1001,7 @@ mod tests {
         let (id, task) = start(scripted_session(), std::time::Duration::ZERO);
         let mut client = Client::attach(&id, hotl_caps()).await;
         let close = client
-            .request("session/close", json!({"sessionId": "test"}))
+            .request("session/close", json!({"sessionId": id}))
             .await;
         assert!(client.reply_to(close).await.get("result").is_some());
         assert!(client.hung_up().await);
@@ -1301,7 +1373,7 @@ mod tests {
         client
             .request(
                 "session/resume",
-                json!({"sessionId": "test", "cwd": std::env::temp_dir()}),
+                json!({"sessionId": id, "cwd": std::env::temp_dir()}),
             )
             .await;
         let got = drained(&mut client).await;
@@ -1324,7 +1396,7 @@ mod tests {
             2,
             "the parked ask and its call, once"
         );
-        let resume = json!({"sessionId": "test", "cwd": std::env::temp_dir()});
+        let resume = json!({"sessionId": id, "cwd": std::env::temp_dir()});
         client.request("session/resume", resume.clone()).await;
         let again = drained(&mut client).await;
         assert_eq!(again.len(), 1, "only the resume reply: {again:?}");
@@ -1430,7 +1502,7 @@ mod tests {
         second
             .request(
                 "session/resume",
-                json!({"sessionId": "test", "cwd": std::env::temp_dir()}),
+                json!({"sessionId": id, "cwd": std::env::temp_dir()}),
             )
             .await;
         let asked = second.request_of("session/request_permission").await;
@@ -1478,7 +1550,7 @@ mod tests {
         client
             .request(
                 "session/resume",
-                json!({"sessionId": "test", "cwd": std::env::temp_dir()}),
+                json!({"sessionId": id, "cwd": std::env::temp_dir()}),
             )
             .await;
         let ask = client.request_of("session/request_permission").await;
@@ -1495,7 +1567,7 @@ mod tests {
     ) -> (String, tokio::task::JoinHandle<()>) {
         let id = endpoint_id("stall");
         let listener = hotl_platform::IPC.bind_private(&id).unwrap();
-        let mut served = served(handle, std::time::Duration::ZERO);
+        let mut served = served(&id, handle, std::time::Duration::ZERO);
         served.client_write_timeout = stall;
         let task = tokio::spawn(serve_on(listener, served, "tok".into()));
         (id, task)
@@ -1618,7 +1690,7 @@ mod tests {
         let mut client = hotl_tui::client::AcpClient::new(write);
         let mut lines = BufReader::new(read).lines();
         assert!(matches!(
-            crate::attach::open(&mut client, &mut lines, "test", "tok").await,
+            crate::attach::open(&mut client, &mut lines, &id, "tok").await,
             crate::attach::Opened::Attached
         ));
         let line = lines.next_line().await.unwrap().unwrap();
@@ -1639,13 +1711,153 @@ mod tests {
             let (read, write) = tokio::io::split(hotl_platform::IPC.connect(&id).await.unwrap());
             let mut client = hotl_tui::client::AcpClient::new(write);
             let mut lines = BufReader::new(read).lines();
-            let opened = crate::attach::open(&mut client, &mut lines, "test", token).await;
+            let opened = crate::attach::open(&mut client, &mut lines, &id, token).await;
             match opened {
                 crate::attach::Opened::Attached => assert!(attached, "{token}"),
                 crate::attach::Opened::Closed => assert!(!attached, "{token}"),
                 crate::attach::Opened::Refused(e) => panic!("{token}: {e}"),
             }
         }
+    }
+
+    fn status_text(id: &str) -> Option<String> {
+        std::fs::read_to_string(crate::run_status::status_path(id)).ok()
+    }
+
+    async fn state_becomes(id: &str, want: crate::run_status::RunState) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let got = status_text(id)
+                .and_then(|t| serde_json::from_str::<crate::run_status::RunStatus>(&t).ok())
+                .map(|s| s.state);
+            if got == Some(want) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the status never read {want:?}, last {got:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    fn turn_done() -> EngineEvent {
+        EngineEvent::TurnDone {
+            outcome: hotl_engine::Outcome::Done { text: "ok".into() },
+            usage: hotl_types::TokenUsage::default(),
+            mispredictions: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_served_session_writes_its_status_and_removes_it_on_stop() {
+        use crate::run_status::{RunState, RunStatus};
+        let (id, task) = start(scripted_session(), std::time::Duration::ZERO);
+        state_becomes(&id, RunState::Idle).await;
+        let text = status_text(&id).expect("the status file");
+        let status: RunStatus = serde_json::from_str(&text).unwrap();
+        assert_eq!(status.run_id, id);
+        assert_eq!(status.session_id, STORED);
+        assert_eq!(status.pid, std::process::id());
+        assert_eq!(status.cwd, std::env::temp_dir());
+        assert_eq!(status.name.as_deref(), Some("served by a test"));
+        assert_eq!(status.version, env!("CARGO_PKG_VERSION"));
+        assert!(status.started_at_ms > 0);
+        let keys: Vec<String> = serde_json::from_str::<serde_json::Map<String, Value>>(&text)
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            keys.len(),
+            8,
+            "nothing beyond the eight status fields: {text}"
+        );
+        assert!(!text.contains("\"tok\""), "{text}");
+
+        let mut client = Client::attach(&id, hotl_caps()).await;
+        let stop = client.request("_hotl/session/stop", json!({})).await;
+        assert_eq!(client.reply_to(stop).await["result"]["ok"], true);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the server exits on stop")
+            .unwrap();
+        assert!(!crate::run_status::status_path(&id).exists());
+    }
+
+    #[tokio::test]
+    async fn status_follows_the_turn() {
+        use crate::run_status::RunState;
+        let (handle, events) = injected();
+        let (id, _task) = start(handle, std::time::Duration::ZERO);
+        state_becomes(&id, RunState::Idle).await;
+        events
+            .send(EngineEvent::TurnStarted { tags: Vec::new() })
+            .await
+            .unwrap();
+        state_becomes(&id, RunState::Running).await;
+        events.send(turn_done()).await.unwrap();
+        state_becomes(&id, RunState::Idle).await;
+    }
+
+    #[tokio::test]
+    async fn a_parked_ask_reads_as_waiting_until_answered() {
+        use crate::run_status::RunState;
+        let (handle, events) = injected();
+        let (id, _task) = start(handle, std::time::Duration::ZERO);
+        events
+            .send(EngineEvent::TurnStarted { tags: Vec::new() })
+            .await
+            .unwrap();
+        let answer = inject_ask(&events).await;
+        state_becomes(&id, RunState::Waiting).await;
+        let mut client = Client::attach(&id, hotl_caps()).await;
+        let asked = client.request_of("session/request_permission").await;
+        client.allow(&asked["id"]).await;
+        assert_eq!(answer.await.unwrap(), hotl_engine::AskReply::Allow);
+        state_becomes(&id, RunState::Running).await;
+    }
+
+    #[tokio::test]
+    async fn an_ask_the_engine_abandons_stops_reading_as_waiting() {
+        use crate::run_status::RunState;
+        let (handle, events) = injected();
+        let (id, _task) = start(handle, std::time::Duration::ZERO);
+        events
+            .send(EngineEvent::TurnStarted { tags: Vec::new() })
+            .await
+            .unwrap();
+        let abandoned = inject_ask(&events).await;
+        state_becomes(&id, RunState::Waiting).await;
+        drop(abandoned);
+        events.send(turn_done()).await.unwrap();
+        state_becomes(&id, RunState::Idle).await;
+    }
+
+    #[tokio::test]
+    async fn a_stale_file_is_not_listed() {
+        use crate::run_status::{RunState, RunStatus};
+        let stale = endpoint_id("stale");
+        crate::run_status::write(&RunStatus {
+            run_id: stale.clone(),
+            session_id: STORED.into(),
+            pid: 1,
+            cwd: std::env::temp_dir(),
+            name: None,
+            version: "0.0.0".into(),
+            started_at_ms: 1,
+            state: RunState::Running,
+        })
+        .unwrap();
+        let (live, _task) = start(scripted_session(), std::time::Duration::ZERO);
+        state_becomes(&live, RunState::Idle).await;
+        let listed: Vec<String> = crate::run_status::read_live()
+            .into_iter()
+            .map(|s| s.run_id)
+            .collect();
+        crate::run_status::remove(&stale);
+        assert!(!listed.contains(&stale), "{listed:?}");
+        assert!(listed.contains(&live), "{listed:?}");
     }
 
     #[test]
