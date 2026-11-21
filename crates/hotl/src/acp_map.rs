@@ -1792,13 +1792,17 @@ mod tests {
             edit["content"],
             json!([{"type": "diff", "path": at("a.rs"), "oldText": "let x = 1;", "newText": "let x = 2;"}])
         );
-        let path = std::path::Path::new("/abs/new.rs").display().to_string();
+        let path = std::env::temp_dir()
+            .join("acp-map-elsewhere")
+            .join("new.rs")
+            .display()
+            .to_string();
         let write = |id: &str, before, calls: &mut ToolCalls| {
             outgoing(
                 &start(
                     id,
                     "write",
-                    json!({"path": "/abs/new.rs", "content": "fn main() {}\n"}),
+                    json!({"path": path, "content": "fn main() {}\n"}),
                 ),
                 &plain(),
                 calls,
