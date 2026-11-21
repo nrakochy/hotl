@@ -1090,6 +1090,7 @@ mod tests {
                 call_id: "c1".into(),
                 tool: "bash".into(),
                 input: json!({"command": "rm -rf build"}),
+                origin: hotl_engine::AskOrigin::Tool,
                 reply,
             })
             .await

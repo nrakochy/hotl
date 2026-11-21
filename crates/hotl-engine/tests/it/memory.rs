@@ -115,10 +115,12 @@ async fn remember_answering(
             call_id,
             tool,
             input,
+            origin,
         } = ev
         else {
             panic!("expected the confirm ask, got {ev:?}");
         };
+        assert_eq!(origin, hotl_engine::AskOrigin::Remember);
         assert!(summary.contains("remember → project memory:"), "{summary}");
         assert!(protected_why.is_some(), "the why names the file");
         assert_eq!(tool, "remember");

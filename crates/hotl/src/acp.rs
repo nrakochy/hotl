@@ -2848,6 +2848,7 @@ async fn drain_events(
                 call_id,
                 tool,
                 input,
+                origin,
                 reply,
             } => {
                 req_id += 1;
@@ -2865,7 +2866,7 @@ async fn drain_events(
                     let shown = if caps.ext { &ext } else { &plain };
                     send_update(&out, &session_id, crate::acp_map::announce(shown)).await;
                 }
-                let reply = if crate::acp_map::synthetic_ask(&call_id, &tool) {
+                let reply = if origin.is_synthetic() {
                     settle_on_answer(
                         reply,
                         writer.clone(),

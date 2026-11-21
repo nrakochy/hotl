@@ -4418,6 +4418,7 @@ impl Surface {
                 call_id,
                 tool,
                 input,
+                origin,
                 reply,
             } => {
                 let (dead, _) = tokio::sync::oneshot::channel();
@@ -4428,6 +4429,7 @@ impl Surface {
                     call_id,
                     tool,
                     input,
+                    origin,
                     reply: dead,
                 }
             }

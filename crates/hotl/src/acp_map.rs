@@ -359,11 +359,6 @@ pub fn settled(tool_call_id: String, done: bool) -> SessionUpdate {
     })
 }
 
-pub fn synthetic_ask(call_id: &str, tool: &str) -> bool {
-    (tool.is_empty() && call_id.starts_with("loop-"))
-        || (tool == "remember" && call_id.starts_with("remember-"))
-}
-
 pub const RESERVED_CALL_PREFIXES: &[&str] = &["egress-", "loop-", "remember-", "tool-"];
 
 pub fn wire_id(id: &str) -> String {
@@ -2208,6 +2203,7 @@ mod tests {
                 call_id: "t-ask".into(),
                 tool: "bash".into(),
                 input: serde_json::json!({"command": "ls"}),
+                origin: hotl_engine::AskOrigin::Tool,
                 reply: tokio::sync::oneshot::channel().0,
             },
             EngineEvent::Question {

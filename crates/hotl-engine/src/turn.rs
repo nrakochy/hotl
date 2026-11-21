@@ -3278,9 +3278,19 @@ impl Turn {
             else {}
         );
         let (tx, rx) = oneshot::channel();
-        let (call_id, tool, input) = match call {
-            AskCall::Tool(tu, input) => (tu.id.clone(), tu.name.clone(), input.clone()),
-            AskCall::Loop => (format!("loop-{id}"), String::new(), Value::Null),
+        let (call_id, tool, input, origin) = match call {
+            AskCall::Tool(tu, input) => (
+                tu.id.clone(),
+                tu.name.clone(),
+                input.clone(),
+                crate::AskOrigin::Tool,
+            ),
+            AskCall::Loop => (
+                format!("loop-{id}"),
+                String::new(),
+                Value::Null,
+                crate::AskOrigin::Loop,
+            ),
         };
         let event = EngineEvent::Ask {
             summary,
@@ -3288,6 +3298,7 @@ impl Turn {
             call_id,
             tool,
             input,
+            origin,
             reply: tx,
         };
         let reply = if self.events.send(event).await.is_err() {

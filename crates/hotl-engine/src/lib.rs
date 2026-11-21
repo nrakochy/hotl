@@ -499,6 +499,19 @@ pub fn budget_refusal(kind: &str, used: f64, cap: f64) -> String {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskOrigin {
+    Tool,
+    Loop,
+    Remember,
+}
+
+impl AskOrigin {
+    pub fn is_synthetic(self) -> bool {
+        !matches!(self, Self::Tool)
+    }
+}
+
 /// Everything the surface renders. `Ask` carries the reply channel — the
 /// surface (or an allow-rule upstream) is the human on the loop.
 pub enum EngineEvent {
@@ -702,6 +715,7 @@ pub enum EngineEvent {
         call_id: String,
         tool: String,
         input: serde_json::Value,
+        origin: AskOrigin,
         reply: oneshot::Sender<AskReply>,
     },
     /// A structured `ask_user` question (tier-1 gap #4) — NOT a permission
@@ -2226,6 +2240,7 @@ pub(crate) fn memory_confirm(
                 call_id: format!("remember-{id}"),
                 tool: "remember".into(),
                 input: serde_json::json!({"note": note}),
+                origin: AskOrigin::Remember,
                 reply: ask_tx,
             })
             .await

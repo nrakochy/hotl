@@ -1,6 +1,7 @@
 //! Every hotl-engine integration test, one module per former test binary:
 //! one link instead of one per file.
 
+mod ask_origin;
 mod ask_user;
 mod auto_title;
 mod budgets;
