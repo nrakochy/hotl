@@ -329,6 +329,24 @@ pub struct SessionInfo {
     pub meta: Option<Meta>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryMeta {
+    #[schemars(description = "Which try is about to be made, counting from 1")]
+    pub attempt: u32,
+    #[schemars(description = "How many tries the ladder allows")]
+    pub max: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "The HTTP status that caused the retry, when there was one")]
+    pub status: Option<u16>,
+    #[schemars(description = "Milliseconds hotl waits before the next try")]
+    pub delay_ms: u64,
+    #[schemars(
+        description = "Which retry ladder this is: sample, summarize, goal_eval, title or aside"
+    )]
+    pub scope: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRowMeta {

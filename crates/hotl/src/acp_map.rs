@@ -14,11 +14,12 @@ use crate::acp_types::{
     ElicitationSchemaType, EmbeddedResource, EmbeddedResourceResource, McpServer, Meta,
     MultiSelectItems, MultiSelectPropertySchema, Notice, NoticeSeverity, PermissionOption,
     PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    RequestPermissionOutcome, SessionConfigBoolean, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelect, SessionConfigSelectOption, SessionInfoUpdate,
-    SessionMode, SessionModeState, SessionUpdate, StopReason, StringMultiSelectItems,
-    StringPropertySchema, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    RequestPermissionOutcome, RetryMeta, SessionConfigBoolean, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelect,
+    SessionConfigSelectOption, SessionInfoUpdate, SessionMode, SessionModeState, SessionUpdate,
+    StopReason, StringMultiSelectItems, StringPropertySchema, ToolCall, ToolCallContent,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    UnstructuredCommandInput,
 };
 
 pub const META_FRAME: &str = "hotl.dev/frame";
@@ -29,6 +30,7 @@ pub const META_CHILD: &str = "hotl.dev/child";
 pub const META_PROTECTED_WHY: &str = "hotl.dev/protectedWhy";
 pub const META_ASK: &str = "hotl.dev/ask";
 pub const META_EGRESS: &str = "hotl.dev/egress";
+pub const META_RETRY: &str = "hotl.dev/retry";
 pub const META_REPLY: &str = "hotl.dev/reply";
 pub const META_QUESTION: &str = "hotl.dev/question";
 pub const ELICITATION_ANSWER: &str = "answer";
@@ -383,6 +385,16 @@ pub fn egress_tool_call(req_id: u64, host: &str, caps: &ClientCaps) -> ToolCallU
     }
 }
 
+fn retry_scope_name(scope: hotl_engine::RetryScope) -> &'static str {
+    match scope {
+        hotl_engine::RetryScope::Sample => "sample",
+        hotl_engine::RetryScope::Summarize => "summarize",
+        hotl_engine::RetryScope::GoalEval => "goal_eval",
+        hotl_engine::RetryScope::Title => "title",
+        hotl_engine::RetryScope::Aside => "aside",
+    }
+}
+
 fn egress_meta(host: &str) -> Value {
     serde_json::to_value(crate::acp_ext::Egress {
         host: host.to_string(),
@@ -731,12 +743,31 @@ fn standard(
             max,
             reason,
             delay_ms,
+            status,
+            scope,
             ..
-        } if caps.notices => notice(
-            NoticeSeverity::Warning,
-            format!("Retrying ({attempt}/{max})"),
-            format!("{reason}; next try in {:.1}s", *delay_ms as f64 / 1000.0),
-        ),
+        } if caps.notices => {
+            let mut update = notice(
+                NoticeSeverity::Warning,
+                format!("Retrying ({attempt}/{max})"),
+                format!("{reason}; next try in {:.1}s", *delay_ms as f64 / 1000.0),
+            );
+            if caps.ext {
+                let meta = RetryMeta {
+                    attempt: *attempt,
+                    max: *max,
+                    status: *status,
+                    delay_ms: *delay_ms,
+                    scope: retry_scope_name(*scope).into(),
+                };
+                add_meta(
+                    &mut update,
+                    META_RETRY,
+                    serde_json::to_value(meta).unwrap_or_default(),
+                );
+            }
+            update
+        }
         EngineEvent::FallbackModel { model } if caps.notices => notice(
             NoticeSeverity::Warning,
             format!("Falling back to {model} for the rest of this turn"),
@@ -2030,6 +2061,68 @@ mod tests {
             outgoing(&retrying, &opted_in(), &mut calls),
             Some(Outgoing::Ext(_))
         ));
+    }
+
+    fn retrying_event(status: Option<u16>, delay_ms: u64) -> EngineEvent {
+        EngineEvent::Retrying {
+            attempt: 2,
+            max: 5,
+            reason: "rate limited".into(),
+            delay_ms,
+            status,
+            request_id: None,
+            scope: hotl_engine::RetryScope::Sample,
+            discarded_partial: false,
+        }
+    }
+
+    #[test]
+    fn a_retry_notice_carries_its_numbers_for_an_opted_in_client() {
+        let caps = ClientCaps {
+            notices: true,
+            ext: true,
+            ..ClientCaps::default()
+        };
+        let mut calls = ToolCalls::rooted(root());
+        let notice = update_json(outgoing(
+            &retrying_event(Some(429), 2_000),
+            &caps,
+            &mut calls,
+        ));
+        assert_eq!(notice["title"], "Retrying (2/5)");
+        assert_eq!(
+            notice["_meta"][META_RETRY],
+            json!({"attempt": 2, "max": 5, "status": 429, "delayMs": 2000, "scope": "sample"})
+        );
+    }
+
+    #[test]
+    fn a_retry_notice_for_a_client_with_notices_but_no_extensions_has_no_meta() {
+        let caps = ClientCaps {
+            notices: true,
+            ..ClientCaps::default()
+        };
+        let mut calls = ToolCalls::rooted(root());
+        let notice = update_json(outgoing(
+            &retrying_event(Some(429), 2_000),
+            &caps,
+            &mut calls,
+        ));
+        assert!(notice.get("_meta").is_none(), "{notice}");
+    }
+
+    #[test]
+    fn a_retry_without_a_status_omits_it() {
+        let caps = ClientCaps {
+            notices: true,
+            ext: true,
+            ..ClientCaps::default()
+        };
+        let mut calls = ToolCalls::rooted(root());
+        let notice = update_json(outgoing(&retrying_event(None, 0), &caps, &mut calls));
+        let meta = &notice["_meta"][META_RETRY];
+        assert!(meta.get("status").is_none(), "{meta}");
+        assert_eq!(meta["delayMs"], 0);
     }
 
     #[test]

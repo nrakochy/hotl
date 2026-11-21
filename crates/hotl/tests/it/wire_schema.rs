@@ -307,6 +307,13 @@ fn every_hotl_meta_payload_validates_against_the_published_schema() {
         json!({"_meta": {acp_ext::META_EXT: 1, acp_ext::META_SOCKET_TOKEN: "t"}}),
         json!({"_meta": {acp::META_OPEN: {"name": "n", "worktree": "w"}}}),
         json!({"_meta": {acp::META_OPEN: {"ephemeral": true}}}),
+        json!({"_meta": {acp_map::META_RETRY: acp_types::RetryMeta {
+            attempt: 1,
+            max: 3,
+            status: Some(429),
+            delay_ms: 100,
+            scope: "sample".into(),
+        }}}),
         json!({"sessionId": "s", "cwd": "/w", "_meta": {acp::META_SESSION: acp_types::SessionRowMeta {
             parent_id: Some("p".into()),
             run_id: Some("bg-1".into()),

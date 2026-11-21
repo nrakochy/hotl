@@ -2268,6 +2268,49 @@
       ],
       "type": "object"
     },
+    "RetryMeta": {
+      "properties": {
+        "attempt": {
+          "description": "Which try is about to be made, counting from 1",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "delayMs": {
+          "description": "Milliseconds hotl waits before the next try",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max": {
+          "description": "How many tries the ladder allows",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scope": {
+          "description": "Which retry ladder this is: sample, summarize, goal_eval, title or aside",
+          "type": "string"
+        },
+        "status": {
+          "description": "The HTTP status that caused the retry, when there was one",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "attempt",
+        "max",
+        "delayMs",
+        "scope"
+      ],
+      "type": "object"
+    },
     "RetryScopeTag": {
       "enum": [
         "sample",
@@ -2870,6 +2913,14 @@
         "on": "session/request_permission result (sent by the client): _meta",
         "schema": {
           "$ref": "#/$defs/Reply"
+        }
+      }
+    ],
+    "hotl.dev/retry": [
+      {
+        "on": "session/update notice: _meta (client offered session.notices)",
+        "schema": {
+          "$ref": "#/$defs/RetryMeta"
         }
       }
     ],

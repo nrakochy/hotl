@@ -310,6 +310,7 @@ pub fn schema() -> Value {
             at("session/new, session/load, session/resume params: _meta", sub::<OpenParams>(g)),
             at("session/new, session/load, session/resume, _hotl/session/fork result: _meta", sub::<SessionOpenExtras>(g)),
         ],
+        (crate::acp_map::META_RETRY): [at("session/update notice: _meta (client offered session.notices)", sub::<crate::acp_types::RetryMeta>(g))],
         (crate::acp::META_SESSION): [at("session/list result: sessions[]._meta", sub::<crate::acp_types::SessionRowMeta>(g))],
         (crate::acp::META_MODEL): [
             at("session/update config_option_update: _meta", sub::<ModelChange>(g)),
