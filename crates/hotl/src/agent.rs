@@ -8797,8 +8797,9 @@ mod tests {
     fn plan_and_memory_files_follow_the_root_they_are_given() {
         let root = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
-        let plan = plan_files_at(Some("notes"), elsewhere.path());
-        let memory = memory_files_at(hotl_engine::MemoryMode::ReadWrite, elsewhere.path());
+        let elsewhere_id = hotl_store::project::id(elsewhere.path());
+        let plan = plan_files_at(&elsewhere_id, Some("notes"), elsewhere.path());
+        let memory = memory_files_at(elsewhere_id, hotl_engine::MemoryMode::ReadWrite);
         let (plan, memory) =
             files_for_root(plan.as_ref(), Some("notes"), memory.as_ref(), root.path());
         let (plan, memory) = (plan.unwrap(), memory.unwrap());
