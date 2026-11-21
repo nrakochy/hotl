@@ -12,6 +12,7 @@
 //! durability (surviving a reboot) is planned durable-asks work
 //! and is deliberately out of scope; this parks in memory, in the live server.
 
+use std::future::Future as _;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -59,7 +60,10 @@ pub struct Served {
     pub handle: SessionHandle,
     pub prompt: Option<String>,
     pub ask_expiry: std::time::Duration,
+    pub client_write_timeout: std::time::Duration,
 }
+
+pub const CLIENT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub fn detached_caps() -> ClientCaps {
     ClientCaps {
@@ -208,32 +212,79 @@ fn write_token(id: &str, token: &str) -> std::io::Result<()> {
         .write_all(token.as_bytes())
 }
 
-#[derive(Clone, Default)]
-struct ClientSlot(Arc<std::sync::Mutex<Option<WriteHalf>>>);
+struct Attached {
+    write: Option<WriteHalf>,
+    stall: Option<Pin<Box<tokio::time::Sleep>>>,
+    limit: std::time::Duration,
+}
+
+#[derive(Clone)]
+struct ClientSlot {
+    attached: Arc<std::sync::Mutex<Attached>>,
+    dropped: Arc<tokio::sync::Notify>,
+}
 
 impl ClientSlot {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<WriteHalf>> {
-        self.0
+    fn new(limit: std::time::Duration) -> Self {
+        ClientSlot {
+            attached: Arc::new(std::sync::Mutex::new(Attached {
+                write: None,
+                stall: None,
+                limit,
+            })),
+            dropped: Arc::default(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Attached> {
+        self.attached
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn poll_with(
+    fn replace(&self, write: Option<WriteHalf>) {
+        let mut attached = self.lock();
+        attached.write = write;
+        attached.stall = None;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lock().write.is_none()
+    }
+
+    fn poll_io<T>(
         &self,
         cx: &mut Context<'_>,
-        f: impl FnOnce(Pin<&mut WriteHalf>, &mut Context<'_>) -> Poll<std::io::Result<()>>,
-    ) -> Poll<std::io::Result<()>> {
-        let mut guard = self.lock();
-        let Some(w) = guard.as_mut() else {
-            return Poll::Ready(Ok(()));
+        gone: T,
+        f: impl FnOnce(Pin<&mut WriteHalf>, &mut Context<'_>) -> Poll<std::io::Result<T>>,
+    ) -> Poll<std::io::Result<T>> {
+        let mut attached = self.lock();
+        let Some(w) = attached.write.as_mut() else {
+            return Poll::Ready(Ok(gone));
         };
-        match f(Pin::new(w), cx) {
-            Poll::Ready(Err(_)) => {
-                *guard = None;
-                Poll::Ready(Ok(()))
+        let stalled = match f(Pin::new(w), cx) {
+            Poll::Ready(Ok(done)) => {
+                attached.stall = None;
+                return Poll::Ready(Ok(done));
             }
-            other => other,
+            Poll::Ready(Err(_)) => true,
+            Poll::Pending => {
+                let limit = attached.limit;
+                attached
+                    .stall
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)))
+                    .as_mut()
+                    .poll(cx)
+                    .is_ready()
+            }
+        };
+        if !stalled {
+            return Poll::Pending;
         }
+        attached.write = None;
+        attached.stall = None;
+        self.dropped.notify_one();
+        Poll::Ready(Ok(gone))
     }
 }
 
@@ -243,25 +294,15 @@ impl AsyncWrite for ClientSlot {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let mut guard = self.lock();
-        let Some(w) = guard.as_mut() else {
-            return Poll::Ready(Ok(buf.len()));
-        };
-        match Pin::new(w).poll_write(cx, buf) {
-            Poll::Ready(Err(_)) => {
-                *guard = None;
-                Poll::Ready(Ok(buf.len()))
-            }
-            other => other,
-        }
+        self.poll_io(cx, buf.len(), |w, cx| w.poll_write(cx, buf))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.poll_with(cx, |w, cx| w.poll_flush(cx))
+        self.poll_io(cx, (), |w, cx| w.poll_flush(cx))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.poll_with(cx, |w, cx| w.poll_shutdown(cx))
+        self.poll_io(cx, (), |w, cx| w.poll_shutdown(cx))
     }
 }
 
@@ -270,7 +311,7 @@ impl AsyncWrite for ClientSlot {
 /// follows the attached client, submit the opening prompt, then serve
 /// clients one at a time — the session lives across attach/detach.
 pub async fn serve_on(listener: Listener, served: Served, token: String) {
-    let slot = ClientSlot::default();
+    let slot = ClientSlot::new(served.client_write_timeout);
     let writer = crate::acp::Writer::new(slot.clone());
     let connection = Connection::hosting(
         writer,
@@ -337,14 +378,16 @@ async fn switch_client(
     caps: ClientCaps,
 ) {
     connection.set_client_caps(caps);
-    connection.forget_prompts();
+    if write.is_some() {
+        connection.forget_prompts();
+    }
     let adopt = connection.caps_adopter();
     let writer = connection.writer().clone();
     writer
         .next_client(|| {
             adopt();
             if let Some(write) = write {
-                *slot.lock() = write;
+                slot.replace(write);
             }
         })
         .await;
@@ -377,6 +420,12 @@ async fn accept_loop(
                             ask_expiry.as_secs()
                         ))
                         .await;
+                }
+            }
+            () = slot.dropped.notified() => {
+                if reader.is_some() && slot.is_empty() {
+                    reader = None;
+                    switch_client(&mut connection, &slot, Some(None), detached_caps()).await;
                 }
             }
             accepted = listener.accept() => {
@@ -581,6 +630,7 @@ mod tests {
             handle,
             prompt: None,
             ask_expiry,
+            client_write_timeout: CLIENT_WRITE_TIMEOUT,
         }
     }
 
@@ -754,6 +804,8 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let mut second = Client::attach(&id, hotl_caps()).await;
+        let announced = second.next().await.expect("the parked call");
+        assert_eq!(announced["params"]["update"]["sessionUpdate"], "tool_call");
         let reissued = second.next().await.expect("the parked ask");
         assert_eq!(reissued["method"], "session/request_permission");
         assert_eq!(reissued["id"], asked["id"], "the same parked ask, same id");
@@ -1011,8 +1063,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let mut client = Client::attach(&id, hotl_caps()).await;
-        let asked = client.next().await.expect("the parked egress ask");
-        assert_eq!(asked["method"], "session/request_permission");
+        let asked = client.request_of("session/request_permission").await;
         assert_eq!(
             asked["params"]["toolCall"]["_meta"]["hotl.dev/egress"]["host"],
             "registry.npmjs.org"
@@ -1166,11 +1217,11 @@ mod tests {
         let text = serde_json::to_string(&got).unwrap();
         assert!(!text.contains("hotl.dev/"), "{text}");
         assert!(
-            got.iter()
-                .all(|m| m["method"] == "session/request_permission"),
-            "only the two permission requests, nothing the client did not offer: {text}"
+            got.iter().all(|m| m["method"] == "session/request_permission"
+                || m["params"]["update"]["sessionUpdate"] == "tool_call"),
+            "only the two permission requests and their calls, nothing the client did not offer: {text}"
         );
-        assert_eq!(got.len(), 2, "{text}");
+        assert_eq!(got.len(), 4, "{text}");
         drop(plain);
         settle().await;
 
@@ -1180,7 +1231,11 @@ mod tests {
         )
         .await;
         let got = drained(&mut hotl).await;
-        let methods: Vec<&str> = got.iter().filter_map(|m| m["method"].as_str()).collect();
+        let requests: Vec<&Value> = got.iter().filter(|m| m.get("id").is_some()).collect();
+        let methods: Vec<&str> = requests
+            .iter()
+            .filter_map(|m| m["method"].as_str())
+            .collect();
         assert_eq!(
             methods,
             [
@@ -1191,11 +1246,11 @@ mod tests {
             "the question stayed parked for a client that can answer it"
         );
         assert_eq!(
-            got[0]["params"]["toolCall"]["_meta"]["hotl.dev/ask"]["summary"],
+            requests[0]["params"]["toolCall"]["_meta"]["hotl.dev/ask"]["summary"],
             "bash: rm -rf build"
         );
         assert_eq!(
-            got[2]["params"]["toolCall"]["_meta"]["hotl.dev/egress"]["host"],
+            requests[2]["params"]["toolCall"]["_meta"]["hotl.dev/egress"]["host"],
             "example.com"
         );
     }
@@ -1227,7 +1282,7 @@ mod tests {
         let _egress = inject_egress(&events).await;
         settle().await;
         let mut hotl = Client::attach(&id, hotl_caps()).await;
-        let asked = hotl.next().await.expect("the parked egress ask");
+        let asked = hotl.request_of("session/request_permission").await;
         assert!(
             matches!(
                 hotl_tui::client::decode(&asked),
@@ -1267,7 +1322,11 @@ mod tests {
         let _ask = inject_ask(&events).await;
         settle().await;
         let mut client = Client::attach(&id, hotl_caps()).await;
-        assert_eq!(drained(&mut client).await.len(), 1, "the parked ask, once");
+        assert_eq!(
+            drained(&mut client).await.len(),
+            2,
+            "the parked ask and its call, once"
+        );
         let resume = json!({"sessionId": "test", "cwd": std::env::temp_dir()});
         client.request("session/resume", resume.clone()).await;
         let again = drained(&mut client).await;
@@ -1308,6 +1367,225 @@ mod tests {
         assert!(got
             .iter()
             .any(|m| m["params"]["update"]["sessionUpdate"] == "usage_update"));
+    }
+
+    #[tokio::test]
+    async fn a_parked_ask_is_announced_again_before_it_is_re_sent() {
+        let (handle, events) = injected();
+        let (id, _task) = start(handle, std::time::Duration::ZERO);
+        let _ask = inject_ask(&events).await;
+        let _egress = inject_egress(&events).await;
+        settle().await;
+        let mut plain = Client::attach(&id, plain_caps()).await;
+        let got = drained(&mut plain).await;
+        let shape: Vec<(String, String)> = got
+            .iter()
+            .map(|m| {
+                let call = m["params"]["update"]["toolCallId"]
+                    .as_str()
+                    .or(m["params"]["toolCall"]["toolCallId"].as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let kind = m["params"]["update"]["sessionUpdate"]
+                    .as_str()
+                    .or(m["method"].as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                (kind, call)
+            })
+            .collect();
+        let egress = shape[3].1.clone();
+        assert!(egress.starts_with("egress-"), "{shape:?}");
+        assert_eq!(
+            shape,
+            [
+                ("tool_call".to_string(), "c1".to_string()),
+                ("session/request_permission".to_string(), "c1".to_string()),
+                ("tool_call".to_string(), egress.clone()),
+                ("session/request_permission".to_string(), egress),
+            ],
+            "{got:?}"
+        );
+        assert_eq!(got[0]["params"]["update"]["status"], "pending");
+        assert_eq!(got[2]["params"]["update"]["kind"], "fetch");
+    }
+
+    #[tokio::test]
+    async fn a_settle_reaches_only_the_client_the_ask_was_shown_to() {
+        let (handle, events) = injected();
+        let (id, _task) = start(handle, std::time::Duration::from_millis(300));
+        let mut first = Client::attach(&id, plain_caps()).await;
+        let expired = inject_egress(&events).await;
+        first.request_of("session/request_permission").await;
+        drop(first);
+        settle().await;
+        let mut second = Client::connect(&id).await;
+        let init = second.initialize(Some("tok"), plain_caps()).await;
+        second.reply_to(init).await;
+        assert_eq!(
+            expired.await.unwrap(),
+            hotl_tools::net::EgressDecision::NoAnswer
+        );
+        let got = drained(&mut second).await;
+        assert!(got.is_empty(), "a settle for a call it never saw: {got:?}");
+
+        let answered = inject_egress(&events).await;
+        second
+            .request(
+                "session/resume",
+                json!({"sessionId": "test", "cwd": std::env::temp_dir()}),
+            )
+            .await;
+        let asked = second.request_of("session/request_permission").await;
+        let call = asked["params"]["toolCall"]["toolCallId"].clone();
+        second.allow(&asked["id"]).await;
+        assert_eq!(
+            answered.await.unwrap(),
+            hotl_tools::net::EgressDecision::Allow
+        );
+        let settled = second
+            .until(|m| {
+                m["params"]["update"]["toolCallId"] == call
+                    && m["params"]["update"]["sessionUpdate"] == "tool_call_update"
+            })
+            .await;
+        assert_eq!(settled["params"]["update"]["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn a_new_initialize_on_the_same_connection_keeps_the_prompt_reply_it_is_owed() {
+        let (id, _task) = start(scripted_session(), std::time::Duration::ZERO);
+        let mut client = Client::attach(&id, hotl_caps()).await;
+        let prompt = client.prompt("go").await;
+        client.request_of("session/request_permission").await;
+        let init = client.initialize(Some("tok"), hotl_caps()).await;
+        client.reply_to(init).await;
+        client
+            .request(
+                "session/resume",
+                json!({"sessionId": "test", "cwd": std::env::temp_dir()}),
+            )
+            .await;
+        let ask = client.request_of("session/request_permission").await;
+        client.allow(&ask["id"]).await;
+        assert_eq!(
+            client.reply_to(prompt).await["result"]["stopReason"],
+            "end_turn"
+        );
+    }
+
+    fn start_with_write_stall(
+        handle: SessionHandle,
+        stall: std::time::Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let id = endpoint_id("stall");
+        let listener = hotl_platform::IPC.bind_private(&id).unwrap();
+        let mut served = served(handle, std::time::Duration::ZERO);
+        served.client_write_timeout = stall;
+        let task = tokio::spawn(serve_on(listener, served, "tok".into()));
+        (id, task)
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stops_reading_is_dropped_and_takeover_and_stop_proceed() {
+        let (handle, events) = injected();
+        let (id, task) = start_with_write_stall(handle, std::time::Duration::from_millis(300));
+        let mut stalled = Client::attach(&id, hotl_caps()).await;
+        let flooding = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flood = {
+            let flooding = Arc::clone(&flooding);
+            let events = events.clone();
+            tokio::spawn(async move {
+                let chunk = "x".repeat(64 * 1024);
+                while flooding.load(std::sync::atomic::Ordering::SeqCst) {
+                    if events
+                        .send(EngineEvent::TextDelta(chunk.clone()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut next = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut next = Client::connect(&id).await;
+            let init = next.initialize(Some("tok"), hotl_caps()).await;
+            next.reply_to(init).await;
+            next
+        })
+        .await
+        .expect("takeover waits behind the stalled client's write");
+        flooding.store(false, std::sync::atomic::Ordering::SeqCst);
+        let asking = tokio::spawn(async move {
+            flood.await.unwrap();
+            Some(inject_ask(&events).await)
+        });
+        let asked = next.request_of("session/request_permission").await;
+        assert_eq!(asked["params"]["toolCall"]["toolCallId"], "c1");
+        let _answer = asking.await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stalled client was never closed"
+            );
+            match tokio::time::timeout(std::time::Duration::from_secs(5), stalled.lines.next_line())
+                .await
+            {
+                Ok(Ok(Some(_))) => continue,
+                Ok(Ok(None)) | Ok(Err(_)) => break,
+                Err(_) => panic!("the stalled client is still open"),
+            }
+        }
+
+        let stop = next.request("_hotl/session/stop", json!({})).await;
+        assert_eq!(next.reply_to(stop).await["result"]["ok"], true);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the server exits on stop")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lone_client_that_stops_reading_is_detached_and_its_ask_stays_parked() {
+        let (handle, events) = injected();
+        let (id, _task) = start_with_write_stall(handle, std::time::Duration::from_millis(300));
+        let mut stalled = Client::attach(&id, hotl_caps()).await;
+        let mut answer = inject_ask(&events).await;
+        let chunk = "x".repeat(64 * 1024);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for _ in 0..64 {
+                events
+                    .send(EngineEvent::TextDelta(chunk.clone()))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .expect("the drain waits behind the stalled client's write");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stalled client was never closed"
+            );
+            match tokio::time::timeout(std::time::Duration::from_secs(5), stalled.lines.next_line())
+                .await
+            {
+                Ok(Ok(Some(_))) => continue,
+                Ok(Ok(None)) | Ok(Err(_)) => break,
+                Err(_) => panic!("the stalled client is still open"),
+            }
+        }
+        assert!(answer.try_recv().is_err(), "the ask stays parked");
+        let mut next = Client::attach(&id, hotl_caps()).await;
+        let asked = next.request_of("session/request_permission").await;
+        next.allow(&asked["id"]).await;
+        assert_eq!(answer.await.unwrap(), hotl_engine::AskReply::Allow);
     }
 
     #[tokio::test]

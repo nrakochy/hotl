@@ -75,8 +75,12 @@ impl Writer {
     }
 
     fn stamped(&self) -> Writer {
+        self.stamped_for(self.client())
+    }
+
+    fn stamped_for(&self, client: u64) -> Writer {
         Writer {
-            seen: Some(self.client()),
+            seen: Some(client),
             ..self.clone()
         }
     }
@@ -169,6 +173,35 @@ impl Request {
     }
 }
 
+impl Request {
+    fn announce(&self, id: u64, caps: &ClientCaps) -> Option<Value> {
+        let (session_id, call) = match self {
+            Request::Ask {
+                session_id,
+                ext,
+                plain,
+                ..
+            } => (
+                session_id,
+                if caps.ext {
+                    (**ext).clone()
+                } else {
+                    (**plain).clone()
+                },
+            ),
+            Request::Egress { session_id, host } => {
+                (session_id, crate::acp_map::egress_tool_call(id, host, caps))
+            }
+            Request::Question { .. } => return None,
+        };
+        let params = SessionNotification {
+            session_id: session_id.clone(),
+            update: crate::acp_map::announce(&call),
+        };
+        Some(json!({"jsonrpc": "2.0", "method": "session/update", "params": to_json(&params)}))
+    }
+}
+
 fn form_of(question: &hotl_types::Question, caps: &ClientCaps) -> Option<FormAsk> {
     caps.elicitation_form.then(|| FormAsk {
         offered: question.options.iter().map(|o| o.label.clone()).collect(),
@@ -176,18 +209,35 @@ fn form_of(question: &hotl_types::Question, caps: &ClientCaps) -> Option<FormAsk
     })
 }
 
+#[derive(Clone)]
+pub(crate) struct ShownTo(Arc<std::sync::atomic::AtomicU64>);
+
+impl ShownTo {
+    pub(crate) fn new(client: u64) -> Self {
+        ShownTo(Arc::new(std::sync::atomic::AtomicU64::new(client)))
+    }
+
+    fn get(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn set(&self, client: u64) {
+        self.0.store(client, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 pub(crate) struct Sent {
     pub(crate) what: Request,
     pub(crate) at: std::time::Instant,
-    pub(crate) client: u64,
+    pub(crate) client: ShownTo,
 }
 
 impl Sent {
-    fn to(what: Request, writer: &Writer) -> Self {
+    fn to(what: Request, client: ShownTo) -> Self {
         Sent {
             what,
             at: std::time::Instant::now(),
-            client: writer.client(),
+            client,
         }
     }
 }
@@ -725,7 +775,7 @@ impl Connection {
             None => self.client_caps,
         };
         let client = self.writer.client();
-        let fresh = |sent: &Sent| sent.client != client;
+        let fresh = |sent: &Sent| sent.client.get() != client;
         let mut parked: Vec<(u64, Value)> = Vec::new();
         {
             let mut asks = self
@@ -736,7 +786,8 @@ impl Connection {
             for (id, slot) in asks.iter_mut().filter(|(_, slot)| fresh(&slot.sent)) {
                 if let Some(request) = slot.sent.what.build(*id, &caps) {
                     slot.ext = caps.ext;
-                    slot.sent.client = client;
+                    slot.sent.client.set(client);
+                    parked.extend(slot.sent.what.announce(*id, &caps).map(|a| (*id, a)));
                     parked.push((*id, request));
                 }
             }
@@ -752,7 +803,7 @@ impl Connection {
                     if let Request::Question { question, .. } = &slot.sent.what {
                         slot.form = form_of(question, &caps);
                     }
-                    slot.sent.client = client;
+                    slot.sent.client.set(client);
                     parked.push((*id, request));
                 }
             }
@@ -765,7 +816,8 @@ impl Connection {
             egress.retain(|_, slot| !slot.reply.is_closed());
             for (id, slot) in egress.iter_mut().filter(|(_, slot)| fresh(&slot.sent)) {
                 if let Some(request) = slot.sent.what.build(*id, &caps) {
-                    slot.sent.client = client;
+                    slot.sent.client.set(client);
+                    parked.extend(slot.sent.what.announce(*id, &caps).map(|a| (*id, a)));
                     parked.push((*id, request));
                 }
             }
@@ -825,7 +877,7 @@ impl Connection {
             .collect();
         for id in ids {
             if let Some(slot) = egress.remove(&id) {
-                let _ = slot.reply.send(hotl_tools::net::EgressDecision::Deny);
+                let _ = slot.reply.send(hotl_tools::net::EgressDecision::NoAnswer);
                 n += 1;
             }
         }
@@ -2723,6 +2775,7 @@ struct EngineLink {
 fn settle_on_answer<T: Send + 'static>(
     reply: oneshot::Sender<T>,
     writer: Writer,
+    shown: ShownTo,
     session_id: String,
     tool_call_id: String,
     allowed: fn(&T) -> bool,
@@ -2738,7 +2791,7 @@ fn settle_on_answer<T: Send + 'static>(
                 let done = allowed(&answer);
                 let _ = reply.send(answer);
                 send_update(
-                    &writer,
+                    &writer.stamped_for(shown.get()),
                     &session_id,
                     crate::acp_map::settled(tool_call_id, done),
                 )
@@ -2899,10 +2952,12 @@ async fn drain_events(
                     let shown = if caps.ext { &ext } else { &plain };
                     send_update(&out, &session_id, crate::acp_map::announce(shown)).await;
                 }
+                let shown = ShownTo::new(out.client());
                 let reply = if origin.is_synthetic() {
                     settle_on_answer(
                         reply,
                         writer.clone(),
+                        shown.clone(),
                         session_id.clone(),
                         plain.tool_call_id.clone(),
                         |r: &AskReply| {
@@ -2929,7 +2984,7 @@ async fn drain_events(
                             reply,
                             offered: options,
                             ext: caps.ext,
-                            sent: Sent::to(what, &out),
+                            sent: Sent::to(what, shown),
                         },
                     );
                 if let Some(request) = request {
@@ -2955,7 +3010,7 @@ async fn drain_events(
                                 QuestionSlot {
                                     reply,
                                     form,
-                                    sent: Sent::to(what, &out),
+                                    sent: Sent::to(what, ShownTo::new(out.client())),
                                 },
                             );
                         send(&out, &request).await;
@@ -2973,9 +3028,11 @@ async fn drain_events(
                 req_id += 1;
                 let call = crate::acp_map::egress_tool_call(req_id, &host, &caps);
                 send_update(&out, &session_id, crate::acp_map::announce(&call)).await;
+                let shown = ShownTo::new(out.client());
                 let reply = settle_on_answer(
                     reply,
                     writer.clone(),
+                    shown.clone(),
                     session_id.clone(),
                     call.tool_call_id,
                     |d: &hotl_tools::net::EgressDecision| {
@@ -2994,7 +3051,7 @@ async fn drain_events(
                         req_id,
                         EgressSlot {
                             reply,
-                            sent: Sent::to(what, &out),
+                            sent: Sent::to(what, shown),
                         },
                     );
                 if let Some(request) = request {
@@ -3457,7 +3514,7 @@ mod parked_tests {
         Sent {
             what,
             at,
-            client: u64::MAX,
+            client: ShownTo::new(u64::MAX),
         }
     }
 
@@ -3498,10 +3555,38 @@ mod parked_tests {
         }
         assert_eq!(connection.pending.lock().unwrap().len(), 1);
         let parked = connection.parked_requests();
-        assert_eq!(parked.len(), 1);
-        assert_eq!(parked[0]["id"], 2);
+        assert_eq!(parked.len(), 2);
+        assert_eq!(parked[0]["params"]["update"]["sessionUpdate"], "tool_call");
+        assert_eq!(parked[1]["id"], 2);
         drop(fresh_rx);
         assert!(connection.parked_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_expired_egress_ask_is_no_answer_not_a_session_deny() {
+        let connection = connection();
+        let (reply, rx) = oneshot::channel();
+        connection.pending_egress.lock().unwrap().insert(
+            1,
+            EgressSlot {
+                reply,
+                sent: sent_at(
+                    Request::Egress {
+                        session_id: "s".into(),
+                        host: "example.com".into(),
+                    },
+                    two_hours_ago(),
+                ),
+            },
+        );
+        assert_eq!(
+            connection.expire_parked(std::time::Duration::from_secs(3600)),
+            1
+        );
+        assert_eq!(
+            rx.await.expect("the expired egress ask was answered"),
+            hotl_tools::net::EgressDecision::NoAnswer
+        );
     }
 
     #[tokio::test]
@@ -3590,7 +3675,7 @@ mod question_reply_tests {
             sent: Sent {
                 what: question_request(&["MVP"]),
                 at: std::time::Instant::now(),
-                client: 0,
+                client: ShownTo::new(0),
             },
         };
         let msg =
@@ -3616,7 +3701,7 @@ mod ask_reply_tests {
                 sent: Sent {
                     what: ask_request(summary),
                     at: std::time::Instant::now(),
-                    client: 0,
+                    client: ShownTo::new(0),
                 },
             },
             rx,

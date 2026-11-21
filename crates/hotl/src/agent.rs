@@ -1332,6 +1332,7 @@ pub async fn serve_main(
         handle,
         prompt,
         ask_expiry,
+        client_write_timeout: crate::session_server::CLIENT_WRITE_TIMEOUT,
     })
     .await
 }
