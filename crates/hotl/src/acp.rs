@@ -3321,16 +3321,20 @@ async fn drain_events(
                                         book.schemas.insert(tag, ask);
                                         book.current.push(tag);
                                     }
-                                    if let Some(engine) = link.engine.upgrade() {
-                                        engine
-                                            .prompt_structured_answering(
-                                                tag,
-                                                hotl_workflow::structured::retry_feedback(&e),
-                                                hotl_types::SyntheticReason::RetryFeedback,
-                                                format,
-                                            )
-                                            .await;
-                                    }
+                                    let engine = link.engine.clone();
+                                    let feedback = hotl_workflow::structured::retry_feedback(&e);
+                                    tokio::spawn(async move {
+                                        if let Some(engine) = engine.upgrade() {
+                                            engine
+                                                .prompt_structured_answering(
+                                                    tag,
+                                                    feedback,
+                                                    hotl_types::SyntheticReason::RetryFeedback,
+                                                    format,
+                                                )
+                                                .await;
+                                        }
+                                    });
                                     continue;
                                 }
                                 Err(e) => invalid = Some(e),
