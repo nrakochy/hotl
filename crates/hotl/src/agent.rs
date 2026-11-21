@@ -1545,9 +1545,10 @@ async fn scaffold(
         max_agents: wf_max_agents,
     };
     let workflow_gate = Arc::new(tokio::sync::Semaphore::new(wf_concurrency));
-    let plan_files = plan_files_for(&cfg, &cwd);
+    let project = hotl_store::project::id(&cwd);
+    let plan_files = plan_files_at(&project, cfg.plan.repo_dir.as_deref(), &cwd);
     // The memory dial (0069): on the session config, read once here.
-    let (memory_files, memory_warning) = memory_files_for(&cfg, &cwd);
+    let (memory_files, memory_warning) = memory_files_for(&cfg, project);
     warnings.extend(memory_warning.map(|w| format!("WARNING — {w}")));
     config.memory_files = memory_files;
     config.ask_expiry = cfg.behavior.ask_expiry();
@@ -1802,20 +1803,19 @@ impl Scaffold {
 /// and reads as `read-only`.
 fn memory_files_for(
     cfg: &crate::config::Config,
-    cwd: &std::path::Path,
+    project: String,
 ) -> (Option<hotl_engine::MemoryFiles>, Option<String>) {
     let (mode, warning) = match cfg.memory.mode() {
         Ok(m) => (m, None),
         Err(w) => (hotl_engine::MemoryMode::ReadOnly, Some(w)),
     };
-    (memory_files_at(mode, cwd), warning)
+    (memory_files_at(project, mode), warning)
 }
 
 fn memory_files_at(
+    project: String,
     mode: hotl_engine::MemoryMode,
-    cwd: &std::path::Path,
 ) -> Option<hotl_engine::MemoryFiles> {
-    let project = hotl_store::project::id(cwd);
     Some(hotl_engine::MemoryFiles {
         dir: data_dir().join("memory").join(&project),
         project,
@@ -1832,9 +1832,13 @@ fn files_for_root(
     Option<hotl_engine::PlanFiles>,
     Option<hotl_engine::MemoryFiles>,
 ) {
+    if plan.is_none() && memory.is_none() {
+        return (None, None);
+    }
+    let project = hotl_store::project::id(root);
     (
-        plan.and_then(|_| plan_files_at(plan_repo_dir, root)),
-        memory.and_then(|m| memory_files_at(m.mode, root)),
+        plan.and_then(|_| plan_files_at(&project, plan_repo_dir, root)),
+        memory.and_then(|m| memory_files_at(project.clone(), m.mode)),
     )
 }
 
@@ -1853,16 +1857,12 @@ fn clamp_headless_memory(config: &mut EngineConfig) {
 /// id>`, plus the optional in-repo mirror `[plan] repo_dir` asks for. A
 /// relative `repo_dir` is resolved against the workspace; the mirror is the
 /// markdown only.
-fn plan_files_for(
-    cfg: &crate::config::Config,
+fn plan_files_at(
+    project: &str,
+    repo_dir: Option<&str>,
     cwd: &std::path::Path,
 ) -> Option<hotl_engine::PlanFiles> {
-    plan_files_at(cfg.plan.repo_dir.as_deref(), cwd)
-}
-
-fn plan_files_at(repo_dir: Option<&str>, cwd: &std::path::Path) -> Option<hotl_engine::PlanFiles> {
-    let project = hotl_store::project::id(cwd);
-    let dir = data_dir().join("plans").join(&project);
+    let dir = data_dir().join("plans").join(project);
     let repo_mirror = repo_dir.map(|d| {
         let base = std::path::Path::new(d);
         let base = if base.is_absolute() {
@@ -1873,7 +1873,7 @@ fn plan_files_at(repo_dir: Option<&str>, cwd: &std::path::Path) -> Option<hotl_e
         base.join("hotl-plan.md")
     });
     Some(hotl_engine::PlanFiles {
-        project,
+        project: project.to_string(),
         dir,
         repo_mirror,
     })
@@ -9986,8 +9986,9 @@ mod worktree_session_tests {
     fn plan_and_memory_files_follow_the_session_root() {
         let root = tempfile::tempdir().unwrap();
         let cwd = std::env::current_dir().unwrap();
-        let plan = plan_files_at(Some("docs"), &cwd);
-        let memory = memory_files_at(hotl_engine::MemoryMode::ReadWrite, &cwd);
+        let here = hotl_store::project::id(&cwd);
+        let plan = plan_files_at(&here, Some("docs"), &cwd);
+        let memory = memory_files_at(here, hotl_engine::MemoryMode::ReadWrite);
         let id = hotl_store::project::id(root.path());
         assert_ne!(id, hotl_store::project::id(&cwd));
         let (p, m) = files_for_root(plan.as_ref(), Some("docs"), memory.as_ref(), root.path());
