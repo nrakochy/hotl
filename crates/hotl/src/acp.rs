@@ -3468,7 +3468,6 @@ async fn drain_events(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn reply_turn_end(
     writer: &Writer,
     id: Value,
