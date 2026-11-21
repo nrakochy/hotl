@@ -248,7 +248,13 @@ fn main() {
         }
         Some("acp") => std::process::exit(block_on(agent::acp_main())),
         Some("bg") => {
-            let resume = bg_resume(&args);
+            let resume = match bg_resume(&args) {
+                Ok(resume) => resume,
+                Err((code, msg)) => {
+                    eprintln!("hotl bg: {msg}");
+                    std::process::exit(code);
+                }
+            };
             let worktree = bg_worktree(&args);
             if let Some((code, msg)) = resume_conflict(resume.as_deref(), worktree.as_ref()) {
                 eprintln!("hotl bg: {msg}");
@@ -270,7 +276,13 @@ fn main() {
                 name,
                 worktree,
                 resume,
-            } = parse_serve_args(&args);
+            } = match parse_serve_args(&args) {
+                Ok(parsed) => parsed,
+                Err((code, msg)) => {
+                    eprintln!("hotl serve: {msg}");
+                    std::process::exit(code);
+                }
+            };
             if let Some((code, msg)) = resume_conflict(resume.as_deref(), worktree.as_ref()) {
                 eprintln!("hotl serve: {msg}");
                 std::process::exit(code);
@@ -454,14 +466,21 @@ fn bg_name(args: &[String]) -> Option<String> {
     None
 }
 
-fn bg_resume(args: &[String]) -> Option<String> {
+fn bg_resume(args: &[String]) -> Result<Option<String>, (i32, &'static str)> {
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         if a == "--resume" {
-            return it.next().cloned();
+            return resume_id(it.next()).map(Some);
         }
     }
-    None
+    Ok(None)
+}
+
+fn resume_id(next: Option<&String>) -> Result<String, (i32, &'static str)> {
+    match next {
+        Some(id) if !id.starts_with('-') => Ok(id.clone()),
+        _ => Err((2, "--resume needs a session id")),
+    }
 }
 
 fn resume_conflict(
@@ -485,7 +504,7 @@ struct ServeArgs {
     resume: Option<String>,
 }
 
-fn parse_serve_args(args: &[String]) -> ServeArgs {
+fn parse_serve_args(args: &[String]) -> Result<ServeArgs, (i32, &'static str)> {
     let mut id = None;
     let mut prompt = None;
     let mut name = None;
@@ -500,17 +519,17 @@ fn parse_serve_args(args: &[String]) -> ServeArgs {
             // Always spelled on the wire: `@derived` is a request, an absent
             // flag is none.
             "--worktree" => worktree = it.next().map(|w| tui::WorktreeArg::from_wire(w)),
-            "--resume" => resume = it.next().cloned(),
+            "--resume" => resume = Some(resume_id(it.next())?),
             _ => {}
         }
     }
-    ServeArgs {
+    Ok(ServeArgs {
         id: id.unwrap_or_else(|| format!("bg-{}", std::process::id())),
         prompt,
         name,
         worktree,
         resume,
-    }
+    })
 }
 
 /// One-shot CLI paths run current_thread per the async policy (no pool
@@ -782,24 +801,24 @@ mod tests {
 
     #[test]
     fn serve_args_carry_a_name() {
-        let a = super::parse_serve_args(&v(&["serve", "--id", "x", "--name", "fix-auth"]));
+        let a = super::parse_serve_args(&v(&["serve", "--id", "x", "--name", "fix-auth"])).unwrap();
         assert_eq!(a.name.as_deref(), Some("fix-auth"));
         assert_eq!(a.worktree, None);
     }
 
     #[test]
     fn serve_args_carry_a_resume_id() {
-        let a = super::parse_serve_args(&v(&["serve", "--id", "x", "--resume", "01ABC"]));
+        let a = super::parse_serve_args(&v(&["serve", "--id", "x", "--resume", "01ABC"])).unwrap();
         assert_eq!(a.resume.as_deref(), Some("01ABC"));
         assert_eq!(a.id, "x");
-        let a = super::parse_serve_args(&v(&["serve", "--id", "x"]));
+        let a = super::parse_serve_args(&v(&["serve", "--id", "x"])).unwrap();
         assert_eq!(a.resume, None);
     }
 
     #[test]
     fn bg_forwards_resume_to_serve() {
         let args = v(&["bg", "--resume", "01ABC", "keep going"]);
-        assert_eq!(super::bg_resume(&args).as_deref(), Some("01ABC"));
+        assert_eq!(super::bg_resume(&args).unwrap().as_deref(), Some("01ABC"));
         assert_eq!(super::bg_prompt(&args), Some("keep going"));
         let cmd = crate::bg::serve_command(
             std::path::Path::new("/bin/hotl"),
@@ -807,7 +826,7 @@ mod tests {
             super::bg_prompt(&args),
             None,
             None,
-            super::bg_resume(&args).as_deref(),
+            super::bg_resume(&args).unwrap().as_deref(),
         );
         let got: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(
@@ -850,13 +869,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resume_without_an_id_is_refused_by_bg_and_serve() {
+        let refused: Result<Option<String>, _> = Err((2, "--resume needs a session id"));
+        for args in [
+            v(&["bg", "--resume"]),
+            v(&["bg", "--resume", "--name", "x"]),
+            v(&["bg", "--resume", "-w"]),
+        ] {
+            assert_eq!(super::bg_resume(&args), refused, "{args:?}");
+        }
+        for args in [
+            v(&["serve", "--id", "x", "--resume"]),
+            v(&["serve", "--resume", "--id", "x"]),
+        ] {
+            assert_eq!(
+                super::parse_serve_args(&args).err(),
+                refused.clone().err(),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            super::bg_resume(&v(&["bg", "--resume", "01ABC"])),
+            Ok(Some("01ABC".to_string()))
+        );
+        assert_eq!(super::bg_resume(&v(&["bg", "fix it"])), Ok(None));
+    }
+
     /// 0065: the derived case is spelled on the wire, so an absent flag and a
     /// derived request never read the same.
     #[test]
     fn serve_args_carry_a_derived_worktree() {
-        let a = super::parse_serve_args(&v(&["serve", "--id", "x", "--worktree", "@derived"]));
+        let a =
+            super::parse_serve_args(&v(&["serve", "--id", "x", "--worktree", "@derived"])).unwrap();
         assert_eq!(a.worktree, Some(crate::tui::WorktreeArg::Derived));
-        let a = super::parse_serve_args(&v(&["serve", "--id", "x", "--worktree", "fix-auth"]));
+        let a =
+            super::parse_serve_args(&v(&["serve", "--id", "x", "--worktree", "fix-auth"])).unwrap();
         assert_eq!(
             a.worktree,
             Some(crate::tui::WorktreeArg::Named("fix-auth".into()))
