@@ -34,6 +34,7 @@ mod plan_artifact;
 mod plan_mode;
 mod prepared_payload_epoch;
 mod prompt_images;
+mod queued_notice;
 mod recall;
 mod rename;
 mod set_mode;
