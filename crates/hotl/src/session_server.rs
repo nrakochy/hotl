@@ -379,7 +379,8 @@ pub async fn serve_on(listener: Listener, served: Served, token: String) {
         slot,
         token,
         served.ask_expiry,
-        (status, signal),
+        status,
+        signal,
     )
     .await;
 }
@@ -456,7 +457,8 @@ async fn accept_loop(
     slot: ClientSlot,
     token: String,
     ask_expiry: std::time::Duration,
-    (mut status, signal): (StatusFile, RunSignal),
+    mut status: StatusFile,
+    signal: RunSignal,
 ) {
     let mut reader: Option<Lines> = None;
     let mut sweep = tokio::time::interval(sweep_period(ask_expiry));
