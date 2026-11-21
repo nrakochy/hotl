@@ -332,9 +332,13 @@ pub struct SessionInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RetryMeta {
-    #[schemars(description = "Which try is about to be made, counting from 1")]
+    #[schemars(
+        description = "Which try just failed, counting from 1; the next try is attempt + 1"
+    )]
     pub attempt: u32,
-    #[schemars(description = "How many tries the ladder allows")]
+    #[schemars(
+        description = "The limit for this kind of retry: the most tries in all (5) for a request that failed before any reply arrived, the most re-tries (2) for a reply cut off part way through"
+    )]
     pub max: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(description = "The HTTP status that caused the retry, when there was one")]

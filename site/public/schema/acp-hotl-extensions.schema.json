@@ -2271,7 +2271,7 @@
     "RetryMeta": {
       "properties": {
         "attempt": {
-          "description": "Which try is about to be made, counting from 1",
+          "description": "Which try just failed, counting from 1; the next try is attempt + 1",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -2283,7 +2283,7 @@
           "type": "integer"
         },
         "max": {
-          "description": "How many tries the ladder allows",
+          "description": "The limit for this kind of retry: the most tries in all (5) for a request that failed before any reply arrived, the most re-tries (2) for a reply cut off part way through",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
