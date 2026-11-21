@@ -1453,6 +1453,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_egress_ask_the_engine_abandons_settles_its_call_as_failed() {
+        let (handle, events) = injected();
+        let (id, _task) = start(handle, std::time::Duration::ZERO);
+        let mut client = Client::attach(&id, plain_caps()).await;
+        let abandoned = inject_egress(&events).await;
+        let asked = client.request_of("session/request_permission").await;
+        let call = asked["params"]["toolCall"]["toolCallId"].clone();
+        drop(abandoned);
+        let settled = client
+            .until(|m| {
+                m["params"]["update"]["toolCallId"] == call
+                    && m["params"]["update"]["sessionUpdate"] == "tool_call_update"
+            })
+            .await;
+        assert_eq!(settled["params"]["update"]["status"], "failed", "{settled}");
+    }
+
+    #[tokio::test]
     async fn a_new_initialize_on_the_same_connection_keeps_the_prompt_reply_it_is_owed() {
         let (id, _task) = start(scripted_session(), std::time::Duration::ZERO);
         let mut client = Client::attach(&id, hotl_caps()).await;

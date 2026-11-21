@@ -2637,6 +2637,7 @@ async fn retire_session(
         let _line = writer.sink.lock().await;
         old.drain.abort();
         let _ = (&mut old.drain).await;
+        writer.reinitialized();
     }
     pending
         .lock()
@@ -2831,7 +2832,14 @@ fn settle_on_answer<T: Send + 'static>(
                 )
                 .await;
             }
-            () = reply.closed() => {}
+            () = reply.closed() => {
+                send_update(
+                    &writer.stamped_for(shown.get()),
+                    &session_id,
+                    crate::acp_map::settled(tool_call_id, false),
+                )
+                .await;
+            }
         }
     });
     tx
