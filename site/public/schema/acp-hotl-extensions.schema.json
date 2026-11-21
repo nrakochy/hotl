@@ -2686,7 +2686,7 @@
   },
   "$id": "https://nrakochy.github.io/hotl/schema/acp-hotl-extensions.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "What hotl adds to ACP v1: the _hotl/ methods and the hotl.dev/ _meta keys. A client sees them only after it sets clientCapabilities._meta[\"hotl.dev/extensions\"] to 1 in initialize. Every standard ACP message follows the ACP v1 schema.",
+  "description": "What hotl adds to ACP v1: the _hotl/ methods and the hotl.dev/ _meta keys. A client sees them only after it sets clientCapabilities._meta[\"hotl.dev/extensions\"] to 1 in initialize, except hotl.dev/output, which answers any client that sent hotl.dev/outputSchema. Every standard ACP message follows the ACP v1 schema.",
   "meta": {
     "hotl.dev/ask": [
       {
@@ -2797,6 +2797,29 @@
         "on": "session/new, session/load, session/resume, _hotl/session/fork result: _meta",
         "schema": {
           "$ref": "#/$defs/SessionOpenExtras"
+        }
+      }
+    ],
+    "hotl.dev/output": [
+      {
+        "on": "session/prompt result: _meta (every client)",
+        "schema": {
+          "description": "The answer as JSON, valid against the request's hotl.dev/outputSchema"
+        }
+      }
+    ],
+    "hotl.dev/outputSchema": [
+      {
+        "on": "initialize result: agentCapabilities._meta",
+        "schema": {
+          "const": true
+        }
+      },
+      {
+        "on": "session/prompt params: _meta",
+        "schema": {
+          "description": "A JSON Schema the answer must fit; the reply carries the parsed answer in hotl.dev/output",
+          "type": "object"
         }
       }
     ],

@@ -269,7 +269,8 @@ fn every_hotl_meta_payload_validates_against_the_published_schema() {
             outcome: wire::OutcomeFrame::of(&Outcome::Done { text: "x".into() }),
             usage: wire::UsageFrame::of("claude-opus-5", &TokenUsage { input_tokens: 3, ..Default::default() }),
             mispredictions: Some(1),
-        }}}),
+        }, acp::META_OUTPUT: {"n": 3}}}),
+        json!({"prompt": [], "_meta": {acp::META_OUTPUT_SCHEMA: {"type": "object"}}}),
         json!({"_meta": {acp::META_MODEL: acp_ext::ModelChange {
             model: "a".into(), previous: "b".into(), context_tokens: 1, context_window: 2,
         }}}),

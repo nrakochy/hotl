@@ -28,7 +28,7 @@ use crate::acp_types::{
     NoticeSeverity, PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionRequest,
     ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionInfo,
     SessionInfoUpdate, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, UsageUpdate,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, TurnErrorData, UsageUpdate,
 };
 
 pub const ACP_PROTOCOL_VERSION: u16 = 1;
@@ -371,6 +371,29 @@ struct PromptBook {
     ids: HashMap<u64, Value>,
     current: Vec<u64>,
     cancelled: std::collections::HashSet<u64>,
+    schemas: HashMap<u64, SchemaAsk>,
+}
+
+struct SchemaAsk {
+    schema: Arc<Value>,
+    retries: u32,
+    usage: hotl_types::TokenUsage,
+}
+
+fn output_schema(meta: Option<&crate::acp_types::Meta>) -> Result<Option<Value>, String> {
+    let Some(schema) = meta.and_then(|m| m.get(META_OUTPUT_SCHEMA)) else {
+        return Ok(None);
+    };
+    if !schema.is_object() {
+        return Err("a schema must be a JSON object".into());
+    }
+    jsonschema::validator_for(schema).map_err(|e| e.to_string())?;
+    Ok(Some(schema.clone()))
+}
+
+fn check_output(schema: &Value, text: &str) -> Result<Value, String> {
+    let validator = jsonschema::validator_for(schema).map_err(|e| e.to_string())?;
+    hotl_workflow::structured::validate(&validator, text)
 }
 
 fn lock_prompts(book: &PendingPrompt) -> std::sync::MutexGuard<'_, PromptBook> {
@@ -392,6 +415,7 @@ fn answer_dropped(
             let id = {
                 let mut b = lock_prompts(&book);
                 b.cancelled.remove(&tag);
+                b.schemas.remove(&tag);
                 b.ids.remove(&tag)
             };
             if let Some(id) = id {
@@ -835,7 +859,7 @@ impl Connection {
     }
 
     pub(crate) fn handle(&self) -> Option<&SessionHandle> {
-        self.session.as_ref().map(|s| &s.handle)
+        self.session.as_ref().map(|s| &*s.handle)
     }
 
     pub(crate) fn session_id(&self) -> Option<&str> {
@@ -962,6 +986,7 @@ impl Connection {
         let mut book = lock_prompts(&state.book);
         book.ids.clear();
         book.cancelled.clear();
+        book.schemas.clear();
     }
 
     pub(crate) fn expire_parked(&self, after: std::time::Duration) -> usize {
@@ -1095,7 +1120,7 @@ struct SessionState {
     store_id: String,
     cwd: std::path::PathBuf,
     mcp: Vec<hotl_mcp::config::ServerConfig>,
-    handle: SessionHandle,
+    handle: Arc<SessionHandle>,
     config: SharedConfig,
     caps: SharedCaps,
     mode: String,
@@ -1489,11 +1514,42 @@ async fn handle_request(
                     .await
                 }
             };
+            let schema = match output_schema(request.meta.as_ref()) {
+                Ok(schema) => schema,
+                Err(e) => {
+                    return reply_err(
+                        writer,
+                        id,
+                        codes::INVALID_PARAMS,
+                        &format!(
+                            "session/prompt: _meta[\"{META_OUTPUT_SCHEMA}\"] is not a valid JSON Schema: {e}"
+                        ),
+                    )
+                    .await
+                }
+            };
+            let text = match &schema {
+                Some(schema) => format!(
+                    "{text}\n\n{}",
+                    hotl_workflow::structured::contract_text(schema)
+                ),
+                None => text,
+            };
             let tag = {
                 let mut book = lock_prompts(&state.book);
                 book.next_tag += 1;
                 let tag = book.next_tag;
                 book.ids.insert(tag, id);
+                if let Some(schema) = schema {
+                    book.schemas.insert(
+                        tag,
+                        SchemaAsk {
+                            schema: Arc::new(schema),
+                            retries: 0,
+                            usage: hotl_types::TokenUsage::default(),
+                        },
+                    );
+                }
                 tag
             };
             state.handle.prompt_answering(tag, text, images).await;
@@ -2732,6 +2788,7 @@ async fn retire_session(
         ids.sort_by_key(|(tag, _)| *tag);
         book.current.clear();
         book.cancelled.clear();
+        book.schemas.clear();
         ids.into_iter().map(|(_, id)| id).collect()
     };
     for id in outstanding {
@@ -2834,10 +2891,12 @@ fn start_session(
     let req_id_seed = *next_id * 1_000_000;
     *next_id += 1;
     let events = std::mem::replace(&mut handle.events, mpsc::channel(1).1);
+    let handle = Arc::new(handle);
     let sid = id.clone();
     let drain_config = Arc::clone(&config);
     let link = EngineLink {
         meter: handle.meter(),
+        engine: Arc::downgrade(&handle),
     };
     let book = PendingPrompt::default();
     let pending_prompt = book.clone();
@@ -2883,6 +2942,7 @@ fn start_session(
 
 struct EngineLink {
     meter: hotl_engine::Meter,
+    engine: std::sync::Weak<SessionHandle>,
 }
 
 fn settle_on_answer<T: Send + 'static>(
@@ -3212,7 +3272,6 @@ async fn drain_events(
                     .retain(|_, slot| !slot.reply.is_closed());
                 calls.end_turn();
                 let misses = (mispredictions > 0).then_some(mispredictions);
-                let frame = crate::wire::UsageFrame::of(&model, &usage);
                 let (size, ext) = {
                     let state = lock_config(&config);
                     (state.context_window, state.ext)
@@ -3232,23 +3291,66 @@ async fn drain_events(
                 )
                 .await;
                 let replies = writer.linked();
-                let answered: Vec<(u64, Value, bool)> = {
+                let answered: Vec<(u64, Value, bool, Option<SchemaAsk>)> = {
                     let mut book = lock_prompts(&pending_prompt);
                     let tags = std::mem::take(&mut book.current);
                     tags.into_iter()
                         .filter_map(|tag| {
                             let cancelled = book.cancelled.contains(&tag);
-                            book.ids.get(&tag).map(|id| (tag, id.clone(), cancelled))
+                            let id = book.ids.get(&tag).cloned()?;
+                            Some((tag, id, cancelled, book.schemas.remove(&tag)))
                         })
                         .collect()
                 };
-                let turn = TurnMeta {
-                    outcome: crate::wire::OutcomeFrame::of(&outcome),
-                    usage: frame,
-                    mispredictions: misses,
-                };
-                for (tag, id, cancelled) in answered {
-                    reply_turn_end(&replies, id, &outcome, cancelled, ext, turn.clone()).await;
+                for (tag, id, cancelled, ask) in answered {
+                    let mut total = usage;
+                    let mut output = None;
+                    let mut invalid = None;
+                    if let Some(mut ask) = ask {
+                        ask.usage += usage;
+                        total = ask.usage;
+                        if let (false, Outcome::Done { text }) = (cancelled, &outcome) {
+                            match check_output(&ask.schema, text) {
+                                Ok(value) => output = Some(value),
+                                Err(e) if ask.retries < hotl_workflow::structured::MAX_RETRIES => {
+                                    ask.retries += 1;
+                                    let format = hotl_workflow::structured::api_schema(&ask.schema)
+                                        .map(Arc::new);
+                                    {
+                                        let mut book = lock_prompts(&pending_prompt);
+                                        book.schemas.insert(tag, ask);
+                                        book.current.push(tag);
+                                    }
+                                    if let Some(engine) = link.engine.upgrade() {
+                                        engine
+                                            .prompt_structured_answering(
+                                                tag,
+                                                hotl_workflow::structured::retry_feedback(&e),
+                                                hotl_types::SyntheticReason::RetryFeedback,
+                                                format,
+                                            )
+                                            .await;
+                                    }
+                                    continue;
+                                }
+                                Err(e) => invalid = Some(e),
+                            }
+                        }
+                    }
+                    let turn = TurnMeta {
+                        outcome: crate::wire::OutcomeFrame::of(&outcome),
+                        usage: crate::wire::UsageFrame::of(&model, &total),
+                        mispredictions: misses,
+                    };
+                    match invalid {
+                        Some(reason) => {
+                            reply_output_invalid(&replies, id, &reason, ext, turn).await
+                        }
+                        None => {
+                            reply_turn_end(&replies, id, &outcome, cancelled, ext, turn, output)
+                                .await
+                        }
+                    }
                     let mut book = lock_prompts(&pending_prompt);
                     book.ids.remove(&tag);
                     book.cancelled.remove(&tag);
@@ -3276,6 +3378,7 @@ async fn drain_events(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reply_turn_end(
     writer: &Writer,
     id: Value,
@@ -3283,12 +3386,17 @@ async fn reply_turn_end(
     cancelled: bool,
     ext: bool,
     turn: TurnMeta,
+    output: Option<Value>,
 ) {
-    let meta = ext.then(|| {
+    let mut meta = ext.then(|| {
         let mut m = serde_json::Map::new();
         m.insert(META_TURN.into(), to_json(&turn));
         m
     });
+    if let Some(output) = output {
+        meta.get_or_insert_with(serde_json::Map::new)
+            .insert(META_OUTPUT.into(), output);
+    }
     let stop = if cancelled {
         Ok(crate::acp_types::StopReason::Cancelled)
     } else {
@@ -3317,6 +3425,26 @@ async fn reply_turn_end(
             .await;
         }
     }
+}
+
+async fn reply_output_invalid(writer: &Writer, id: Value, reason: &str, ext: bool, turn: TurnMeta) {
+    let data = ext.then(|| {
+        let mut meta = serde_json::Map::new();
+        meta.insert(META_TURN.into(), to_json(&turn));
+        to_json(&TurnErrorData { meta })
+    });
+    send(
+        writer,
+        &json!({"jsonrpc": "2.0", "id": id, "error": ErrorObject {
+            code: codes::OUTPUT_INVALID,
+            message: format!(
+                "output did not validate after {} retries: {reason}",
+                hotl_workflow::structured::MAX_RETRIES
+            ),
+            data,
+        }}),
+    )
+    .await;
 }
 
 async fn notify_ext(writer: &Writer, session_id: &str, update: Value) {
@@ -3420,6 +3548,7 @@ mod drain_tests {
             config,
             EngineLink {
                 meter: hotl_engine::Meter::default(),
+                engine: std::sync::Weak::new(),
             },
             Arc::new(std::sync::Mutex::new(ClientCaps {
                 ext: true,
@@ -3461,6 +3590,7 @@ mod drain_tests {
             test_config(),
             EngineLink {
                 meter: hotl_engine::Meter::default(),
+                engine: std::sync::Weak::new(),
             },
             Arc::new(std::sync::Mutex::new(ClientCaps::default())),
             crate::acp_map::ToolCalls::default(),
@@ -4114,8 +4244,7 @@ fn auth_methods(client_caps: ClientCaps) -> Vec<AuthMethod> {
 pub const META_INIT: &str = "hotl.dev/init";
 
 pub fn initialize_response(info: &ServerInfo, client_caps: ClientCaps) -> InitializeResponse {
-    let ext = client_caps.ext;
-    let meta = ext.then(|| {
+    let meta = client_caps.ext.then(|| {
         let init = HotlInit {
             skills: skill_roster(info),
             workflows: workflow_roster(info),
@@ -4128,6 +4257,7 @@ pub fn initialize_response(info: &ServerInfo, client_caps: ClientCaps) -> Initia
         let mut m = serde_json::Map::new();
         m.insert(META_INIT.into(), to_json(&init));
         m.insert(META_METHODS.into(), json!(EXTENSION_METHODS));
+        m.insert(META_OUTPUT_SCHEMA.into(), Value::Bool(true));
         m
     });
     InitializeResponse {
@@ -4206,6 +4336,10 @@ pub struct SessionOpenExtras {
 }
 
 pub const META_TURN: &str = "hotl.dev/turn";
+
+pub const META_OUTPUT_SCHEMA: &str = "hotl.dev/outputSchema";
+
+pub const META_OUTPUT: &str = "hotl.dev/output";
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]

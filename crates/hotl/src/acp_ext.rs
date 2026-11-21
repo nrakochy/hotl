@@ -4,6 +4,7 @@ pub mod codes {
     pub const INTERNAL: i64 = -32603;
     pub const AUTH_REQUIRED: i64 = -32000;
     pub const NOT_FOUND: i64 = -32002;
+    pub const OUTPUT_INVALID: i64 = -32003;
 }
 
 pub const EXT_PREFIX: &str = "_hotl/";
@@ -309,6 +310,11 @@ pub fn schema() -> Value {
             at("session/update config_option_update: _meta", sub::<ModelChange>(g)),
             at("session/set_config_option result: _meta", sub::<ModelAck>(g)),
         ],
+        (crate::acp::META_OUTPUT_SCHEMA): [
+            at("initialize result: agentCapabilities._meta", json!({"const": true})),
+            at("session/prompt params: _meta", json!({"type": "object", "description": "A JSON Schema the answer must fit; the reply carries the parsed answer in hotl.dev/output"})),
+        ],
+        (crate::acp::META_OUTPUT): [at("session/prompt result: _meta (every client)", json!({"description": "The answer as JSON, valid against the request's hotl.dev/outputSchema"}))],
         (crate::acp::META_TURN): [
             at("session/prompt result: _meta", sub::<TurnMeta>(g)),
             at("session/prompt error: error.data._meta", sub::<TurnMeta>(g)),
@@ -330,7 +336,7 @@ pub fn schema() -> Value {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": SCHEMA_ID,
         "title": "hotl ACP extensions",
-        "description": "What hotl adds to ACP v1: the _hotl/ methods and the hotl.dev/ _meta keys. A client sees them only after it sets clientCapabilities._meta[\"hotl.dev/extensions\"] to 1 in initialize. Every standard ACP message follows the ACP v1 schema.",
+        "description": "What hotl adds to ACP v1: the _hotl/ methods and the hotl.dev/ _meta keys. A client sees them only after it sets clientCapabilities._meta[\"hotl.dev/extensions\"] to 1 in initialize, except hotl.dev/output, which answers any client that sent hotl.dev/outputSchema. Every standard ACP message follows the ACP v1 schema.",
         "methods": methods,
         "meta": meta,
         "$defs": defs,

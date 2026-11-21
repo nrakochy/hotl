@@ -9,12 +9,10 @@ use hotl_engine::{EngineEvent, Outcome, SessionHandle};
 use hotl_types::{Item, SyntheticReason, TokenUsage};
 use serde_json::Value;
 
-pub const MAX_RETRIES: u32 = 2;
-
 /// Fence stripping, validation and the contract text live in `hotl-workflow`
 /// (0044) so the workflow runner's per-agent schemas and `--json-schema` share
 /// one validator; re-exported here for the existing call sites.
-pub use hotl_workflow::structured::validate;
+pub use hotl_workflow::structured::{validate, MAX_RETRIES};
 
 /// The schema as a tagged instruction item pushed into the session's context.
 pub fn contract_item(schema: &Value) -> Item {
@@ -64,9 +62,7 @@ where
             Ok(value) => return Ok((value, total)),
             Err(e) if attempts < max_retries => {
                 attempts += 1;
-                let feedback = format!(
-                    "Validation failed: {e}\nReply with only the corrected JSON object, nothing else."
-                );
+                let feedback = hotl_workflow::structured::retry_feedback(&e);
                 // 0073 D8: the retry turn asks the API for the schema too, when
                 // the grammar can take it; the check above keeps the original.
                 match hotl_workflow::structured::api_schema(schema) {

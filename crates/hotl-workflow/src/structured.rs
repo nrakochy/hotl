@@ -48,6 +48,12 @@ pub fn contract_text(schema: &Value) -> String {
     )
 }
 
+pub const MAX_RETRIES: u32 = 2;
+
+pub fn retry_feedback(error: &str) -> String {
+    format!("Validation failed: {error}\nReply with only the corrected JSON object, nothing else.")
+}
+
 /// Keywords the structured-output grammar does not accept (0073 D10). The
 /// client-side validator keeps enforcing them against the original schema.
 const UNSUPPORTED_KEYWORDS: [&str; 11] = [

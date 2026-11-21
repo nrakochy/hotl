@@ -6826,3 +6826,262 @@ async fn replacing_a_session_never_cuts_a_line_in_half() {
         }
     }
 }
+
+fn n_schema() -> Value {
+    json!({"type": "object", "required": ["n"], "properties": {"n": {"type": "integer"}}})
+}
+
+fn schema_prompt_msg(id: u64, sid: &str, text: &str, schema: Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"method":"session/prompt",
+        "params":{"sessionId": sid, "prompt": [{"type": "text", "text": text}],
+                  "_meta": {"hotl.dev/outputSchema": schema}}})
+}
+
+fn replies_to(frames: &[Value], id: u64) -> usize {
+    frames
+        .iter()
+        .filter(|m| m["id"] == json!(id) && m.get("method").is_none())
+        .count()
+}
+
+async fn frames_through_rename(
+    w: &mut (impl AsyncWriteExt + Unpin),
+    lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
+) -> Vec<Value> {
+    send(
+        w,
+        json!({"jsonrpc":"2.0","id":99,"method":"_hotl/session/rename","params":{"name":"x"}}),
+    )
+    .await;
+    let (before, _) = frames_through_reply(lines, 99).await;
+    before
+}
+
+#[tokio::test]
+async fn a_schema_prompt_returns_the_validated_value() {
+    let (provider, sid, mut w, mut lines) = open_with(
+        vec![ScriptedProvider::text_reply(r#"{"n": 3}"#)],
+        init_params(),
+    )
+    .await;
+    send(&mut w, schema_prompt_msg(3, &sid, "count", n_schema())).await;
+    let reply = read_until_id(&mut lines, 3).await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+    assert_eq!(
+        reply["result"]["_meta"]["hotl.dev/output"],
+        json!({"n": 3}),
+        "{reply}"
+    );
+    assert!(
+        reply["result"]["_meta"]["hotl.dev/turn"].is_object(),
+        "{reply}"
+    );
+    assert_eq!(
+        last_user_text(&provider),
+        format!(
+            "count\n\n{}",
+            hotl_workflow::structured::contract_text(&n_schema())
+        )
+    );
+    assert!(
+        provider.requests()[0].output_format.is_none(),
+        "the first attempt sends no format"
+    );
+}
+
+#[tokio::test]
+async fn a_schema_prompt_from_a_client_without_extensions_still_gets_its_output() {
+    let (_provider, sid, mut w, mut lines) = open_with(
+        vec![ScriptedProvider::text_reply(r#"{"n": 3}"#)],
+        json!({"protocolVersion": 1}),
+    )
+    .await;
+    send(&mut w, schema_prompt_msg(3, &sid, "count", n_schema())).await;
+    let reply = read_until_id(&mut lines, 3).await;
+    assert_eq!(
+        reply["result"],
+        json!({"stopReason": "end_turn", "_meta": {"hotl.dev/output": {"n": 3}}})
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_answer_is_retried_and_the_same_request_is_answered() {
+    let (provider, sid, mut w, mut lines) = open_with(
+        vec![
+            ScriptedProvider::text_reply("not json"),
+            ScriptedProvider::text_reply(r#"{"n": 3}"#),
+        ],
+        init_params(),
+    )
+    .await;
+    send(&mut w, schema_prompt_msg(3, &sid, "count", n_schema())).await;
+    let (before, reply) = frames_through_reply(&mut lines, 3).await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+    assert_eq!(reply["result"]["_meta"]["hotl.dev/output"], json!({"n": 3}));
+    let after = frames_through_rename(&mut w, &mut lines).await;
+    assert_eq!(replies_to(&before, 3) + replies_to(&after, 3), 0);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let feedback = requests[1]
+        .items
+        .iter()
+        .find_map(|item| match item.as_ref() {
+            hotl_types::Item::User {
+                text,
+                synthetic: Some(hotl_types::SyntheticReason::RetryFeedback),
+                ..
+            } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("the retry carries tagged feedback");
+    assert!(feedback.starts_with("Validation failed: "), "{feedback}");
+    assert!(
+        feedback.ends_with("\nReply with only the corrected JSON object, nothing else."),
+        "{feedback}"
+    );
+    assert_eq!(
+        requests[1].output_format.as_deref(),
+        hotl_workflow::structured::api_schema(&n_schema()).as_ref()
+    );
+    let usage = &reply["result"]["_meta"]["hotl.dev/turn"]["usage"];
+    assert_eq!(usage["input_tokens"], 20, "{reply}");
+    assert_eq!(usage["output_tokens"], 10, "{reply}");
+}
+
+#[tokio::test]
+async fn two_bad_retries_end_in_output_invalid() {
+    let (provider, sid, mut w, mut lines) = open_with(
+        vec![
+            ScriptedProvider::text_reply("not json"),
+            ScriptedProvider::text_reply("still not json"),
+            ScriptedProvider::text_reply(r#"{"n": "three"}"#),
+        ],
+        init_params(),
+    )
+    .await;
+    send(&mut w, schema_prompt_msg(3, &sid, "count", n_schema())).await;
+    let reply = read_until_id(&mut lines, 3).await;
+    assert_eq!(reply["error"]["code"], -32003, "{reply}");
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("output did not validate after 2 retries: "),
+        "{reply}"
+    );
+    assert_eq!(
+        reply["error"]["data"]["_meta"]["hotl.dev/turn"]["usage"]["input_tokens"], 30,
+        "{reply}"
+    );
+    assert_eq!(provider.request_count(), 3);
+}
+
+#[tokio::test]
+async fn a_schema_that_is_not_a_schema_is_refused_before_any_model_call() {
+    let (provider, sid, mut w, mut lines) =
+        open_with(vec![ScriptedProvider::text_reply("seen")], init_params()).await;
+    send(
+        &mut w,
+        schema_prompt_msg(3, &sid, "count", json!({"type": 12})),
+    )
+    .await;
+    let reply = read_until_id(&mut lines, 3).await;
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    assert!(
+        reply["error"]["message"].as_str().unwrap().starts_with(
+            "session/prompt: _meta[\"hotl.dev/outputSchema\"] is not a valid JSON Schema: "
+        ),
+        "{reply}"
+    );
+    send(&mut w, schema_prompt_msg(4, &sid, "count", json!("object"))).await;
+    let reply = read_until_id(&mut lines, 4).await;
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    frames_through_rename(&mut w, &mut lines).await;
+    assert_eq!(
+        provider.request_count(),
+        0,
+        "a refused prompt samples nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_schema_prompt_replies_cancelled_with_no_output() {
+    let (provider, sid, mut w, mut lines) = open_with(
+        vec![hanging(), ScriptedProvider::text_reply(r#"{"n": 3}"#)],
+        init_params(),
+    )
+    .await;
+    send(&mut w, schema_prompt_msg(3, &sid, "count", n_schema())).await;
+    wait_for_text(&mut lines).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId": sid}}),
+    )
+    .await;
+    let reply = read_until_id(&mut lines, 3).await;
+    assert_eq!(reply["result"]["stopReason"], "cancelled", "{reply}");
+    assert!(
+        reply["result"]["_meta"].get("hotl.dev/output").is_none(),
+        "{reply}"
+    );
+    let after = frames_through_rename(&mut w, &mut lines).await;
+    assert_eq!(replies_to(&after, 3), 0, "{after:?}");
+    assert_eq!(
+        provider.request_count(),
+        1,
+        "a cancelled prompt is not retried"
+    );
+}
+
+#[tokio::test]
+async fn a_prompt_queued_behind_a_schema_prompt_and_its_retry_each_get_one_reply() {
+    let (_provider, sid, mut w, mut lines) = open_with(
+        vec![
+            ScriptedProvider::text_reply("not json"),
+            ScriptedProvider::text_reply(r#"{"n": 3}"#),
+            ScriptedProvider::text_reply(r#"{"n": 3}"#),
+        ],
+        init_params(),
+    )
+    .await;
+    send(&mut w, schema_prompt_msg(3, &sid, "count", n_schema())).await;
+    send(
+        &mut w,
+        prompt_msg(4, &sid, json!([{"type": "text", "text": "plain"}])),
+    )
+    .await;
+    let mut frames = Vec::new();
+    while replies_to(&frames, 3) == 0 || replies_to(&frames, 4) == 0 {
+        frames.push(next_raw(&mut lines).await);
+    }
+    frames.extend(frames_through_rename(&mut w, &mut lines).await);
+    assert_eq!(replies_to(&frames, 3), 1, "{frames:?}");
+    assert_eq!(replies_to(&frames, 4), 1, "{frames:?}");
+    let reply = |id: u64| {
+        frames
+            .iter()
+            .find(|m| m["id"] == json!(id) && m.get("method").is_none())
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        reply(3)["result"]["_meta"]["hotl.dev/output"],
+        json!({"n": 3})
+    );
+    assert_eq!(reply(4)["result"]["stopReason"], "end_turn");
+    assert!(reply(4)["result"]["_meta"].get("hotl.dev/output").is_none());
+}
+
+#[tokio::test]
+async fn initialize_advertises_output_schema() {
+    let opted = initialize_with(init_params()).await;
+    assert_eq!(
+        opted["agentCapabilities"]["_meta"]["hotl.dev/outputSchema"],
+        true
+    );
+    let plain = initialize_with(json!({"protocolVersion": 1})).await;
+    assert!(
+        !plain.to_string().contains("hotl.dev/"),
+        "a plain client was sent a hotl.dev/ key: {plain}"
+    );
+}

@@ -482,7 +482,6 @@ pub struct PromptRequest {
     #[serde(default)]
     pub session_id: Option<String>,
     pub prompt: Vec<ContentBlock>,
-    #[allow(dead_code)]
     #[serde(default, rename = "_meta")]
     pub meta: Option<Meta>,
 }
@@ -493,6 +492,12 @@ pub struct PromptResponse {
     pub stop_reason: StopReason,
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct TurnErrorData {
+    #[serde(rename = "_meta")]
+    pub meta: Meta,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
