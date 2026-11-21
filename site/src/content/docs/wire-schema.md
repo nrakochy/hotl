@@ -38,8 +38,11 @@ types.
 
 hotl's own extras are off until a client asks for them. A client opts in by
 sending `clientCapabilities._meta["hotl.dev/extensions"]: 1` in `initialize`.
-Without that, hotl sends no `_hotl/` method and no `hotl.dev/` key. It still
-answers `_hotl/` requests the client chooses to send.
+Without that, hotl sends no `_hotl/` method and no `hotl.dev/` key of its own
+accord. It still answers `_hotl/` requests the client chooses to send. One key
+is an answer rather than an extra: a client that sends
+`hotl.dev/outputSchema` on a prompt gets `hotl.dev/output` back whether or not
+it opted in.
 
 `acp-hotl-extensions.schema.json` describes only the extras:
 
@@ -69,3 +72,16 @@ The `_hotl/` methods:
 The `hotl.dev/turn` key carries a turn's outcome, token use and cost. It rides
 on the `session/prompt` result. When a turn ends in an error, it rides inside
 the JSON-RPC error instead, at `error.data._meta["hotl.dev/turn"]`.
+
+Keys for programs that drive hotl (see [Driving hotl from another program](../embedding/)):
+
+| Key | Rides on | Holds |
+|---|---|---|
+| `hotl.dev/outputSchema` | `session/prompt` params `_meta` (any client), and `initialize` result `agentCapabilities._meta` as `true` (opted-in clients only) | A JSON Schema the answer must fit |
+| `hotl.dev/output` | `session/prompt` result `_meta` (any client that sent a schema) | The checked answer. If it still does not fit after two retries, the prompt fails with error `-32003` instead |
+| `hotl.dev/session` | `session/list` result, each row's `_meta` (opted-in clients) | `parentId`, the listed row the session was forked from, and `runId`, the running `hotl serve` process holding it. Each is left out when it does not apply |
+| `hotl.dev/retry` | `session/update` notice `_meta` (clients that offered `session.notices` and opted in) | `attempt`, `max`, `status` (when there was one), `delayMs` and `scope` |
+
+`hotl.dev/open` on `session/new` also takes `ephemeral: true`, which opens a
+throwaway session whose log is never stored. It is refused on `session/load`,
+`session/resume` and `_hotl/session/fork`, and together with `worktree`.

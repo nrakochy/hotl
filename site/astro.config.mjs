@@ -90,6 +90,7 @@ export default defineConfig({
 					items: [
 						{ label: 'Configuration', slug: 'configuration' },
 						{ label: 'Wire schemas', slug: 'wire-schema' },
+						{ label: 'Driving hotl from a program', slug: 'embedding' },
 						{ label: 'Feature stages', slug: 'features' },
 						{ label: 'Troubleshooting', slug: 'troubleshooting' },
 						{ label: 'Updating', slug: 'updating' },

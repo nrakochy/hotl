@@ -26,6 +26,8 @@ hotl resume [arg]       # the subcommand spelling of -r
 ```
 
 A resumed session that was interrupted mid-turn finishes that turn on load.
+To reopen a stored session as a background session instead, run
+`hotl bg --resume <session-id>` (see [Background sessions](../backgrounding/)).
 
 Inside the console, `/resume` does the same without leaving: bare lists the
 sessions, `/resume <n|id|name>` switches to one.

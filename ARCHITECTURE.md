@@ -1,6 +1,6 @@
 # ARCHITECTURE.md — the harness at a glance
 
-**Product frame (hotl = watch · execute · orchestrate):** this file describes the **execute** capability — the harness behind the bare `hotl` command. The other two capabilities sit _outside_ this architecture by design: **watch** (`hotl watch`, the shipped tmux dashboard, layers W1–W4) observes agents from outside the process — pane titles, process state, captured output; never the harness's internal types; **orchestrate** (`hotl fleet`, future) will be an ACP _client_ of the harness like any other frontend, using the orchestrator-as-client seams. One binary hosts all three; only this one has layers.
+**Product frame (hotl = watch · execute · orchestrate):** this file describes the **execute** capability — the harness behind the bare `hotl` command. The other two capabilities sit _outside_ this architecture by design: **watch** (`hotl watch`, the shipped tmux dashboard, layers W1–W4) observes agents from outside the process — pane titles, process state, captured output; never the harness's internal types; **orchestrate** is a separate project that drives hotl as an ACP _client_ like any other frontend, using the orchestrator-as-client seams (status files, `hotl attach --json`, `--resume` for served sessions, schema answers, lineage, throwaway sessions and retry data — plan 0082); the `hotl fleet` command stays a reserved stub. One binary hosts all three; only this one has layers.
 
 **Shape: event-log-as-canon, actor-as-serializer, ACP spine.** Session state is a projection of one append-only entry log (a tree via `parent_id`, with a movable leaf); the model transcript and the UI replay are two _projections_ of it; compaction is an appended entry that re-points the projection, never a rewrite. One actor per session serializes admission and commits; turn tasks _propose_ entries, only the actor commits them.
 
@@ -95,14 +95,14 @@ flowchart TB
     ACTOR -->|"⑩ TurnDone (outcome + usage)"| CLIENT
 ```
 
-ACP is already the console's transport — the TUI is a pure ACP client of an in-process `acp::serve`, and `hotl acp` exposes the same contract to external editors. The contract is standard ACP v1 (hand-written types in `crates/hotl/src/acp_types.rs`, checked from outside the workspace by `conformance/acp/` against the official SDK); hotl-only features ride `_hotl/` methods and `hotl.dev/` `_meta` keys that a client must opt in to; `hotl fleet` (a reserved stub today) will be one more ACP client. `hotl watch` observes from outside this diagram entirely — pane titles, process state, never these internals.
+ACP is already the console's transport — the TUI is a pure ACP client of an in-process `acp::serve`, and `hotl acp` exposes the same contract to external editors. The contract is standard ACP v1 (hand-written types in `crates/hotl/src/acp_types.rs`, checked from outside the workspace by `conformance/acp/` against the official SDK); hotl-only features ride `_hotl/` methods and `hotl.dev/` `_meta` keys that a client must opt in to; the orchestrator is a separate project that drives hotl as one more ACP client (`hotl fleet` stays a reserved stub). `hotl watch` observes from outside this diagram entirely — pane titles, process state, never these internals.
 
 _\* The native-Windows write floor is written but fail-closed; until it is certified, every exec on Windows is individually human-gated._
 
 ## The other two capability stacks
 
 - **Watch — W1–W4, shipped:** observation types + `Surface` trait → surface backends (tmux) → listener (ratatui-free, the non-TUI consumer seam) → Elm TUI; wired by `hotl watch`. Invariants: observe-from-outside; zero shared crates/types with the harness.
-- **Orchestrate — O, reserved:** `hotl fleet` will be an ACP client of the harness; its only present footprint is the orchestrator-as-client seams; its natural view layer is W3's listener.
+- **Orchestrate — O, reserved:** the orchestrator is a separate project that drives the harness as an ACP client, and the `hotl fleet` command stays a reserved stub; its only present footprint is the orchestrator-as-client seams; its natural view layer is W3's listener.
 
 ## What this system is not
 

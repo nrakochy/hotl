@@ -29,14 +29,23 @@ The key property: when the agent needs a permission decision **while you're deta
 hotl bg "refactor the parser and run the tests"
 ```
 
-Prints a session id and the attach command. The opening prompt is optional — `hotl bg` alone starts an idle session you prompt after attaching. The background session inherits the provider env (`HOTL_MODEL` + key) from the shell you run `hotl bg` in — run it where `hotl doctor` passes.
+Prints a session id and the attach command. To reopen a stored session in
+the background instead of starting a new one, pass its full id:
+`hotl bg --resume <session-id> [prompt]` (not together with `-w`). If the
+stored session stopped in the middle of a task, it carries on with it. The opening prompt is optional — `hotl bg` alone starts an idle session you prompt after attaching. The background session inherits the provider env (`HOTL_MODEL` + key) from the shell you run `hotl bg` in — run it where `hotl doctor` passes.
 
 ## List and attach
 
 ```
 hotl attach            # list live backgrounded sessions
 hotl attach bg-12345   # connect to one (an id prefix works)
+hotl attach --json     # one JSON line per live session, for scripts
 ```
+
+`--json` prints each live session's run id, stored session id, process
+number, folder, name, hotl version, start time and state (`idle`, `running`
+or `waiting`). The fields are described in
+[Driving hotl from another program](../embedding/).
 
 Once attached, it behaves like a line console: type to prompt, type mid-turn to steer, answer `y`/`N` when it asks. Anything that happened while you were detached is in the session log (the live view starts from when you attach).
 
