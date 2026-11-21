@@ -396,3 +396,53 @@ async fn sdk_client_with_every_capability_reads_every_update_hotl_sends() {
     assert_eq!(log.elicited.lock().unwrap().len(), 1, "one form question");
     assert!(check_wire(&log.wire) >= 10);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sdk_client_with_compaction_reads_a_fold_as_compaction_updates() {
+    let world = World::with_model(
+        &[
+            json!({"tool_use": {"id": "t1", "name": "todo_write", "input": {"todos": [
+                {"id": "n1", "content": "read the code", "status": "in_progress", "active_form": "reading"}
+            ]}}, "usage": {"input": 5_000_000, "output": 10}}),
+            json!({"text": "the digest of what happened"}),
+            json!({"text": "folded and done"}),
+        ],
+        "claude-sonnet-4-6",
+    );
+    let log = Log::default();
+    let work = world.work.clone();
+    let reply = run(
+        world.agent(&log.wire),
+        &log,
+        async |cx: ConnectionTo<Agent>| {
+            cx.send_request(typed::<InitializeRequest>(json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {"session": {"compaction": {}}}
+            })))
+            .block_task()
+            .await?;
+            let session = cx
+                .send_request(NewSessionRequest::new(work.clone()))
+                .block_task()
+                .await?;
+            cx.send_request(PromptRequest::new(session.session_id, text("fold it")))
+                .block_task()
+                .await
+        },
+    )
+    .await;
+    assert_eq!(reply.stop_reason, StopReason::EndTurn);
+    let folds: Vec<Value> = log
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|n| matches!(n.update, SessionUpdate::CompactionUpdate(_)))
+        .map(|n| serde_json::to_value(&n.update).unwrap())
+        .collect();
+    assert_eq!(folds.len(), 2, "{folds:?}");
+    assert_eq!(folds[0]["status"], "in_progress", "{folds:?}");
+    assert_eq!(folds[1]["status"], "completed", "{folds:?}");
+    assert_eq!(folds[0]["compactionId"], folds[1]["compactionId"]);
+    assert!(check_wire(&log.wire) >= 4);
+}
