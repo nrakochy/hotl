@@ -1213,6 +1213,8 @@ pub enum SessionCmd {
         /// to fit (0073 D8): `output_config.format` on the Anthropic
         /// dialect. `None` for every prompt but a `--json-schema` retry.
         output_format: Option<Arc<serde_json::Value>>,
+        tag: Option<u64>,
+        epoch: u64,
     },
     /// Continue an interrupted turn (M4/#8): sample against the current
     /// projection with no new user item — used on resume when the last item
@@ -1639,6 +1641,8 @@ impl SessionHandle {
                 text,
                 synthetic,
                 output_format: None,
+                tag: None,
+                epoch: 0,
             })
             .await;
     }
@@ -1657,6 +1661,26 @@ impl SessionHandle {
                 text,
                 synthetic,
                 output_format: Some(schema),
+                tag: None,
+                epoch: 0,
+            })
+            .await;
+    }
+    pub async fn prompt_structured_answering(
+        &self,
+        tag: u64,
+        text: String,
+        synthetic: hotl_types::SyntheticReason,
+        schema: Option<Arc<serde_json::Value>>,
+    ) {
+        let _ = self
+            .cmd
+            .send(SessionCmd::PromptTagged {
+                text,
+                synthetic,
+                output_format: schema,
+                tag: Some(tag),
+                epoch: self.cancels.requested(),
             })
             .await;
     }

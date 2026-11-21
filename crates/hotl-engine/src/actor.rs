@@ -1454,6 +1454,8 @@ pub(crate) async fn run(
                 text,
                 synthetic,
                 output_format,
+                tag,
+                epoch,
             } => {
                 running = admit_prompt(
                     &shared,
@@ -1467,8 +1469,8 @@ pub(crate) async fn run(
                         images: Vec::new(),
                         synthetic: Some(synthetic),
                         output_format,
-                        tags: Vec::new(),
-                        epoch: 0,
+                        tags: tag.into_iter().collect(),
+                        epoch,
                     },
                     &cmd_tx,
                     &events,

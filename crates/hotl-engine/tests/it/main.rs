@@ -46,6 +46,7 @@ mod speculation;
 mod steer_order;
 mod stop_reasons;
 mod stream_retry;
+mod structured_answering;
 mod structured_format;
 mod supervision;
 mod todo_gate;
