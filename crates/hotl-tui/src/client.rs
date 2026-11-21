@@ -298,6 +298,10 @@ fn standard_update(kind: &str, update: &Value) -> Option<Value> {
             let mode = update.get("currentModeId").and_then(Value::as_str)?;
             Some(json!({"type": "mode_changed", "mode": mode}))
         }
+        "usage_update" => {
+            let used = update.get("used").and_then(Value::as_u64)?;
+            Some(json!({"type": "context_used", "used": used}))
+        }
         "notice" => {
             let title = update.get("title").and_then(Value::as_str)?;
             Some(json!({"type": "server_notice", "text": title}))
@@ -1031,6 +1035,20 @@ mod tests {
             decode(&options),
             Some(ServerMsg::Update(
                 json!({"type": "config_options", "plan": true, "effort": "max"})
+            ))
+        );
+    }
+
+    #[test]
+    fn a_usage_update_decodes_into_context_used() {
+        let msg: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"usage_update","used":12000,"size":200000}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decode(&msg),
+            Some(ServerMsg::Update(
+                json!({"type": "context_used", "used": 12000})
             ))
         );
     }

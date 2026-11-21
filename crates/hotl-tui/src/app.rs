@@ -633,10 +633,6 @@ pub struct State {
     /// Background jobs running right now (0064): `job_started` adds,
     /// `job_done` removes. The strip's `⚙ N` chip.
     pub jobs_running: usize,
-    /// What the last turn actually cost the provider — the exact figure a
-    /// `/context` report shows beside its estimate. `on_prompt_result`
-    /// computes it for the strip's `% ctx` segment and used to discard it.
-    /// `None` until the first turn completes.
     pub live_context: Option<u64>,
     /// The engine's at-open context estimate, from the open reply (0040):
     /// what the strip's `% ctx` shows before any turn completes — a resumed
@@ -2021,6 +2017,11 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         // `/model` applied (0067): server-driven like `fallback_model`. The
         // frame carries the new window so the ctx chip divides by what the
         // engine uses, and the cache cost the next turn pays.
+        "context_used" => {
+            if let Some(used) = v.get("used").and_then(Value::as_u64).filter(|n| *n > 0) {
+                state.live_context = Some(used);
+            }
+        }
         "model_changed" => {
             state.model = text_of("model");
             if let Some(w) = v.get("context_window").and_then(Value::as_u64) {
@@ -2516,12 +2517,6 @@ fn on_prompt_result(
         finished_at,
     });
     state.session_usage.add(usage);
-    // What the *next* turn starts from: everything resident in this turn's
-    // context. Computed here, not in `format_usage`, so the formatter stays a
-    // formatter — `/context` wants the number, not the string.
-    let n = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
-    let live = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
-    state.live_context = Some(live);
     state.usage_line = Some(format_usage(state, usage));
     state.phase = Phase::Idle;
     band_tidy(state);
@@ -4560,10 +4555,33 @@ mod tests {
             line.contains("12.0k cached"),
             "cache reads must show: {line}"
         );
-        // (2_000 + 8_000) / 200_000 of the window is live in the latest turn
-        // — the strip's ctx chip reads it from here, never from the line.
-        assert_eq!(s.live_context, Some(10_000));
         assert!(!line.contains("ctx"), "the gauge is a chip: {line}");
+    }
+
+    #[test]
+    fn a_two_call_turn_shows_the_last_calls_context_not_the_sum() {
+        let mut s = State::test_default();
+        s.context_window = 200_000;
+        upd(&mut s, json!({"type": "context_used", "used": 12_000}));
+        on_result(
+            &mut s,
+            "done",
+            None,
+            &json!({
+                "input_tokens": 2_000, "output_tokens": 300,
+                "cache_read_input_tokens": 18_000, "cache_creation_input_tokens": 2_000
+            }),
+        );
+        assert_eq!(s.live_context, Some(12_000));
+        assert_eq!(ctx_pct(s.live_context.unwrap(), s.context_window), Some(6));
+    }
+
+    #[test]
+    fn a_zero_context_figure_keeps_the_last_known_one() {
+        let mut s = State::test_default();
+        upd(&mut s, json!({"type": "context_used", "used": 9_000}));
+        upd(&mut s, json!({"type": "context_used", "used": 0}));
+        assert_eq!(s.live_context, Some(9_000));
     }
 
     #[test]
@@ -4763,7 +4781,7 @@ mod tests {
     fn the_context_gauge_is_omitted_without_a_window() {
         let mut s = State::test_default();
         s.context_window = 0;
-        on_result(&mut s, "done", None, &json!({"input_tokens": 10}));
+        upd(&mut s, json!({"type": "context_used", "used": 10}));
         assert_eq!(ctx_pct(s.live_context.unwrap(), s.context_window), None);
     }
 
@@ -7506,7 +7524,7 @@ mod tests {
         // Session totals; no cache segment (this turn read none), no cost
         // (the payload carried none), and the gauge is the strip's chip.
         assert_eq!(s.usage_line.as_deref(), Some("120 in · 45 out"));
-        assert_eq!(s.live_context, Some(120));
+        assert_eq!(s.live_context, None);
         assert!(matches!(&cmds[..], [Cmd::SetTitle(t), Cmd::ProgramStatus(_)] if t == "hotl"));
     }
 
@@ -9597,6 +9615,7 @@ mod tests {
     #[test]
     fn the_report_carries_the_last_turns_reported_total() {
         let mut s = State::test_default();
+        upd(&mut s, json!({"type": "context_used", "used": 41_300}));
         update(
             &mut s,
             Msg::PromptResult {
