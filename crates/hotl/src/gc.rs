@@ -209,8 +209,14 @@ mod tests {
     #[test]
     fn the_dead_socket_sweep_takes_the_status_and_token_files_too() {
         use hotl_platform::PrivateFs as _;
+        let data = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_DATA_HOME", data.path());
         let id = format!("gc-dead-{}", std::process::id());
         let run = crate::session_server::run_dir();
+        assert!(
+            run.starts_with(data.path()),
+            "{run:?} is not the temp folder"
+        );
         hotl_platform::PRIVATE_FS.create_dir_all(&run).unwrap();
         let sock = run.join(format!("{id}.sock"));
         let _ = std::fs::remove_file(&sock);
@@ -219,7 +225,7 @@ mod tests {
         std::fs::write(&token, "secret").unwrap();
         let status = crate::run_status::status_path(&id);
         std::fs::write(&status, "{}").unwrap();
-        assert!(sweep_dead_sockets(false) >= 1);
+        assert_eq!(sweep_dead_sockets(false), 1);
         assert!(!sock.exists());
         assert!(!token.exists(), "a dead session's token is swept");
         assert!(!status.exists(), "a dead session's status is swept");
