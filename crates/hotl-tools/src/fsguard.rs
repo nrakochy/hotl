@@ -206,7 +206,7 @@ pub(crate) fn resolve_as_far_as_it_exists(p: &Path) -> PathBuf {
 /// string prefix — `/srv/cachette` is not under `/srv/cache`) and
 /// case-folded where the filesystem folds. `None` when `path` is not under
 /// `root`.
-fn strip_root<'a>(path: &'a Path, root: &Path) -> Option<&'a Path> {
+pub(crate) fn strip_root<'a>(path: &'a Path, root: &Path) -> Option<&'a Path> {
     let mut rest = path.components();
     for want in root.components() {
         match rest.next() {

@@ -843,7 +843,11 @@ fn read_carved(target: &std::path::Path, deny: &sandbox::ReadDeny) -> bool {
         .iter()
         .chain(&deny.secrets)
         .chain(&deny.rules)
-        .any(|dir| candidates.iter().any(|c| c.starts_with(dir)))
+        .any(|dir| {
+            candidates
+                .iter()
+                .any(|c| fsguard::strip_root(c, dir).is_some())
+        })
 }
 
 fn before_of(file: std::fs::File) -> crate::Before {
@@ -3044,6 +3048,83 @@ mod tests {
             "old\n"
         );
         assert!(!root.join("fresh.txt").exists());
+    }
+
+    #[test]
+    fn hotls_own_dirs_are_never_shown_through_read_carved() {
+        let (_o, root, home) = fsguard::tests::fixture();
+        let own = home.join(".hotl");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join("config.toml"), "key = 1\n").unwrap();
+        let deny = sandbox::ReadDeny {
+            always: vec![own.clone()],
+            ..Default::default()
+        };
+        assert!(read_carved(&own.join("config.toml"), &deny));
+        assert_eq!(
+            before_plain(&own.join("config.toml"), &deny),
+            crate::Before::Unshown
+        );
+        assert!(!read_carved(&root.join("src/lib.rs"), &deny));
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn a_carve_holds_against_a_different_case_where_the_filesystem_folds() {
+        let (_o, root, _home) = fsguard::tests::fixture();
+        std::fs::create_dir_all(root.join("Secrets")).unwrap();
+        std::fs::write(root.join("Secrets/key.txt"), "TOKEN=1\n").unwrap();
+        let deny = sandbox::ReadDeny {
+            rules: vec![root.join("Secrets")],
+            ..Default::default()
+        };
+        assert!(read_carved(&root.join("SECRETS/key.txt"), &deny));
+        assert!(read_carved(&root.join("secrets/KEY.txt"), &deny));
+        assert_eq!(
+            before_beneath(&root, std::path::Path::new("sEcReTs/key.txt"), &deny),
+            crate::Before::Unshown
+        );
+        assert!(!read_carved(&root.join("SecretsX/key.txt"), &deny));
+        let named_in_other_case = sandbox::ReadDeny {
+            rules: vec![root.join("SECRETS")],
+            ..Default::default()
+        };
+        assert!(read_carved(
+            &root.join("Secrets/key.txt"),
+            &named_in_other_case
+        ));
+        assert_eq!(
+            before_beneath(
+                &root,
+                std::path::Path::new("Secrets/key.txt"),
+                &named_in_other_case
+            ),
+            crate::Before::Unshown
+        );
+    }
+
+    #[test]
+    fn a_write_through_a_symlinked_parent_shows_no_before() {
+        let (_o, root, home) = fsguard::tests::fixture();
+        let outside = home.join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("notes.txt"), "private\n").unwrap();
+        symlink_or_skip!(&outside, root.join("linked"));
+        let deny = sandbox::ReadDeny::default();
+        assert_eq!(
+            before_write_with(
+                &root,
+                &[],
+                &json!({"path": "linked/notes.txt", "content": "new\n"}),
+                &deny,
+            ),
+            crate::Before::Unshown
+        );
+        let carved = sandbox::ReadDeny {
+            secrets: vec![outside.clone()],
+            ..Default::default()
+        };
+        assert!(read_carved(&root.join("linked/notes.txt"), &carved));
     }
 
     #[test]
