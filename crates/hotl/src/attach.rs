@@ -167,8 +167,21 @@ async fn connect(id: &str) -> i32 {
         }
     });
 
+    drive(&mut client, &mut server, &mut stdin_rx).await
+}
+
+async fn drive<W, R>(
+    client: &mut AcpClient<W>,
+    server: &mut tokio::io::Lines<R>,
+    stdin_rx: &mut mpsc::Receiver<String>,
+) -> i32
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncBufRead + Unpin,
+{
     let mut state = Attached::default();
     let (shell_tx, mut shell_rx) = mpsc::unbounded_channel::<ShellDone>();
+    let mut stdin_open = true;
     loop {
         tokio::select! {
             line = server.next_line() => match line {
@@ -179,15 +192,27 @@ async fn connect(id: &str) -> i32 {
                 }
                 _ => { println!("\n(session closed)"); return 0; }
             },
-            line = stdin_rx.recv() => {
-                let Some(line) = line else { return detach(&mut client).await };
-                if on_input(line.trim(), &mut client, &mut state, &shell_tx).await {
+            line = stdin_rx.recv(), if stdin_open => {
+                let Some(line) = line else {
+                    let Some(command) = &state.shell_running else {
+                        return detach(client).await;
+                    };
+                    fresh_line();
+                    eprintln!("[input closed — detaching once !{command} finishes]");
+                    stdin_open = false;
+                    continue;
+                };
+                set_mid_line(false);
+                if on_input(line.trim(), client, &mut state, &shell_tx).await {
                     return 0;
                 }
             }
             done = shell_rx.recv() => {
                 if let Some(done) = done {
-                    on_shell_done(done, &mut client, &mut state).await;
+                    on_shell_done(done, client, &mut state).await;
+                }
+                if !stdin_open {
+                    return detach(client).await;
                 }
             }
         }
@@ -199,7 +224,8 @@ struct Attached {
     pending_ask: Option<Parked>,
     turn_running: bool,
     prompts: Vec<u64>,
-    shell_running: bool,
+    shell_running: Option<String>,
+    held: Option<String>,
 }
 
 type ShellDone = (String, String, Value);
@@ -347,9 +373,9 @@ async fn bang(command: &str, cwd: &std::path::Path) -> (String, Value) {
     (shown, params)
 }
 
-async fn on_input(
+async fn on_input<W: tokio::io::AsyncWrite + Unpin>(
     text: &str,
-    client: &mut Client,
+    client: &mut AcpClient<W>,
     state: &mut Attached,
     shell_tx: &mpsc::UnboundedSender<ShellDone>,
 ) -> bool {
@@ -365,11 +391,11 @@ async fn on_input(
         }
         Action::Shell(command) => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            if state.shell_running {
+            if state.shell_running.is_some() {
                 eprintln!("a ! command is already running");
                 return false;
             }
-            state.shell_running = true;
+            state.shell_running = Some(command.clone());
             fresh_line();
             println!("[running !{command}…]");
             spawn_bang(command, cwd, shell_tx.clone());
@@ -387,39 +413,76 @@ async fn on_input(
             }
             false
         }
-        // Expansion happens here, not in `route`: reading files is I/O, and
-        // the transcript should show what the human typed.
-        Action::Steer(text) => {
-            let text = crate::setup::expand_file_refs(&text);
-            let _ = client
-                .request("_hotl/session/steer", json!({"text": text}))
-                .await;
+        Action::Steer(text) | Action::Prompt(text) if state.shell_running.is_some() => {
+            eprintln!("{}", hold(state, text));
             false
         }
-        Action::Prompt(text) => {
-            let text = crate::setup::expand_file_refs(&text);
-            if let Ok(id) = client
-                .request(
-                    "session/prompt",
-                    json!({"prompt": [{"type": "text", "text": text}]}),
-                )
-                .await
-            {
-                state.prompts.push(id);
-                state.turn_running = true;
-            }
+        // Expansion happens here, not in `route`: reading files is I/O, and
+        // the transcript should show what the human typed.
+        Action::Steer(text) | Action::Prompt(text) => {
+            send_typed(text, client, state).await;
             false
         }
     }
 }
 
-async fn on_shell_done(done: ShellDone, client: &mut Client, state: &mut Attached) {
+fn hold(state: &mut Attached, text: String) -> String {
+    let command = state.shell_running.clone().unwrap_or_default();
+    let preview: String = text
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(40)
+        .collect();
+    let replacing = state.held.replace(text).is_some();
+    if replacing {
+        format!(
+            "[waiting for !{command} — \"{preview}\" goes next (replaced the earlier held message)]"
+        )
+    } else {
+        format!("[waiting for !{command} — \"{preview}\" goes next]")
+    }
+}
+
+async fn send_typed<W: tokio::io::AsyncWrite + Unpin>(
+    text: String,
+    client: &mut AcpClient<W>,
+    state: &mut Attached,
+) {
+    let text = crate::setup::expand_file_refs(&text);
+    if state.turn_running {
+        let _ = client
+            .request("_hotl/session/steer", json!({"text": text}))
+            .await;
+        return;
+    }
+    if let Ok(id) = client
+        .request(
+            "session/prompt",
+            json!({"prompt": [{"type": "text", "text": text}]}),
+        )
+        .await
+    {
+        state.prompts.push(id);
+        state.turn_running = true;
+    }
+}
+
+async fn on_shell_done<W: tokio::io::AsyncWrite + Unpin>(
+    done: ShellDone,
+    client: &mut AcpClient<W>,
+    state: &mut Attached,
+) {
     let (command, shown, params) = done;
     let mid = MID_LINE.swap(false, std::sync::atomic::Ordering::Relaxed);
     print!("{}", shell_text(&command, &shown, mid));
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let _ = client.request("_hotl/session/shell_note", params).await;
-    state.shell_running = false;
+    state.shell_running = None;
+    if let Some(text) = state.held.take() {
+        send_typed(text, client, state).await;
+    }
     if let Some(parked) = &state.pending_ask {
         eprint!("{}", parked.prompt);
         let _ = std::io::Write::flush(&mut std::io::stderr());
@@ -430,8 +493,13 @@ async fn on_shell_done(done: ShellDone, client: &mut Client, state: &mut Attache
 }
 
 fn show_prompt() {
-    eprint!("\n❯ ");
-    let _ = std::io::Write::flush(&mut std::io::stderr());
+    show_prompt_to(&mut std::io::stderr(), &MID_LINE);
+}
+
+fn show_prompt_to(out: &mut impl std::io::Write, mid_line: &std::sync::atomic::AtomicBool) {
+    let _ = write!(out, "\n❯ ");
+    let _ = out.flush();
+    mid_line.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn turn_end_kind(result: &Result<Value, String>) -> &str {
@@ -706,7 +774,7 @@ fn render_update(update: &Value) {
     }
 }
 
-async fn detach(client: &mut Client) -> i32 {
+async fn detach<W: tokio::io::AsyncWrite + Unpin>(client: &mut AcpClient<W>) -> i32 {
     let _ = client.request("session/close", json!({})).await;
     println!("\n(detached — session still running; `hotl attach` to return)");
     0
@@ -985,6 +1053,145 @@ mod tests {
             route("y", false, Some(&ask)),
             Action::AnswerAsk { allow: true, .. }
         ));
+    }
+
+    async fn drive_lines(lines: &[&str]) -> Vec<Value> {
+        use tokio::io::AsyncReadExt;
+        let (client_w, mut observe) = tokio::io::duplex(1 << 20);
+        let (_server_far, server_near) = tokio::io::duplex(1 << 16);
+        let mut client = AcpClient::new(client_w);
+        client.set_session_id("s");
+        let mut server = BufReader::new(server_near).lines();
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        for line in lines {
+            tx.send(format!("{line}\n")).await.unwrap();
+        }
+        drop(tx);
+        let code = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(&mut client, &mut server, &mut rx),
+        )
+        .await
+        .expect("attach never detached");
+        assert_eq!(code, 0);
+        drop(client);
+        let mut sent = String::new();
+        observe.read_to_string(&mut sent).await.unwrap();
+        sent.lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    fn methods(sent: &[Value]) -> Vec<&str> {
+        sent.iter()
+            .filter_map(|m| m.get("method").and_then(Value::as_str))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn stdin_closing_while_a_bang_runs_still_shares_its_output_before_detaching() {
+        let sent = drive_lines(&["!sleep 0.3; echo late-0085"]).await;
+        assert_eq!(
+            methods(&sent),
+            vec!["_hotl/session/shell_note", "session/close"],
+            "{sent:?}"
+        );
+        assert!(
+            sent[0]["params"]["output"]
+                .as_str()
+                .unwrap()
+                .contains("late-0085"),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prompt_typed_during_a_bang_goes_after_its_note() {
+        let sent = drive_lines(&["!sleep 0.3; echo first-0085", "what did it say"]).await;
+        assert_eq!(
+            methods(&sent),
+            vec![
+                "_hotl/session/shell_note",
+                "session/prompt",
+                "session/close"
+            ],
+            "{sent:?}"
+        );
+        assert_eq!(sent[1]["params"]["prompt"][0]["text"], "what did it say");
+    }
+
+    #[tokio::test]
+    async fn a_second_line_during_a_bang_replaces_the_held_one() {
+        let sent = drive_lines(&["!sleep 0.3", "first try", "second try"]).await;
+        assert_eq!(
+            methods(&sent),
+            vec![
+                "_hotl/session/shell_note",
+                "session/prompt",
+                "session/close"
+            ],
+            "{sent:?}"
+        );
+        assert_eq!(sent[1]["params"]["prompt"][0]["text"], "second try");
+    }
+
+    #[test]
+    fn a_shell_result_after_the_prompt_marker_starts_on_a_fresh_line() {
+        let mid_line = std::sync::atomic::AtomicBool::new(false);
+        let mut shown = Vec::new();
+        show_prompt_to(&mut shown, &mid_line);
+        assert_eq!(String::from_utf8(shown).unwrap(), "\n❯ ");
+        let mid = mid_line.swap(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(shell_text("ls", "a", mid), "\n$ ls\na\n");
+    }
+
+    #[tokio::test]
+    async fn a_held_line_released_mid_turn_is_a_steer_after_the_note() {
+        use tokio::io::AsyncReadExt;
+        let (client_w, mut observe) = tokio::io::duplex(1 << 16);
+        let mut client = AcpClient::new(client_w);
+        let mut state = Attached {
+            shell_running: Some("ls".into()),
+            held: Some("also check tests".into()),
+            turn_running: true,
+            ..Attached::default()
+        };
+        on_shell_done(
+            ("ls".into(), String::new(), json!({"command": "ls"})),
+            &mut client,
+            &mut state,
+        )
+        .await;
+        drop(client);
+        let mut sent = String::new();
+        observe.read_to_string(&mut sent).await.unwrap();
+        let sent: Vec<Value> = sent
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            methods(&sent),
+            vec!["_hotl/session/shell_note", "_hotl/session/steer"]
+        );
+        assert_eq!(sent[1]["params"]["text"], "also check tests");
+        assert!(state.held.is_none() && state.shell_running.is_none());
+    }
+
+    #[test]
+    fn a_held_line_names_the_command_and_says_when_it_replaces() {
+        let mut state = Attached {
+            shell_running: Some("make".into()),
+            ..Attached::default()
+        };
+        assert_eq!(
+            hold(&mut state, "first".into()),
+            "[waiting for !make — \"first\" goes next]"
+        );
+        assert_eq!(
+            hold(&mut state, "second".into()),
+            "[waiting for !make — \"second\" goes next (replaced the earlier held message)]"
+        );
+        assert_eq!(state.held.as_deref(), Some("second"));
     }
 
     #[test]
