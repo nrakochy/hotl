@@ -475,7 +475,6 @@ pub const DENIAL_SPIRAL_CONSECUTIVE: u32 = 3;
 /// Denials in one turn, however scattered, before the turn ends.
 pub const DENIAL_SPIRAL_TOTAL: u32 = 20;
 
-/// The `[behavior]` key that raises a budget of this kind.
 pub fn shell_note_text(command: &str, output: &str, exit_code: Option<i32>) -> String {
     let code = exit_code.map_or("none".to_string(), |c| c.to_string());
     format!(
@@ -483,6 +482,7 @@ pub fn shell_note_text(command: &str, output: &str, exit_code: Option<i32>) -> S
     )
 }
 
+/// The `[behavior]` key that raises a budget of this kind.
 pub fn budget_key(kind: &str) -> &'static str {
     match kind {
         "cost_usd" => "max_cost_usd",
