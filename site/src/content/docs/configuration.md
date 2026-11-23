@@ -18,7 +18,7 @@ Reference for the command surface, config files, and environment variables of th
 | `hotl bg [prompt]` | Background a session as a detached socket server; `hotl attach` to reach it. See [backgrounding.md](../backgrounding/). |
 | `hotl attach [id]` | Connect to a backgrounded session (bare: list live ones). |
 | `hotl gc [--dry-run] [--days N] [--keep N]` | Prune old sessions/blobs per `[retention]`; in a git repo, also sweep session worktrees. See [below](#hotl-gc). |
-| `hotl setup [--force]` | Write a commented starter `config.toml` (never overwrites without `--force`). |
+| `hotl setup [--force]` | Write a commented starter `config.toml` (never replaces an existing file without `--force`; a file holding only `[settings]` gets the defaults added around it). |
 | `hotl doctor` | Non-mutating checks: provider/keys, sandbox, config, allow-rules, session store, MCP trust, memory, secrets audit. Exit 1 if any check FAILs. `--args [--days N]` instead replays recent sessions and prints how many builtin tool calls had arguments that do not fit their schema, per tool and class, plus the turns a tool body ended unparsed — the measurement behind the (not built) argument coercion. |
 | `hotl init zsh\|bash\|fish` | Shell integration to stdout. zsh: the `:` prefix plugin plus tab completion (`eval "$(hotl init zsh)"` in `~/.zshrc`); bash and fish: completion only. See [shell.md](../shell/). |
 | `hotl export <id\|name\|@last> [--md\|--html]` | Print a past session's transcript — what the model saw, in order — as Markdown (default) or a self-contained HTML page, secrets masked. |
