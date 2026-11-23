@@ -147,7 +147,7 @@ async fn connect(id: &str) -> i32 {
             return 0;
         }
     }
-    println!("attached to {id} — type to prompt · Ctrl-D detaches · /stop ends the session");
+    println!("attached to {id} — type to prompt · Ctrl-D or Ctrl-C detaches (Ctrl-C stops a running !) · /stop ends the session");
 
     // Terminal stdin on a blocking thread → channel (same shape as the REPL).
     let (tx, mut stdin_rx) = mpsc::channel::<String>(8);
@@ -167,13 +167,22 @@ async fn connect(id: &str) -> i32 {
         }
     });
 
-    drive(&mut client, &mut server, &mut stdin_rx).await
+    let (interrupt_tx, mut interrupts) = mpsc::channel::<()>(4);
+    tokio::spawn(async move {
+        while tokio::signal::ctrl_c().await.is_ok() {
+            if interrupt_tx.send(()).await.is_err() {
+                break;
+            }
+        }
+    });
+    drive(&mut client, &mut server, &mut stdin_rx, &mut interrupts).await
 }
 
 async fn drive<W, R>(
     client: &mut AcpClient<W>,
     server: &mut tokio::io::Lines<R>,
     stdin_rx: &mut mpsc::Receiver<String>,
+    interrupts: &mut mpsc::Receiver<()>,
 ) -> i32
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -182,8 +191,30 @@ where
     let mut state = Attached::default();
     let (shell_tx, mut shell_rx) = mpsc::unbounded_channel::<ShellDone>();
     let mut stdin_open = true;
+    let mut interrupted = false;
     loop {
         tokio::select! {
+            Some(()) = interrupts.recv() => {
+                if interrupted {
+                    return 130;
+                }
+                interrupted = true;
+                stdin_open = false;
+                if let Some(command) = &state.shell_running {
+                    fresh_line();
+                    eprintln!("[Ctrl-C — stopping !{command}]");
+                    if let Some(cancel) = &state.shell_cancel {
+                        cancel.cancel();
+                    }
+                    continue;
+                }
+                fresh_line();
+                if let Some(note) = held_not_sent(&mut state) {
+                    eprintln!("{note}");
+                }
+                detach(client).await;
+                return 130;
+            }
             line = server.next_line() => match line {
                 Ok(Some(line)) => {
                     if let Ok(msg) = serde_json::from_str::<Value>(&line) {
@@ -208,8 +239,17 @@ where
                 }
             }
             done = shell_rx.recv() => {
+                if interrupted {
+                    if let Some(note) = held_not_sent(&mut state) {
+                        eprintln!("{note}");
+                    }
+                }
                 if let Some(done) = done {
                     on_shell_done(done, client, &mut state).await;
+                }
+                if interrupted {
+                    detach(client).await;
+                    return 130;
                 }
                 if !stdin_open {
                     return detach(client).await;
@@ -217,6 +257,18 @@ where
             }
         }
     }
+}
+
+fn held_not_sent(state: &mut Attached) -> Option<String> {
+    let text = state.held.take()?;
+    let preview: String = text
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(40)
+        .collect();
+    Some(format!("held message not sent: \"{preview}\""))
 }
 
 fn closed_message(state: &Attached) -> String {
@@ -241,6 +293,7 @@ struct Attached {
     turn_running: bool,
     prompts: Vec<u64>,
     shell_running: Option<String>,
+    shell_cancel: Option<tokio_util::sync::CancellationToken>,
     held: Option<String>,
 }
 
@@ -271,9 +324,14 @@ fn shell_text(command: &str, shown: &str, mid_line: bool) -> String {
     out
 }
 
-fn spawn_bang(command: String, cwd: std::path::PathBuf, tx: mpsc::UnboundedSender<ShellDone>) {
+fn spawn_bang(
+    command: String,
+    cwd: std::path::PathBuf,
+    cancel: tokio_util::sync::CancellationToken,
+    tx: mpsc::UnboundedSender<ShellDone>,
+) {
     tokio::spawn(async move {
-        let (shown, params) = bang(&command, &cwd).await;
+        let (shown, params) = bang(&command, &cwd, cancel).await;
         let _ = tx.send((command, shown, params));
     });
 }
@@ -356,12 +414,16 @@ fn route(text: &str, turn_running: bool, pending_ask: Option<&Parked>) -> Action
     }
 }
 
-async fn bang(command: &str, cwd: &std::path::Path) -> (String, Value) {
+async fn bang(
+    command: &str,
+    cwd: &std::path::Path,
+    cancel: tokio_util::sync::CancellationToken,
+) -> (String, Value) {
     let run = hotl_tools::user_shell::run(
         command,
         cwd,
         hotl_tools::user_shell::USER_SHELL_TIMEOUT,
-        tokio_util::sync::CancellationToken::new(),
+        cancel,
     )
     .await;
     let append = |text: &str, label: &str| {
@@ -414,7 +476,9 @@ async fn on_input<W: tokio::io::AsyncWrite + Unpin>(
             state.shell_running = Some(command.clone());
             fresh_line();
             println!("[running !{command}…]");
-            spawn_bang(command, cwd, shell_tx.clone());
+            let cancel = tokio_util::sync::CancellationToken::new();
+            state.shell_cancel = Some(cancel.clone());
+            spawn_bang(command, cwd, cancel, shell_tx.clone());
             false
         }
         Action::AnswerAsk { parked, allow } => {
@@ -494,8 +558,11 @@ async fn on_shell_done<W: tokio::io::AsyncWrite + Unpin>(
     let mid = MID_LINE.swap(false, std::sync::atomic::Ordering::Relaxed);
     print!("{}", shell_text(&command, &shown, mid));
     let _ = std::io::Write::flush(&mut std::io::stdout());
-    let _ = client.request("_hotl/session/shell_note", params).await;
+    if params.get("end").and_then(Value::as_str) != Some("cancelled") {
+        let _ = client.request("_hotl/session/shell_note", params).await;
+    }
     state.shell_running = None;
+    state.shell_cancel = None;
     if let Some(text) = state.held.take() {
         send_typed(text, client, state).await;
     }
@@ -1095,9 +1162,10 @@ mod tests {
             tx.send(format!("{line}\n")).await.unwrap();
         }
         drop(tx);
+        let (_itx, mut irx) = mpsc::channel::<()>(1);
         let code = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            drive(&mut client, &mut server, &mut rx),
+            drive(&mut client, &mut server, &mut rx, &mut irx),
         )
         .await
         .expect("attach never detached");
@@ -1114,6 +1182,69 @@ mod tests {
         sent.iter()
             .filter_map(|m| m.get("method").and_then(Value::as_str))
             .collect()
+    }
+
+    async fn drive_until_interrupt(lines: &[&str], wait_ms: u64) -> (i32, Vec<Value>) {
+        use tokio::io::AsyncReadExt;
+        let (client_w, mut observe) = tokio::io::duplex(1 << 20);
+        let (_server_far, server_near) = tokio::io::duplex(1 << 16);
+        let mut client = AcpClient::new(client_w);
+        client.set_session_id("s");
+        let mut server = BufReader::new(server_near).lines();
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        for line in lines {
+            tx.send(format!("{line}\n")).await.unwrap();
+        }
+        let (itx, mut irx) = mpsc::channel::<()>(4);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+            let _ = itx.send(()).await;
+            std::future::pending::<()>().await;
+        });
+        let code = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drive(&mut client, &mut server, &mut rx, &mut irx),
+        )
+        .await
+        .expect("Ctrl-C did not end attach");
+        drop(tx);
+        drop(client);
+        let mut sent = String::new();
+        observe.read_to_string(&mut sent).await.unwrap();
+        let sent = sent
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        (code, sent)
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_with_nothing_running_detaches() {
+        let (code, sent) = drive_until_interrupt(&[], 100).await;
+        assert_eq!(code, 130);
+        assert!(methods(&sent).contains(&"session/close"), "{sent:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ctrl_c_while_a_bang_runs_kills_it_and_shares_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        let line = format!("!sleep 2; touch {}", marker.display());
+        let started = std::time::Instant::now();
+        let (code, sent) = drive_until_interrupt(&[&line], 400).await;
+        assert_eq!(code, 130);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            !methods(&sent).contains(&"_hotl/session/shell_note"),
+            "{sent:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        assert!(!marker.exists(), "the ! command outlived Ctrl-C");
     }
 
     #[tokio::test]
@@ -1235,6 +1366,7 @@ mod tests {
         spawn_bang(
             "sleep 1; echo late".into(),
             std::path::PathBuf::from("."),
+            tokio_util::sync::CancellationToken::new(),
             shell_tx,
         );
         server_tx
@@ -1261,7 +1393,11 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (shown, params) = rt.block_on(bang("ls; exit 3", dir.path()));
+        let (shown, params) = rt.block_on(bang(
+            "ls; exit 3",
+            dir.path(),
+            tokio_util::sync::CancellationToken::new(),
+        ));
         rt.shutdown_background();
         assert!(shown.contains("marker-0084-attach"), "{shown}");
         assert!(shown.ends_with("[exit 3]"), "{shown}");
@@ -1284,8 +1420,11 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (shown, params) =
-            rt.block_on(bang("echo hi; kill -TERM $$", std::path::Path::new(".")));
+        let (shown, params) = rt.block_on(bang(
+            "echo hi; kill -TERM $$",
+            std::path::Path::new("."),
+            tokio_util::sync::CancellationToken::new(),
+        ));
         rt.shutdown_background();
         assert!(shown.ends_with("[killed by SIGTERM]"), "{shown}");
         assert!(

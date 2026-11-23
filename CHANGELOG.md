@@ -32,6 +32,10 @@ semver promise of their own.
 
 ### Fixed
 
+- Ctrl-C in `hotl attach` now stops a running `!` command (and everything it
+  started) before detaching, instead of leaving it running in the
+  background. A message waiting on that command is reported as not sent.
+
 - Loading a saved session with `session/load` from a client that speaks
   hotl's extensions now replays earlier `!` results as shell cards instead of
   dropping them. (The TUI resumes sessions without replaying history, as
