@@ -1413,6 +1413,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             Vec::new()
         }
         Msg::Key(key) => on_key(state, key),
+        Msg::Paste(_) if state.theme_picker.is_some() => Vec::new(),
         Msg::Paste(text) => {
             // A dropped image path or a 3+-line paste compacts to a token;
             // the content parks in the side table until submit. Numbering is
@@ -2835,14 +2836,21 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
     // presses always suffice to leave.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         state.help_open = false;
-        state.theme_picker = None;
+        let mut cmds: Vec<Cmd> = state
+            .theme_picker
+            .take()
+            .map(|picker| Cmd::PreviewTheme(picker.original))
+            .into_iter()
+            .collect();
         if state.phase == Phase::Idle || state.interrupt_sent {
-            return vec![Cmd::Quit];
+            cmds.push(Cmd::Quit);
+            return cmds;
         }
         state.interrupt_sent = true;
         // No notice (0061 T20): the strip says `interrupting` and the hint
         // names the second press — a transcript item said it a third time.
-        return vec![Cmd::Cancel];
+        cmds.push(Cmd::Cancel);
+        return cmds;
     }
     if state.theme_picker.is_some() {
         return theme_picker_key(state, key);
@@ -4754,8 +4762,35 @@ mod tests {
     fn ctrl_c_with_the_picker_open_quits_and_sets_nothing() {
         let mut s = picker_state("tokyo-night", true);
         let cmds = ctrl(&mut s, 'c');
-        assert!(matches!(cmds[..], [Cmd::Quit]), "{cmds:?}");
+        assert_eq!(cmds, vec![preview("tokyo-night"), Cmd::Quit]);
         assert!(!cmds.iter().any(|c| matches!(c, Cmd::SetTheme(_))));
+    }
+
+    #[test]
+    fn ctrl_c_with_the_picker_open_while_busy_restores_the_palette() {
+        let mut s = picker_state("nord", false);
+        s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+        press(&mut s, KeyCode::Down);
+        let cmds = ctrl(&mut s, 'c');
+        assert_eq!(cmds, vec![preview("nord"), Cmd::Cancel]);
+        assert!(s.theme_picker.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_with_the_picker_open_when_idle_restores_then_quits() {
+        let mut s = picker_state("nord", true);
+        press(&mut s, KeyCode::Down);
+        let cmds = ctrl(&mut s, 'c');
+        assert_eq!(cmds, vec![preview("nord"), Cmd::Quit]);
+    }
+
+    #[test]
+    fn a_paste_while_the_picker_is_open_never_reaches_the_composer() {
+        let mut s = picker_state("tokyo-night", false);
+        let cmds = update(&mut s, Msg::Paste("hello\nthere\nfriend\nnow".into()));
+        assert!(cmds.is_empty());
+        assert_eq!(s.editor.text(), "");
+        assert!(s.theme_picker.is_some());
     }
 
     #[test]
