@@ -70,15 +70,16 @@ pub(crate) fn set_theme_preset(config_path: &Path, name: &str) -> io::Result<()>
             ));
         }
     }
-    let new_value = match theme.get("preset").and_then(|p| p.as_value()) {
-        Some(old) => {
-            let mut v = toml_edit::Value::from(name);
-            *v.decor_mut() = old.decor().clone();
-            v
-        }
-        None => toml_edit::Value::from(name),
-    };
-    theme.insert("preset", toml_edit::Item::Value(new_value));
+    if let Some(v) = theme.get_mut("preset").and_then(|i| i.as_value_mut()) {
+        let decor = v.decor().clone();
+        *v = toml_edit::Value::from(name);
+        *v.decor_mut() = decor;
+    } else {
+        theme.insert(
+            "preset",
+            toml_edit::Item::Value(toml_edit::Value::from(name)),
+        );
+    }
 
     let mut out = doc.to_string();
     if original.contains("\r\n") && !original.replace("\r\n", "").contains('\n') {
@@ -100,7 +101,7 @@ pub(crate) fn set_theme_preset(config_path: &Path, name: &str) -> io::Result<()>
     write_atomic(&target, &out)
 }
 
-fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
     let dir = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
@@ -277,6 +278,30 @@ mod tests {
         assert!(!out.replace("\r\n", "").contains('\n'));
         assert!(out.starts_with("# c\r\n[plugins]\r\nx = 1\r\n"));
         assert_eq!(preset_of(&out).as_deref(), Some("warm"));
+    }
+
+    #[test]
+    fn comment_above_preset_survives() {
+        let text = "[settings.theme]\n# my favourite\npreset = \"nord\"\nbg = \"#101010\"\n";
+        assert_eq!(set(text, "warm"), text.replace("nord", "warm"));
+        let crlf = text.replace('\n', "\r\n");
+        assert_eq!(set(&crlf, "warm"), crlf.replace("nord", "warm"));
+    }
+
+    #[test]
+    fn indented_spaced_preset_keeps_layout() {
+        let text = "[settings.theme]\n  preset   =   \"nord\"  # c\n  bg = \"#101010\"\n";
+        assert_eq!(set(text, "warm"), text.replace("nord", "warm"));
+        let crlf = text.replace('\n', "\r\n");
+        assert_eq!(set(&crlf, "warm"), crlf.replace("nord", "warm"));
+    }
+
+    #[test]
+    fn comment_above_dotted_preset_survives() {
+        let text = "[settings]\n# pick one\ntheme.preset = \"nord\"\ntheme.bg = \"#101010\"\n";
+        assert_eq!(set(text, "warm"), text.replace("nord", "warm"));
+        let crlf = text.replace('\n', "\r\n");
+        assert_eq!(set(&crlf, "warm"), crlf.replace("nord", "warm"));
     }
 
     #[test]
