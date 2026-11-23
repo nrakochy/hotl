@@ -3043,12 +3043,6 @@ fn render_ask(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
     );
 }
 
-/// `ask_user`'s option-picker modal (tier-1 gap #4) — generalizes
-/// `render_ask`'s y/n card to N labelled options (2-4, per the tool's own
-/// validation) plus free text. Not a permission card, and dressed unlike
-/// one (0047 D3): its own title and the accent border, so blocked color +
-/// "waiting on you" stay exclusive to prompts where a key grants authority.
-/// The strip's blocked phase text is untouched — the turn *is* halted.
 fn render_theme_picker(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
     let Some(picker) = &state.theme_picker else {
         return;
@@ -3095,6 +3089,12 @@ fn render_theme_picker(state: &State, p: &Palette, frame: &mut Frame, over: Rect
     );
 }
 
+/// `ask_user`'s option-picker modal (tier-1 gap #4) — generalizes
+/// `render_ask`'s y/n card to N labelled options (2-4, per the tool's own
+/// validation) plus free text. Not a permission card, and dressed unlike
+/// one (0047 D3): its own title and the accent border, so blocked color +
+/// "waiting on you" stay exclusive to prompts where a key grants authority.
+/// The strip's blocked phase text is untouched — the turn *is* halted.
 fn render_question(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
     let Phase::WaitingQuestion {
         header,
