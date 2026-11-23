@@ -343,7 +343,7 @@ async fn escape_cancels_a_running_bang_command() {
         return;
     };
     smoke.tmux.type_line("!sleep 30");
-    std::thread::sleep(Duration::from_millis(500));
+    smoke.wait_any_row("the running card", "running…", s(5));
     let started = std::time::Instant::now();
     smoke.tmux.send_keys(&["Escape"]);
     smoke.wait_any_row("the cancelled card", "[cancelled]", s(5));

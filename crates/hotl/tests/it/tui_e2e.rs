@@ -98,6 +98,7 @@ async fn remember_confirm_allow_golden() {
     let mut steer_ids = VecDeque::new();
     let mut model_ids = VecDeque::new();
     let mut remember_ids = VecDeque::new();
+    let mut shell_note_ids: VecDeque<u64> = VecDeque::new();
 
     type_prompt(
         &mut state,
@@ -106,6 +107,7 @@ async fn remember_confirm_allow_golden() {
         &mut steer_ids,
         &mut model_ids,
         &mut remember_ids,
+        &mut shell_note_ids,
         "/remember the tests need nextest",
     )
     .await;
@@ -119,6 +121,7 @@ async fn remember_confirm_allow_golden() {
             &mut steer_ids,
             &mut model_ids,
             &mut remember_ids,
+            &mut shell_note_ids,
         ) else {
             continue;
         };
@@ -131,6 +134,7 @@ async fn remember_confirm_allow_golden() {
             &mut steer_ids,
             &mut model_ids,
             &mut remember_ids,
+            &mut shell_note_ids,
         )
         .await;
         if is_ask {
@@ -152,6 +156,7 @@ async fn remember_confirm_allow_golden() {
                 &mut steer_ids,
                 &mut model_ids,
                 &mut remember_ids,
+                &mut shell_note_ids,
             )
             .await;
         }
@@ -396,13 +401,22 @@ async fn exec(
     steer_ids: &mut VecDeque<u64>,
     model_ids: &mut VecDeque<u64>,
     remember_ids: &mut VecDeque<u64>,
+    shell_note_ids: &mut VecDeque<u64>,
 ) {
     for cmd in cmds {
         // The terminal-bound remainder (title, editor, history, quit) has no
         // meaning in a headless test; the runtime handles those.
-        let _ = exec_wire_cmd(cmd, client, prompt_ids, steer_ids, model_ids, remember_ids)
-            .await
-            .expect("the duplex write succeeded");
+        let _ = exec_wire_cmd(
+            cmd,
+            client,
+            prompt_ids,
+            steer_ids,
+            model_ids,
+            remember_ids,
+            shell_note_ids,
+        )
+        .await
+        .expect("the duplex write succeeded");
     }
 }
 
@@ -454,6 +468,7 @@ fn press(state: &mut State, code: KeyCode) -> Vec<Cmd> {
     update(state, Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn type_prompt(
     state: &mut State,
     client: &mut Client,
@@ -461,13 +476,23 @@ async fn type_prompt(
     steer_ids: &mut VecDeque<u64>,
     model_ids: &mut VecDeque<u64>,
     remember_ids: &mut VecDeque<u64>,
+    shell_note_ids: &mut VecDeque<u64>,
     text: &str,
 ) {
     for c in text.chars() {
         press(state, KeyCode::Char(c));
     }
     let cmds = press(state, KeyCode::Enter);
-    exec(cmds, client, prompt_ids, steer_ids, model_ids, remember_ids).await;
+    exec(
+        cmds,
+        client,
+        prompt_ids,
+        steer_ids,
+        model_ids,
+        remember_ids,
+        shell_note_ids,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -478,6 +503,7 @@ async fn prompt_stream_ask_allow_done_golden() {
     let mut steer_ids = VecDeque::new();
     let mut model_ids = VecDeque::new();
     let mut remember_ids = VecDeque::new();
+    let mut shell_note_ids: VecDeque<u64> = VecDeque::new();
 
     type_prompt(
         &mut state,
@@ -486,6 +512,7 @@ async fn prompt_stream_ask_allow_done_golden() {
         &mut steer_ids,
         &mut model_ids,
         &mut remember_ids,
+        &mut shell_note_ids,
         "go",
     )
     .await;
@@ -503,6 +530,7 @@ async fn prompt_stream_ask_allow_done_golden() {
             &mut steer_ids,
             &mut model_ids,
             &mut remember_ids,
+            &mut shell_note_ids,
         ) else {
             continue;
         };
@@ -516,6 +544,7 @@ async fn prompt_stream_ask_allow_done_golden() {
             &mut steer_ids,
             &mut model_ids,
             &mut remember_ids,
+            &mut shell_note_ids,
         )
         .await;
         if is_ask {
@@ -543,6 +572,7 @@ async fn prompt_stream_ask_allow_done_golden() {
                 &mut steer_ids,
                 &mut model_ids,
                 &mut remember_ids,
+                &mut shell_note_ids,
             )
             .await;
         }
@@ -597,6 +627,7 @@ async fn dropped_image_paste_compacts_and_echoes_golden() {
     let mut steer_ids = VecDeque::new();
     let mut model_ids = VecDeque::new();
     let mut remember_ids = VecDeque::new();
+    let mut shell_note_ids: VecDeque<u64> = VecDeque::new();
 
     update(&mut state, Msg::Paste("/tmp/shot.png ".into()));
     for c in " what is this?".chars() {
@@ -616,6 +647,7 @@ async fn dropped_image_paste_compacts_and_echoes_golden() {
         &mut steer_ids,
         &mut model_ids,
         &mut remember_ids,
+        &mut shell_note_ids,
     )
     .await;
     let rows = draw(&state);
@@ -640,6 +672,7 @@ async fn ask_user_option_pick_golden() {
     let mut steer_ids = VecDeque::new();
     let mut model_ids = VecDeque::new();
     let mut remember_ids = VecDeque::new();
+    let mut shell_note_ids: VecDeque<u64> = VecDeque::new();
 
     type_prompt(
         &mut state,
@@ -648,6 +681,7 @@ async fn ask_user_option_pick_golden() {
         &mut steer_ids,
         &mut model_ids,
         &mut remember_ids,
+        &mut shell_note_ids,
         "go",
     )
     .await;
@@ -659,6 +693,7 @@ async fn ask_user_option_pick_golden() {
             &mut steer_ids,
             &mut model_ids,
             &mut remember_ids,
+            &mut shell_note_ids,
         ) else {
             continue;
         };
@@ -676,6 +711,7 @@ async fn ask_user_option_pick_golden() {
             &mut steer_ids,
             &mut model_ids,
             &mut remember_ids,
+            &mut shell_note_ids,
         )
         .await;
         if is_question {
@@ -702,6 +738,7 @@ async fn ask_user_option_pick_golden() {
                 &mut steer_ids,
                 &mut model_ids,
                 &mut remember_ids,
+                &mut shell_note_ids,
             )
             .await;
         }
@@ -726,6 +763,7 @@ async fn deny_with_reason_reaches_engine() {
     let mut steer_ids = VecDeque::new();
     let mut model_ids = VecDeque::new();
     let mut remember_ids = VecDeque::new();
+    let mut shell_note_ids: VecDeque<u64> = VecDeque::new();
 
     type_prompt(
         &mut state,
@@ -734,6 +772,7 @@ async fn deny_with_reason_reaches_engine() {
         &mut steer_ids,
         &mut model_ids,
         &mut remember_ids,
+        &mut shell_note_ids,
         "go",
     )
     .await;
@@ -744,6 +783,7 @@ async fn deny_with_reason_reaches_engine() {
             &mut steer_ids,
             &mut model_ids,
             &mut remember_ids,
+            &mut shell_note_ids,
         ) else {
             continue;
         };
@@ -757,6 +797,7 @@ async fn deny_with_reason_reaches_engine() {
             &mut steer_ids,
             &mut model_ids,
             &mut remember_ids,
+            &mut shell_note_ids,
         )
         .await;
         if is_ask {
@@ -774,6 +815,7 @@ async fn deny_with_reason_reaches_engine() {
                 &mut steer_ids,
                 &mut model_ids,
                 &mut remember_ids,
+                &mut shell_note_ids,
             )
             .await;
         }
@@ -806,6 +848,7 @@ async fn drag_select_copies_transcript_prose_without_the_spine_golden() {
     let mut steer_ids = VecDeque::new();
     let mut model_ids = VecDeque::new();
     let mut remember_ids = VecDeque::new();
+    let mut shell_note_ids: VecDeque<u64> = VecDeque::new();
 
     type_prompt(
         &mut state,
@@ -814,6 +857,7 @@ async fn drag_select_copies_transcript_prose_without_the_spine_golden() {
         &mut steer_ids,
         &mut model_ids,
         &mut remember_ids,
+        &mut shell_note_ids,
         "go",
     )
     .await;
@@ -824,6 +868,7 @@ async fn drag_select_copies_transcript_prose_without_the_spine_golden() {
             &mut steer_ids,
             &mut model_ids,
             &mut remember_ids,
+            &mut shell_note_ids,
         ) else {
             continue;
         };
@@ -837,6 +882,7 @@ async fn drag_select_copies_transcript_prose_without_the_spine_golden() {
             &mut steer_ids,
             &mut model_ids,
             &mut remember_ids,
+            &mut shell_note_ids,
         )
         .await;
         if is_ask {
@@ -848,6 +894,7 @@ async fn drag_select_copies_transcript_prose_without_the_spine_golden() {
                 &mut steer_ids,
                 &mut model_ids,
                 &mut remember_ids,
+                &mut shell_note_ids,
             )
             .await;
         }
@@ -888,6 +935,7 @@ async fn slash_plan_with_a_task_reaches_the_model_in_plan_mode() {
     let mut steer_ids = VecDeque::new();
     let mut model_ids = VecDeque::new();
     let mut remember_ids = VecDeque::new();
+    let mut shell_note_ids: VecDeque<u64> = VecDeque::new();
     type_prompt(
         &mut state,
         &mut client,
@@ -895,6 +943,7 @@ async fn slash_plan_with_a_task_reaches_the_model_in_plan_mode() {
         &mut steer_ids,
         &mut model_ids,
         &mut remember_ids,
+        &mut shell_note_ids,
         "/plan draft the migration",
     )
     .await;
@@ -905,6 +954,7 @@ async fn slash_plan_with_a_task_reaches_the_model_in_plan_mode() {
             &mut steer_ids,
             &mut model_ids,
             &mut remember_ids,
+            &mut shell_note_ids,
         ) else {
             continue;
         };
@@ -985,6 +1035,7 @@ async fn a_loaded_session_replays_its_shell_note_as_a_shell_card() {
     let mut steer_ids = VecDeque::new();
     let mut model_ids = VecDeque::new();
     let mut remember_ids = VecDeque::new();
+    let mut shell_note_ids: VecDeque<u64> = VecDeque::new();
     let load = client
         .request(
             "session/load",
@@ -1003,6 +1054,7 @@ async fn a_loaded_session_replays_its_shell_note_as_a_shell_card() {
             &mut steer_ids,
             &mut model_ids,
             &mut remember_ids,
+            &mut shell_note_ids,
         ) {
             update(&mut state, msg);
         }

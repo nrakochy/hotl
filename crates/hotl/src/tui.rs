@@ -625,6 +625,7 @@ async fn run_loop(
     let mut steer_ids: VecDeque<u64> = VecDeque::new();
     let mut model_ids: VecDeque<u64> = VecDeque::new();
     let mut remember_ids: VecDeque<u64> = VecDeque::new();
+    let mut shell_note_ids: VecDeque<u64> = VecDeque::new();
     // What `/resume` re-seeds a switched-to session with: the process default
     // model, and the ids its last listing numbered.
     let default_model = state.model.clone();
@@ -669,6 +670,7 @@ async fn run_loop(
                 &mut steer_ids,
                 &mut model_ids,
                 &mut remember_ids,
+                &mut shell_note_ids,
             )
             .await?
             else {
@@ -750,6 +752,7 @@ async fn run_loop(
                 Cmd::Resume(arg) => {
                     match resume_target(&arg, &mut listed) {
                         Ok(ResumeTarget::Listing(lines)) => {
+                            settle_shell_for_resume(false, &mut shell_cancel, &mut shell_current);
                             for line in lines {
                                 push_notice(&mut state, line);
                             }
@@ -759,7 +762,11 @@ async fn run_loop(
                             // the current session installed and untouched.
                             match handshake(client, reader, TuiArgs::resume(sid)).await {
                                 Ok(opened) => {
-                                    abandon_shell(&mut shell_cancel, &mut shell_current);
+                                    settle_shell_for_resume(
+                                        true,
+                                        &mut shell_cancel,
+                                        &mut shell_current,
+                                    );
                                     let fresh = State::new(state.vim_mode, String::new());
                                     let old = std::mem::replace(&mut state, fresh);
                                     state.editor = old.editor;
@@ -773,13 +780,24 @@ async fn run_loop(
                                     steer_ids.clear();
                                     model_ids.clear();
                                     remember_ids.clear();
+                                    shell_note_ids.clear();
                                     listed.clear();
                                     queue.extend(hotl_tui::app::opened_cmds(&state));
                                 }
-                                Err(e) => push_notice(&mut state, format!("/resume: {e}")),
+                                Err(e) => {
+                                    settle_shell_for_resume(
+                                        false,
+                                        &mut shell_cancel,
+                                        &mut shell_current,
+                                    );
+                                    push_notice(&mut state, format!("/resume: {e}"))
+                                }
                             }
                         }
-                        Err(e) => push_notice(&mut state, e),
+                        Err(e) => {
+                            settle_shell_for_resume(false, &mut shell_cancel, &mut shell_current);
+                            push_notice(&mut state, e)
+                        }
                     }
                     needs_draw = true;
                 }
@@ -839,6 +857,7 @@ async fn run_loop(
                     &mut steer_ids,
                     &mut model_ids,
                     &mut remember_ids,
+                    &mut shell_note_ids,
                     );
                     if matches!(msg, Some(Msg::PromptResult { .. })) {
                         client.clear_questions();
@@ -1207,6 +1226,16 @@ fn resolve_mouse(env: Option<&str>, cfg: bool) -> bool {
 
 fn is_current_shell_run(current: Option<u64>, id: u64) -> bool {
     current == Some(id)
+}
+
+fn settle_shell_for_resume(
+    switched: bool,
+    cancel: &mut Option<tokio_util::sync::CancellationToken>,
+    current: &mut Option<u64>,
+) {
+    if switched {
+        abandon_shell(cancel, current);
+    }
 }
 
 fn abandon_shell(
@@ -1817,6 +1846,20 @@ fn age(t: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_resume_that_does_not_switch_leaves_the_running_shell_alone() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut cancel = Some(token.clone());
+        let mut current = Some(7);
+        super::settle_shell_for_resume(false, &mut cancel, &mut current);
+        assert!(!token.is_cancelled());
+        assert!(cancel.is_some());
+        assert_eq!(current, Some(7));
+        super::settle_shell_for_resume(true, &mut cancel, &mut current);
+        assert!(token.is_cancelled());
+        assert!(cancel.is_none() && current.is_none());
+    }
+
     #[test]
     fn only_the_current_shell_run_may_land() {
         assert!(super::is_current_shell_run(Some(3), 3));

@@ -466,6 +466,7 @@ pub fn translate(
     steer_ids: &mut VecDeque<u64>,
     model_ids: &mut VecDeque<u64>,
     remember_ids: &mut VecDeque<u64>,
+    shell_note_ids: &mut VecDeque<u64>,
 ) -> Option<Msg> {
     match msg {
         ServerMsg::Update(v) => Some(Msg::Update(v)),
@@ -503,6 +504,10 @@ pub fn translate(
                 return Some(Msg::RememberAck {
                     result: result.map(|_| ()),
                 });
+            }
+            if let Some(pos) = shell_note_ids.iter().position(|&p| p == id) {
+                shell_note_ids.remove(pos);
+                return result.err().map(|why| Msg::ShellNoteRejected { why });
             }
             if let Some(update) = result.as_ref().ok().and_then(report_update) {
                 return Some(Msg::Update(update));
@@ -608,6 +613,7 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
     steer_ids: &mut VecDeque<u64>,
     model_ids: &mut VecDeque<u64>,
     remember_ids: &mut VecDeque<u64>,
+    shell_note_ids: &mut VecDeque<u64>,
 ) -> io::Result<Option<Cmd>> {
     match cmd {
         Cmd::SendPrompt(p) => {
@@ -638,12 +644,14 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
             exit_code,
             end,
         } => {
-            client
-                .request(
-                    "_hotl/session/shell_note",
-                    json!({"command": command, "output": output, "exitCode": exit_code, "end": end}),
-                )
-                .await?;
+            shell_note_ids.push_back(
+                client
+                    .request(
+                        "_hotl/session/shell_note",
+                        json!({"command": command, "output": output, "exitCode": exit_code, "end": end}),
+                    )
+                    .await?,
+            );
         }
         Cmd::SetColor(color) => {
             client
@@ -832,6 +840,7 @@ mod tests {
                 &mut steer_ids,
                 &mut VecDeque::new(),
                 &mut VecDeque::new(),
+                &mut VecDeque::new(),
             )
             else {
                 panic!("not a prompt result")
@@ -857,7 +866,8 @@ mod tests {
             &mut ids,
             &mut steer_ids,
             &mut VecDeque::new(),
-            &mut VecDeque::new()
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
         )
         .is_none());
         assert_eq!(ids.len(), 1, "an unrelated ack consumes no prompt id");
@@ -875,6 +885,7 @@ mod tests {
             msg,
             &mut prompt_ids,
             &mut steer_ids,
+            &mut VecDeque::new(),
             &mut VecDeque::new(),
             &mut VecDeque::new(),
         ) else {
@@ -897,7 +908,8 @@ mod tests {
             &mut prompt_ids,
             &mut steer_ids,
             &mut VecDeque::new(),
-            &mut VecDeque::new()
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
         )
         .is_none());
         assert!(steer_ids.is_empty(), "the id is consumed either way");
@@ -947,6 +959,7 @@ mod tests {
             &mut client,
             &mut ids,
             &mut steer_ids,
+            &mut VecDeque::new(),
             &mut VecDeque::new(),
             &mut VecDeque::new(),
         )
@@ -1093,6 +1106,7 @@ mod tests {
             &mut VecDeque::new(),
             &mut VecDeque::from([5]),
             &mut VecDeque::new(),
+            &mut VecDeque::new(),
         );
         assert_eq!(
             msg,
@@ -1100,6 +1114,41 @@ mod tests {
                 result: Ok(json!({"applied": false, "model": "x"}))
             })
         );
+    }
+
+    #[test]
+    fn a_rejected_shell_note_reply_becomes_a_message() {
+        let mut notes = VecDeque::from([9]);
+        let msg = translate(
+            ServerMsg::Response {
+                id: 9,
+                result: Err("no such session".into()),
+            },
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut notes,
+        );
+        assert_eq!(
+            msg,
+            Some(Msg::ShellNoteRejected {
+                why: "no such session".into()
+            })
+        );
+        assert!(notes.is_empty());
+        let ok = translate(
+            ServerMsg::Response {
+                id: 10,
+                result: Ok(json!({})),
+            },
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::from([10]),
+        );
+        assert_eq!(ok, None);
     }
 
     #[tokio::test]
@@ -1487,6 +1536,7 @@ mod tests {
             &mut VecDeque::new(),
             &mut VecDeque::new(),
             &mut VecDeque::new(),
+            &mut VecDeque::new(),
         )
         .await
         .expect("the write succeeded");
@@ -1543,6 +1593,7 @@ mod tests {
         exec_wire_cmd(
             Cmd::Cancel,
             &mut client,
+            &mut VecDeque::new(),
             &mut VecDeque::new(),
             &mut VecDeque::new(),
             &mut VecDeque::new(),
@@ -1648,6 +1699,7 @@ mod tests {
             &mut VecDeque::new(),
             &mut VecDeque::new(),
             &mut VecDeque::new(),
+            &mut VecDeque::new(),
         );
         assert_eq!(
             got,
@@ -1673,6 +1725,7 @@ mod tests {
                 ),
             },
             &mut VecDeque::from([7]),
+            &mut VecDeque::new(),
             &mut VecDeque::new(),
             &mut VecDeque::new(),
             &mut VecDeque::new(),
@@ -1761,6 +1814,7 @@ mod tests {
             &mut VecDeque::new(),
             &mut VecDeque::new(),
             &mut VecDeque::new(),
+            &mut VecDeque::new(),
         ) else {
             panic!("a report reply is an update");
         };
@@ -1804,6 +1858,7 @@ mod tests {
                 &mut steer_ids,
                 &mut VecDeque::new(),
                 &mut VecDeque::new(),
+                &mut VecDeque::new(),
             )
             .await
             .expect("the write succeeded")
@@ -1837,6 +1892,7 @@ mod tests {
                 &mut client,
                 &mut ids,
                 &mut steer_ids,
+                &mut VecDeque::new(),
                 &mut VecDeque::new(),
                 &mut VecDeque::new(),
             )

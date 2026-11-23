@@ -599,6 +599,7 @@ pub struct State {
     pub session_branch: Option<String>,
     pub session_root: Option<std::path::PathBuf>,
     pub shell_running: Option<String>,
+    pub held_prompt: Option<(String, paste::PromptPayload)>,
     pub session_color: Option<String>,
     /// A `/btw` in flight (0071 T5): the question and ticks since it was
     /// sent, for the strip's `aside · Ns` segment. `None` = none pending.
@@ -796,6 +797,7 @@ impl State {
             session_branch: None,
             session_root: None,
             shell_running: None,
+            held_prompt: None,
             session_color: None,
             aside_pending: None,
             mode: "ask".into(),
@@ -957,6 +959,9 @@ pub enum Msg {
     /// frame carries the notice); `Err` is the refusal text.
     RememberAck {
         result: Result<(), String>,
+    },
+    ShellNoteRejected {
+        why: String,
     },
     Key(KeyEvent),
     /// Bracketed-paste payload. Literal text, never keys — see `Msg::Key`.
@@ -1162,6 +1167,7 @@ fn from_wire(msg: &Msg) -> bool {
             | Msg::SteerRejected { .. }
             | Msg::ModelAck { .. }
             | Msg::RememberAck { .. }
+            | Msg::ShellNoteRejected { .. }
     )
 }
 
@@ -1297,6 +1303,13 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             usage,
             finished_at,
         } => on_prompt_result(state, &outcome_kind, outcome_text, &usage, finished_at),
+        Msg::ShellNoteRejected { why } => {
+            notice(
+                state,
+                format!("couldn't share the ! output with the model: {why}"),
+            );
+            Vec::new()
+        }
         Msg::RememberAck { result } => {
             if let Err(e) = result {
                 notice(state, e);
@@ -3274,18 +3287,39 @@ fn shell_done(state: &mut State, output: String, end: ShellEnd) -> Vec<Cmd> {
         *e = Some(end);
         *running = false;
     }
-    if end == ShellEnd::Cancelled {
-        return Vec::new();
+    let mut cmds = Vec::new();
+    if end != ShellEnd::Cancelled {
+        cmds.push(Cmd::ShellNote {
+            command,
+            output: shared,
+            exit_code: end.exit_code(),
+            end: end.wire(),
+        });
     }
-    vec![Cmd::ShellNote {
-        command,
-        output: shared,
-        exit_code: end.exit_code(),
-        end: end.wire(),
-    }]
+    if let Some((text, payload)) = state.held_prompt.take() {
+        cmds.extend(send_text(state, text, payload));
+    }
+    cmds
 }
 
 fn send_text(state: &mut State, text: String, payload: paste::PromptPayload) -> Vec<Cmd> {
+    if let Some(command) = state.shell_running.clone() {
+        let preview: String = text
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(40)
+            .collect();
+        let line = if state.held_prompt.is_some() {
+            format!("replaced the held message — still waiting for !{command}, then \"{preview}\" goes next")
+        } else {
+            format!("waiting for !{command} — \"{preview}\" goes next")
+        };
+        state.held_prompt = Some((text, payload));
+        notice(state, line);
+        return Vec::new();
+    }
     // Anything the human sends answers a live plan card — usually a revision.
     settle_plan(state);
     if state.phase == Phase::Idle {
@@ -7760,6 +7794,7 @@ mod tests {
             &mut std::collections::VecDeque::new(),
             &mut std::collections::VecDeque::new(),
             &mut std::collections::VecDeque::new(),
+            &mut std::collections::VecDeque::new(),
         )
         .expect("a notice is a message for the app");
         update(&mut s, msg);
@@ -10369,6 +10404,110 @@ mod tests {
             "{cmds:?}"
         );
         assert!(s.shell_running.is_none());
+    }
+
+    fn sent_texts(cmds: &[Cmd]) -> Vec<String> {
+        cmds.iter()
+            .filter_map(|c| match c {
+                Cmd::SendPrompt(p) | Cmd::SendSteer(p) => Some(p.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_prompt_sent_while_bang_runs_waits_for_its_output() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "!sleep 5");
+        let cmds = type_and_submit(&mut s, "what did it print");
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::SendPrompt(_) | Cmd::SendSteer(_))),
+            "{cmds:?}"
+        );
+        assert_eq!(s.phase, Phase::Idle);
+        assert!(
+            s.transcript.iter().any(|i| matches!(i, TranscriptItem::Notice { text } if text.contains("waiting for !sleep 5"))),
+            "{:?}",
+            s.transcript
+        );
+        let cmds = update(&mut s, done("hi\n", ShellEnd::Exited(0)));
+        assert!(
+            matches!(&cmds[..], [Cmd::ShellNote { .. }, Cmd::SendPrompt(p), ..] if p.text == "what did it print"),
+            "{cmds:?}"
+        );
+        assert!(s.held_prompt.is_none());
+        assert!(matches!(s.phase, Phase::Sampling { .. }));
+        let again = update(&mut s, done("", ShellEnd::Exited(0)));
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn a_held_prompt_survives_a_cancelled_bang() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "!sleep 5");
+        type_and_submit(&mut s, "carry on");
+        let cmds = update(&mut s, done("", ShellEnd::Cancelled));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::ShellNote { .. })),
+            "{cmds:?}"
+        );
+        assert_eq!(sent_texts(&cmds), vec!["carry on".to_string()]);
+        assert!(matches!(cmds[0], Cmd::SendPrompt(_)));
+    }
+
+    #[test]
+    fn a_second_held_prompt_replaces_the_first() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "!sleep 5");
+        type_and_submit(&mut s, "first");
+        type_and_submit(&mut s, "second");
+        assert!(last_notice(&s).contains("replaced"), "{}", last_notice(&s));
+        let cmds = update(&mut s, done("x", ShellEnd::Exited(0)));
+        assert_eq!(sent_texts(&cmds), vec!["second".to_string()]);
+    }
+
+    #[test]
+    fn a_held_prompt_mid_turn_is_sent_as_a_steer() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "!sleep 5");
+        type_and_submit(&mut s, "later");
+        s.phase = Phase::Sampling { ticks: 0 };
+        let cmds = update(&mut s, done("x", ShellEnd::Exited(0)));
+        assert!(
+            matches!(&cmds[..], [Cmd::ShellNote { .. }, Cmd::SendSteer(p)] if p.text == "later"),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_plan_task_during_a_bang_sets_plan_now_and_holds_the_task() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "!sleep 5");
+        let cmds = type_and_submit(&mut s, "/plan write it");
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SetPlan(true))),
+            "{cmds:?}"
+        );
+        assert!(sent_texts(&cmds).is_empty());
+        let cmds = update(&mut s, done("x", ShellEnd::Exited(0)));
+        assert_eq!(sent_texts(&cmds), vec!["write it".to_string()]);
+    }
+
+    #[test]
+    fn a_rejected_shell_note_says_so() {
+        let mut s = State::test_default();
+        update(
+            &mut s,
+            Msg::ShellNoteRejected {
+                why: "no session".into(),
+            },
+        );
+        assert_eq!(
+            last_notice(&s),
+            "couldn't share the ! output with the model: no session"
+        );
     }
 
     #[test]
