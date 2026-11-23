@@ -18,10 +18,10 @@ const READ_MAX_LINES: usize = 2000;
 const READ_MAX_LINE: usize = 8 * 1024;
 const BASH_DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const BASH_MAX_TIMEOUT_MS: u64 = 600_000;
-const BASH_MAX_OUTPUT: usize = 50 * 1024;
+pub(crate) const BASH_MAX_OUTPUT: usize = 50 * 1024;
 /// Slack past the truncation point so `combined_output` still sees "over the
 /// cap" and appends its marker exactly as before.
-const BASH_OUTPUT_SLACK: usize = 1024;
+pub(crate) const BASH_OUTPUT_SLACK: usize = 1024;
 
 /// Errors double as results: `Err(ToolOutcome)` is the errors-as-prompts
 /// channel, letting tool bodies use `?`.
@@ -1866,7 +1866,7 @@ async fn bash_impl(root: &Path, input: &Value, cancel: CancellationToken) -> Too
 /// process exited. The dup onto the child's fd 1/2 (or its Windows handle
 /// equivalent) clears that on the copies the child actually gets, so it costs
 /// the child nothing.
-fn merged_pipe() -> std::io::Result<(
+pub(crate) fn merged_pipe() -> std::io::Result<(
     std::process::Stdio,
     std::process::Stdio,
     std::io::PipeReader,
@@ -1886,7 +1886,7 @@ fn merged_pipe() -> std::io::Result<(
 ///
 /// Additive beside `collect_output`, whose signature is shared with the
 /// diagnostics runner and is deliberately left alone.
-async fn collect_merged(
+pub(crate) async fn collect_merged(
     mut child: tokio::process::Child,
     pipe: std::io::PipeReader,
     cap: usize,
@@ -2264,7 +2264,7 @@ fn death_trailer(status: &std::process::ExitStatus) -> Option<(String, String)> 
     Some((format!("exception {name}"), format!("[killed by {name}]")))
 }
 
-fn clip_output(bytes: &[u8]) -> String {
+pub(crate) fn clip_output(bytes: &[u8]) -> String {
     let mut text = String::from_utf8_lossy(bytes).into_owned();
     if text.len() > BASH_MAX_OUTPUT {
         let mut end = BASH_MAX_OUTPUT;

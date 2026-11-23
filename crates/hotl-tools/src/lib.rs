@@ -30,6 +30,7 @@ pub mod skills;
 #[cfg(test)]
 pub(crate) mod testsupport;
 pub mod todo;
+pub mod user_shell;
 pub mod web;
 pub mod winfloor;
 
