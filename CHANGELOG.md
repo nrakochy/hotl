@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-11-23
+
 ### Added
 
 - `/plan <task>` turns plan mode on and sends `<task>` as your prompt in one
