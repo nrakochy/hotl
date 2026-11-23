@@ -182,6 +182,9 @@ fn seed_state(state: &mut State, model: String, opened: Opened, first_run_hint: 
     state.memory_mode = memory_mode;
     state.session_name = session_name;
     state.session_title = title;
+    state.session_root = worktree
+        .as_ref()
+        .map(|(path, _)| std::path::PathBuf::from(path));
     state.session_branch = worktree.map(|(_, branch)| branch);
     state.session_color = color
         .as_deref()

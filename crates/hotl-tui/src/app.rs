@@ -199,6 +199,12 @@ pub enum TranscriptItem {
         text: Streamed,
         queued: bool,
     },
+    Shell {
+        command: String,
+        output: String,
+        exit_code: Option<i32>,
+        running: bool,
+    },
     /// Grows via `text_delta`.
     Assistant {
         text: Streamed,
@@ -590,6 +596,8 @@ pub struct State {
     /// The git branch of the session's worktree (0065), from the open reply;
     /// rides the title so `hotl watch` can show it.
     pub session_branch: Option<String>,
+    pub session_root: Option<std::path::PathBuf>,
+    pub shell_running: Option<String>,
     pub session_color: Option<String>,
     /// A `/btw` in flight (0071 T5): the question and ticks since it was
     /// sent, for the strip's `aside · Ns` segment. `None` = none pending.
@@ -785,6 +793,8 @@ impl State {
             session_name: None,
             session_title: None,
             session_branch: None,
+            session_root: None,
+            shell_running: None,
             session_color: None,
             aside_pending: None,
             mode: "ask".into(),
@@ -902,6 +912,12 @@ impl State {
 
 #[derive(Debug, PartialEq)]
 pub enum Msg {
+    ShellDone {
+        output: String,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        cancelled: bool,
+    },
     /// The `update` object from a `session/update` notification.
     Update(Value),
     PermissionRequest {
@@ -992,6 +1008,16 @@ pub enum Cmd {
     /// runtime seam reads and encodes the files.
     SendPrompt(paste::PromptPayload),
     SendSteer(paste::PromptPayload),
+    RunShell {
+        command: String,
+        cwd: std::path::PathBuf,
+    },
+    CancelShell,
+    ShellNote {
+        command: String,
+        output: String,
+        exit_code: Option<i32>,
+    },
     /// Send `_hotl/session/rename` (fire-and-forget; the ack is noise).
     Rename(String),
     /// Send `session/set_mode` (fire-and-forget; the ack is noise). Payload
@@ -1354,6 +1380,12 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             on_tick(state);
             Vec::new()
         }
+        Msg::ShellDone {
+            output,
+            exit_code,
+            timed_out,
+            cancelled,
+        } => shell_done(state, output, exit_code, timed_out, cancelled),
         Msg::EditorDone(content) => {
             match content {
                 Ok(Some(text)) => {
@@ -2928,7 +2960,8 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             // (or the expanded template) on disk. In-session recall still walks
             // everything via the editor's own ring.
             let starts_turn = cmds.iter().any(|c| matches!(c, Cmd::SendPrompt(_)));
-            if starts_turn && !text.trim_start().starts_with('/') {
+            let runs_shell = cmds.iter().any(|c| matches!(c, Cmd::RunShell { .. }));
+            if (starts_turn && !text.trim_start().starts_with('/')) || runs_shell {
                 let mut out = vec![Cmd::AppendHistory(history_text)];
                 out.extend(cmds);
                 out
@@ -3091,6 +3124,9 @@ fn scroll_route(state: &mut State, intent: crate::scroll::Intent) {
 /// stops waiting for the answer. Control returns unconditionally — the
 /// client must never depend on the server to hand the prompt line back.
 fn interrupt_or_detach(state: &mut State) -> Vec<Cmd> {
+    if state.shell_running.is_some() {
+        return vec![Cmd::CancelShell];
+    }
     if !state.interrupt_sent {
         state.interrupt_sent = true;
         return vec![Cmd::Cancel];
@@ -3121,7 +3157,93 @@ fn submit(state: &mut State, text: String, payload: paste::PromptPayload) -> Vec
     if let Some(rest) = text.trim().strip_prefix('/') {
         return slash_command(state, rest, payload);
     }
+    if let Some(rest) = text.trim_start().strip_prefix('!') {
+        return run_shell(state, rest.trim());
+    }
     send_text(state, text, payload)
+}
+
+fn run_shell(state: &mut State, command: &str) -> Vec<Cmd> {
+    if command.is_empty() {
+        notice(
+            state,
+            "usage: !<command> — runs it here and shares the output with the model".into(),
+        );
+        return Vec::new();
+    }
+    if state.shell_running.is_some() {
+        notice(
+            state,
+            "a shell command is already running — esc cancels it".into(),
+        );
+        return Vec::new();
+    }
+    state.transcript.push(TranscriptItem::Shell {
+        command: command.to_string(),
+        output: String::new(),
+        exit_code: None,
+        running: true,
+    });
+    state.shell_running = Some(command.to_string());
+    state.scroll = Scroll::Follow;
+    let cwd = state
+        .session_root
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    vec![Cmd::RunShell {
+        command: command.to_string(),
+        cwd,
+    }]
+}
+
+fn shell_done(
+    state: &mut State,
+    output: String,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    cancelled: bool,
+) -> Vec<Cmd> {
+    let Some(command) = state.shell_running.take() else {
+        return Vec::new();
+    };
+    let mut output = output;
+    let tail = if timed_out {
+        Some("[timed out after 120s]")
+    } else if cancelled {
+        Some("[cancelled]")
+    } else {
+        None
+    };
+    if let Some(tail) = tail {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(tail);
+    }
+    if let Some(TranscriptItem::Shell {
+        output: o,
+        exit_code: e,
+        running,
+        ..
+    }) = state
+        .transcript
+        .iter_mut()
+        .rev()
+        .find(|i| matches!(i, TranscriptItem::Shell { running: true, .. }))
+    {
+        o.clone_from(&output);
+        *e = exit_code;
+        *running = false;
+    }
+    if cancelled {
+        return Vec::new();
+    }
+    vec![Cmd::ShellNote {
+        command,
+        output,
+        exit_code,
+    }]
 }
 
 fn send_text(state: &mut State, text: String, payload: paste::PromptPayload) -> Vec<Cmd> {
@@ -10049,6 +10171,189 @@ mod tests {
                 .any(|c| matches!(c, Cmd::AppendHistory(t) if t == "fix the bug")),
             "got {cmds:?}"
         );
+    }
+
+    fn shell_cards(s: &State) -> Vec<&TranscriptItem> {
+        s.transcript
+            .iter()
+            .filter(|i| matches!(i, TranscriptItem::Shell { .. }))
+            .collect()
+    }
+
+    fn done(output: &str, exit_code: Option<i32>) -> Msg {
+        Msg::ShellDone {
+            output: output.into(),
+            exit_code,
+            timed_out: false,
+            cancelled: false,
+        }
+    }
+
+    #[test]
+    fn bang_runs_a_shell_command_without_starting_a_turn() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "!git status");
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::RunShell { command, .. } if command == "git status")),
+            "{cmds:?}"
+        );
+        assert!(!cmds
+            .iter()
+            .any(|c| matches!(c, Cmd::SendPrompt(_) | Cmd::SendSteer(_))));
+        assert_eq!(s.phase, Phase::Idle);
+        assert_eq!(s.shell_running.as_deref(), Some("git status"));
+        assert!(matches!(
+            shell_cards(&s)[..],
+            [TranscriptItem::Shell { running: true, .. }]
+        ));
+    }
+
+    #[test]
+    fn bang_lines_persist_to_history() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "!git status");
+        assert!(
+            cmds.contains(&Cmd::AppendHistory("!git status".into())),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn bang_alone_is_usage() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "!   ");
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(last_notice(&s).starts_with("usage: !<command>"));
+        assert!(s.shell_running.is_none());
+    }
+
+    #[test]
+    fn bang_while_one_runs_is_refused() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "!sleep 5");
+        let cmds = type_and_submit(&mut s, "!ls");
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::RunShell { .. })),
+            "{cmds:?}"
+        );
+        assert!(last_notice(&s).contains("already running"));
+        assert_eq!(s.shell_running.as_deref(), Some("sleep 5"));
+    }
+
+    #[test]
+    fn plan_task_starting_with_bang_is_a_prompt_not_a_shell() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/plan !foo");
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::SendPrompt(p) if p.text == "!foo")),
+            "{cmds:?}"
+        );
+        assert!(s.shell_running.is_none());
+    }
+
+    #[test]
+    fn shell_done_fills_the_card_and_shares_the_output() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "!false");
+        let cmds = update(&mut s, done("boom\n", Some(1)));
+        assert_eq!(
+            cmds,
+            vec![Cmd::ShellNote {
+                command: "false".into(),
+                output: "boom\n".into(),
+                exit_code: Some(1)
+            }]
+        );
+        assert!(s.shell_running.is_none());
+        assert!(matches!(
+            shell_cards(&s)[..],
+            [TranscriptItem::Shell { output, exit_code: Some(1), running: false, .. }] if output == "boom\n"
+        ));
+    }
+
+    #[test]
+    fn a_timed_out_shell_command_says_so_and_is_shared() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "!sleep 999");
+        let cmds = update(
+            &mut s,
+            Msg::ShellDone {
+                output: "x".into(),
+                exit_code: None,
+                timed_out: true,
+                cancelled: false,
+            },
+        );
+        assert!(
+            matches!(&cmds[..], [Cmd::ShellNote { output, .. }] if output.contains("[timed out after 120s]")),
+            "{cmds:?}"
+        );
+        assert!(matches!(
+            shell_cards(&s)[..],
+            [TranscriptItem::Shell { output, .. }] if output.contains("[timed out after 120s]")
+        ));
+    }
+
+    #[test]
+    fn a_cancelled_shell_command_is_not_shared() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "!sleep 999");
+        let cmds = update(
+            &mut s,
+            Msg::ShellDone {
+                output: "".into(),
+                exit_code: None,
+                timed_out: false,
+                cancelled: true,
+            },
+        );
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(s.shell_running.is_none());
+        assert!(matches!(
+            shell_cards(&s)[..],
+            [TranscriptItem::Shell { output, running: false, .. }] if output.contains("[cancelled]")
+        ));
+    }
+
+    #[test]
+    fn esc_cancels_the_shell_command_before_the_turn() {
+        let mut s = State::test_default();
+        s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+        type_and_submit(&mut s, "!sleep 999");
+        press(&mut s, KeyCode::Esc);
+        let cmds = press(&mut s, KeyCode::Esc);
+        assert_eq!(cmds, vec![Cmd::CancelShell]);
+        assert!(!s.interrupt_sent);
+    }
+
+    #[test]
+    fn bang_mid_turn_runs_and_leaves_the_turn_alone() {
+        let mut s = State::test_default();
+        s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+        let cmds = type_and_submit(&mut s, "!ls");
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::RunShell { .. })),
+            "{cmds:?}"
+        );
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::SendSteer(_))));
+        assert!(matches!(s.phase, Phase::Streaming { .. }));
+    }
+
+    #[test]
+    fn a_signal_death_renders_no_exit_code() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "!x");
+        update(&mut s, done("", None));
+        assert!(matches!(
+            shell_cards(&s)[..],
+            [TranscriptItem::Shell {
+                exit_code: None,
+                running: false,
+                ..
+            }]
+        ));
     }
 
     #[test]

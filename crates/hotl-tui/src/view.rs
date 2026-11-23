@@ -242,6 +242,12 @@ fn item_fingerprint(item: &TranscriptItem, thinking_expanded: bool, band_keys: b
     match item {
         TranscriptItem::User { text } => (0u8, text_key(text)).hash(&mut h),
         TranscriptItem::Steer { text, queued } => (1u8, text_key(text), queued).hash(&mut h),
+        TranscriptItem::Shell {
+            command,
+            output,
+            exit_code,
+            running,
+        } => (13u8, command, output, exit_code, running).hash(&mut h),
         TranscriptItem::Assistant { text } => (2u8, text_key(text)).hash(&mut h),
         TranscriptItem::Thinking { text } => (3u8, text_key(text), thinking_expanded).hash(&mut h),
         TranscriptItem::Tool {
@@ -696,7 +702,9 @@ enum Speaker {
 
 fn speaker(item: &TranscriptItem) -> Speaker {
     match item {
-        TranscriptItem::User { .. } | TranscriptItem::Steer { .. } => Speaker::You,
+        TranscriptItem::User { .. }
+        | TranscriptItem::Steer { .. }
+        | TranscriptItem::Shell { .. } => Speaker::You,
         TranscriptItem::Assistant { .. } => Speaker::Model,
         TranscriptItem::Thinking { .. }
         | TranscriptItem::Tool { .. }
@@ -1106,6 +1114,43 @@ fn item_block<'a>(
                     .collect(),
             ),
         ),
+        TranscriptItem::Shell {
+            command,
+            output,
+            exit_code,
+            running,
+        } => {
+            let dim = Style::new().fg(p.muted);
+            let mut lines = vec![Line::styled(
+                format!("! {command}"),
+                Style::new().fg(p.accent).bold(),
+            )];
+            lines.extend(output.lines().map(|l| Line::styled(l.to_string(), dim)));
+            if *running && output.is_empty() {
+                lines.push(Line::styled("running…".to_string(), dim.italic()));
+            }
+            match exit_code {
+                Some(0) => {}
+                Some(n) => lines.push(Line::styled(format!("[exit {n}]"), dim)),
+                None if !*running
+                    && !output.ends_with("[cancelled]")
+                    && !output.ends_with("[timed out after 120s]") =>
+                {
+                    lines.push(Line::styled("[no exit code]".to_string(), dim));
+                }
+                None => {}
+            }
+            (
+                Spine {
+                    indent: 0,
+                    marker: "!",
+                    cont: " ",
+                    marker_style: Style::new().fg(p.accent),
+                    cont_style: Style::new(),
+                },
+                prose(lines),
+            )
+        }
         TranscriptItem::Assistant { text } => (assistant_spine(p), assistant_lines(text, p)),
         TranscriptItem::Steer { text, queued: true } => (
             Spine {

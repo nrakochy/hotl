@@ -632,6 +632,18 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
                 .request("_hotl/session/rename", json!({"name": name}))
                 .await?;
         }
+        Cmd::ShellNote {
+            command,
+            output,
+            exit_code,
+        } => {
+            client
+                .request(
+                    "_hotl/session/shell_note",
+                    json!({"command": command, "output": output, "exitCode": exit_code}),
+                )
+                .await?;
+        }
         Cmd::SetColor(color) => {
             client
                 .request("_hotl/session/set_color", json!({"color": color}))
@@ -1485,6 +1497,21 @@ mod tests {
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         (lines, ids)
+    }
+
+    #[tokio::test]
+    async fn shell_note_sends_the_output_and_exit_code() {
+        let (lines, _) = written(Cmd::ShellNote {
+            command: "ls".into(),
+            output: "a\n".into(),
+            exit_code: Some(2),
+        })
+        .await;
+        assert_eq!(lines[0]["method"], "_hotl/session/shell_note");
+        assert_eq!(
+            lines[0]["params"],
+            json!({"sessionId": "s1", "command": "ls", "output": "a\n", "exitCode": 2})
+        );
     }
 
     #[tokio::test]
