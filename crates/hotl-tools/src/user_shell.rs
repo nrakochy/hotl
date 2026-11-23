@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::builtins::{
     adopt, clip_output, collect_merged_into, kill_tree, merged_pipe, new_reaper, BASH_MAX_OUTPUT,
-    BASH_OUTPUT_SLACK,
+    BASH_OUTPUT_SLACK, TRUNCATION_MARKER,
 };
 
 pub const USER_SHELL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -158,8 +158,15 @@ pub fn sanitize(raw: &str) -> String {
     out
 }
 
+const RAW_CAP: usize = BASH_MAX_OUTPUT + BASH_OUTPUT_SLACK;
+
 fn decode(bytes: &[u8]) -> String {
-    clip_output(sanitize(&String::from_utf8_lossy(bytes)).as_bytes())
+    let clean = sanitize(&String::from_utf8_lossy(bytes));
+    let mut text = clip_output(clean.as_bytes());
+    if bytes.len() >= RAW_CAP && text.len() == clean.len() {
+        text.push_str(TRUNCATION_MARKER);
+    }
+    text
 }
 
 pub async fn run(
@@ -190,13 +197,7 @@ pub async fn run(
     adopt(&reaper, &child);
     drop(cmd);
     let buf = Arc::new(Mutex::new(Vec::new()));
-    let wait = collect_merged_into(
-        child,
-        pipe,
-        BASH_MAX_OUTPUT + BASH_OUTPUT_SLACK,
-        None,
-        buf.clone(),
-    );
+    let wait = collect_merged_into(child, pipe, RAW_CAP, None, buf.clone());
     tokio::pin!(wait);
     let end = tokio::select! {
         result = &mut wait => return match result {
@@ -431,13 +432,33 @@ mod tests {
     #[test]
     fn an_escape_cut_at_the_cap_leaves_no_fragment() {
         let r = block(run(
-            "head -c 51190 /dev/zero | tr '\\0' a; printf '\\033[31mred\\033[0m'; head -c 5000 /dev/zero | tr '\\0' b",
+            "awk 'BEGIN { printf \"aa\"; for (i = 0; i < 20000; i++) printf \"\\033[0m\" }'",
             Path::new("."),
             USER_SHELL_TIMEOUT,
             CancellationToken::new(),
         ));
-        assert!(!r.output.contains('\x1b'));
-        assert!(!r.output.contains("[31m"));
-        assert!(r.output.contains("[output truncated at 50KB"));
+        assert!(!r.output.contains('\x1b'), "{:?}", r.output);
+        assert!(
+            r.output.starts_with("aa\n[output truncated at 50KB"),
+            "{:?}",
+            r.output
+        );
+    }
+
+    #[test]
+    fn output_dropped_at_the_raw_cap_is_marked_even_when_cleaning_shrinks_it() {
+        let r = block(run(
+            "awk 'BEGIN { for (i = 0; i < 20000; i++) printf \"\\033[31mx\\033[0m\\n\" }'",
+            Path::new("."),
+            USER_SHELL_TIMEOUT,
+            CancellationToken::new(),
+        ));
+        assert!(r.output.len() < 20_000, "{}", r.output.len());
+        assert!(r.output.starts_with("x\nx\n"), "{:?}", &r.output[..20]);
+        assert!(
+            r.output.contains("[output truncated at 50KB"),
+            "{:?}",
+            &r.output[r.output.len() - 60..]
+        );
     }
 }

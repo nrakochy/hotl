@@ -2288,10 +2288,13 @@ pub(crate) fn clip_output(bytes: &[u8]) -> String {
             end -= 1;
         }
         text.truncate(end);
-        text.push_str("\n[output truncated at 50KB — narrow the command (grep/head) to see more]");
+        text.push_str(TRUNCATION_MARKER);
     }
     text
 }
+
+pub(crate) const TRUNCATION_MARKER: &str =
+    "\n[output truncated at 50KB — narrow the command (grep/head) to see more]";
 
 /// A reaper for one spawned child and everything it goes on to spawn, plus the
 /// child itself. Shared with the diagnostics runner (H-11).
