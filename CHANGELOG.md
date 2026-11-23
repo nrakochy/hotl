@@ -6,6 +6,29 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Changed
+
+- A prompt you send while a `!` command is still running now waits for that
+  command to finish, so the model sees the output first. The same goes for
+  approving a plan and for `/goal`.
+- `!` cards show the last 20 lines of output, with a count of the earlier
+  ones. Colour codes and progress-bar redraws are stripped from what you see
+  and from what the model gets.
+- A `!` card says how the command ended: `[exit N]`, `[killed by SIGTERM]`,
+  `[could not start]`, `[timed out after 120s]` or `[cancelled]`.
+- `/plan <task>` lines are kept in your prompt history, `/plan` also accepts
+  `yes`/`no`/`enable`/`disable`, and the task is sent with its spacing intact.
+- In `hotl attach`, a `!` command runs alongside the session, so its output
+  keeps printing, and a `!` line no longer answers a waiting approval prompt.
+
+### Fixed
+
+- Clients that load a saved session (editors over ACP) now see earlier `!`
+  results as shell cards instead of losing them.
+- If hotl can't hand a `!` result to the model, the TUI now says so.
+- A message you type mid-turn can no longer be swallowed into a background
+  agent's notice.
+
 ## [0.34.0] - 2026-11-23
 
 ### Added
