@@ -11,23 +11,130 @@ use crate::builtins::{
 
 pub const USER_SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShellEnd {
+    Exited(i32),
+    #[cfg(unix)]
+    Signaled(i32),
+    TimedOut,
+    Cancelled,
+    Failed,
+}
+
+impl ShellEnd {
+    pub fn label(self) -> Option<String> {
+        match self {
+            ShellEnd::Exited(0) => None,
+            ShellEnd::Exited(n) => Some(format!("[exit {n}]")),
+            #[cfg(unix)]
+            ShellEnd::Signaled(sig) => {
+                Some(format!("[killed by {}]", crate::builtins::signal_name(sig)))
+            }
+            ShellEnd::TimedOut => Some(format!(
+                "[timed out after {}s]",
+                USER_SHELL_TIMEOUT.as_secs()
+            )),
+            ShellEnd::Cancelled => Some("[cancelled]".to_string()),
+            ShellEnd::Failed => Some("[could not run]".to_string()),
+        }
+    }
+
+    pub fn shared_label(self) -> Option<String> {
+        match self {
+            ShellEnd::Exited(_) | ShellEnd::Cancelled | ShellEnd::Failed => None,
+            _ => self.label(),
+        }
+    }
+
+    pub fn exit_code(self) -> Option<i32> {
+        match self {
+            ShellEnd::Exited(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    fn from_status(status: std::process::ExitStatus) -> Self {
+        if let Some(code) = status.code() {
+            return ShellEnd::Exited(code);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(sig) = status.signal() {
+                return ShellEnd::Signaled(sig);
+            }
+        }
+        ShellEnd::Failed
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserShellRun {
     pub output: String,
-    pub exit_code: Option<i32>,
-    pub timed_out: bool,
-    pub cancelled: bool,
+    pub end: ShellEnd,
 }
 
 impl UserShellRun {
     fn failed(output: String) -> Self {
         Self {
             output,
-            exit_code: None,
-            timed_out: false,
-            cancelled: false,
+            end: ShellEnd::Failed,
         }
     }
+}
+
+pub fn sanitize(raw: &str) -> String {
+    let mut stripped = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            stripped.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                while let Some(&n) = chars.peek() {
+                    match n {
+                        '\u{20}'..='\u{3f}' => {
+                            chars.next();
+                        }
+                        '\u{40}'..='\u{7e}' => {
+                            chars.next();
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(n) = chars.next() {
+                    if n == '\u{7}' {
+                        break;
+                    }
+                    if n == '\u{1b}' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = String::with_capacity(stripped.len());
+    for (i, line) in stripped.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        out.push_str(line.rsplit('\r').next().unwrap_or(line));
+    }
+    out
+}
+
+fn decode(bytes: &[u8]) -> String {
+    clip_output(sanitize(&String::from_utf8_lossy(bytes)).as_bytes())
 }
 
 pub async fn run(
@@ -66,25 +173,22 @@ pub async fn run(
         buf.clone(),
     );
     tokio::pin!(wait);
-    let (timed_out, cancelled) = tokio::select! {
+    let end = tokio::select! {
         result = &mut wait => return match result {
             Ok(status) => UserShellRun {
-                output: clip_output(&take(&buf)),
-                exit_code: status.code(),
-                timed_out: false,
-                cancelled: false,
+                output: decode(&take(&buf)),
+                end: ShellEnd::from_status(status),
             },
             Err(e) => UserShellRun::failed(format!("Failed waiting on command: {e}.")),
         },
-        _ = tokio::time::sleep(timeout) => (true, false),
-        _ = cancel.cancelled() => (false, true),
+        _ = tokio::time::sleep(timeout) => ShellEnd::TimedOut,
+        _ = cancel.cancelled() => ShellEnd::Cancelled,
     };
     kill_tree(&reaper);
     let _ = tokio::time::timeout(KILLED_DRAIN_GRACE, &mut wait).await;
     UserShellRun {
-        timed_out,
-        cancelled,
-        ..UserShellRun::failed(clip_output(&take(&buf)))
+        output: decode(&take(&buf)),
+        end,
     }
 }
 
@@ -122,7 +226,7 @@ mod tests {
             "{}",
             r.output
         );
-        assert_eq!(r.exit_code, Some(3));
+        assert_eq!(r.end, ShellEnd::Exited(3));
     }
 
     #[test]
@@ -167,7 +271,7 @@ mod tests {
             .await;
             (r, t.elapsed())
         });
-        assert!(r.timed_out && !r.cancelled);
+        assert_eq!(r.end, ShellEnd::TimedOut);
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
     }
 
@@ -179,7 +283,7 @@ mod tests {
             Duration::from_millis(500),
             CancellationToken::new(),
         ));
-        assert!(r.timed_out);
+        assert_eq!(r.end, ShellEnd::TimedOut);
         assert!(r.output.contains("before"), "{:?}", r.output);
     }
 
@@ -200,7 +304,7 @@ mod tests {
             )
             .await
         });
-        assert!(r.cancelled);
+        assert_eq!(r.end, ShellEnd::Cancelled);
         assert!(r.output.contains("before"), "{:?}", r.output);
     }
 
@@ -217,7 +321,7 @@ mod tests {
             let r = run("sleep 5", Path::new("."), USER_SHELL_TIMEOUT, token).await;
             (r, t.elapsed())
         });
-        assert!(r.cancelled && !r.timed_out);
+        assert_eq!(r.end, ShellEnd::Cancelled);
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
     }
 
@@ -230,6 +334,82 @@ mod tests {
             CancellationToken::new(),
         ));
         assert!(r.output.len() < 60_000, "{}", r.output.len());
+        assert!(r.output.contains("[output truncated at 50KB"));
+    }
+
+    #[test]
+    fn a_signal_death_is_named() {
+        let r = block(run(
+            "kill -TERM $$",
+            Path::new("."),
+            USER_SHELL_TIMEOUT,
+            CancellationToken::new(),
+        ));
+        assert_eq!(r.end, ShellEnd::Signaled(15));
+        assert_eq!(r.end.label().as_deref(), Some("[killed by SIGTERM]"));
+    }
+
+    #[test]
+    fn a_missing_directory_is_failed() {
+        let r = block(run(
+            "echo hi",
+            Path::new("/nonexistent-0085-dir"),
+            USER_SHELL_TIMEOUT,
+            CancellationToken::new(),
+        ));
+        assert_eq!(r.end, ShellEnd::Failed);
+        assert!(!r.output.is_empty());
+    }
+
+    #[test]
+    fn ansi_and_carriage_returns_are_cleaned() {
+        let r = block(run(
+            "printf '\\033[32mok\\033[0m\\nprog 1\\rprog 2\\n'",
+            Path::new("."),
+            USER_SHELL_TIMEOUT,
+            CancellationToken::new(),
+        ));
+        assert_eq!(r.output, "ok\nprog 2\n");
+    }
+
+    #[test]
+    fn non_utf8_output_is_lossy_not_a_panic() {
+        let r = block(run(
+            "printf '\\377\\376ok'",
+            Path::new("."),
+            USER_SHELL_TIMEOUT,
+            CancellationToken::new(),
+        ));
+        assert!(r.output.ends_with("ok"), "{:?}", r.output);
+        assert_eq!(r.end, ShellEnd::Exited(0));
+    }
+
+    #[test]
+    fn sanitize_handles_each_sequence_shape() {
+        assert_eq!(sanitize("a\x1b[1;31mb\x1b[0mc"), "abc");
+        assert_eq!(sanitize("a\x1b]0;title\x07b"), "ab");
+        assert_eq!(
+            sanitize("a\x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\"),
+            "alink"
+        );
+        assert_eq!(sanitize("x\r\ny\r\n"), "x\ny\n");
+        assert_eq!(sanitize("a\rb\rc\nd"), "c\nd");
+        assert_eq!(sanitize("ok\x1b[3"), "ok");
+        assert_eq!(sanitize("ok\x1b"), "ok");
+        assert_eq!(sanitize("ok\x1b]0;tit"), "ok");
+        assert_eq!(sanitize("a\x1b[\nb"), "a\nb");
+    }
+
+    #[test]
+    fn an_escape_cut_at_the_cap_leaves_no_fragment() {
+        let r = block(run(
+            "head -c 51190 /dev/zero | tr '\\0' a; printf '\\033[31mred\\033[0m'; head -c 5000 /dev/zero | tr '\\0' b",
+            Path::new("."),
+            USER_SHELL_TIMEOUT,
+            CancellationToken::new(),
+        ));
+        assert!(!r.output.contains('\x1b'));
+        assert!(!r.output.contains("[31m"));
         assert!(r.output.contains("[output truncated at 50KB"));
     }
 }

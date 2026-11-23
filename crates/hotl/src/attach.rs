@@ -281,20 +281,24 @@ async fn bang(command: &str, cwd: &std::path::Path) -> (String, Value) {
     )
     .await;
     let mut output = run.output;
-    if run.timed_out {
+    let label = run.end.label();
+    if let (Some(label), hotl_tools::user_shell::ShellEnd::TimedOut) = (&label, run.end) {
         if !output.is_empty() && !output.ends_with('\n') {
             output.push('\n');
         }
-        output.push_str("[timed out after 120s]");
+        output.push_str(label);
     }
     let mut shown = output.clone();
-    if let Some(code) = run.exit_code.filter(|c| *c != 0) {
+    if let (Some(label), false) = (
+        &label,
+        run.end == hotl_tools::user_shell::ShellEnd::TimedOut,
+    ) {
         if !shown.is_empty() && !shown.ends_with('\n') {
             shown.push('\n');
         }
-        shown.push_str(&format!("[exit {code}]"));
+        shown.push_str(label);
     }
-    let params = json!({"command": command, "output": output, "exitCode": run.exit_code});
+    let params = json!({"command": command, "output": output, "exitCode": run.end.exit_code()});
     (shown, params)
 }
 

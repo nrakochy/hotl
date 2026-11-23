@@ -245,9 +245,9 @@ fn item_fingerprint(item: &TranscriptItem, thinking_expanded: bool, band_keys: b
         TranscriptItem::Shell {
             command,
             output,
-            exit_code,
+            end,
             running,
-        } => (13u8, command, output, exit_code, running).hash(&mut h),
+        } => (13u8, command, output, end, running).hash(&mut h),
         TranscriptItem::Assistant { text } => (2u8, text_key(text)).hash(&mut h),
         TranscriptItem::Thinking { text } => (3u8, text_key(text), thinking_expanded).hash(&mut h),
         TranscriptItem::Tool {
@@ -1083,6 +1083,8 @@ fn group_digits(n: u64) -> String {
     out
 }
 
+const SHELL_CARD_LINES: usize = 20;
+
 /// The spine and the content spans for one item — the content no longer
 /// carries its own marker prefix; the spine owns that column now.
 fn item_block<'a>(
@@ -1117,7 +1119,7 @@ fn item_block<'a>(
         TranscriptItem::Shell {
             command,
             output,
-            exit_code,
+            end,
             running,
         } => {
             let dim = Style::new().fg(p.muted);
@@ -1125,20 +1127,21 @@ fn item_block<'a>(
                 format!("! {command}"),
                 Style::new().fg(p.accent).bold(),
             )];
-            lines.extend(output.lines().map(|l| Line::styled(l.to_string(), dim)));
+            let all: Vec<&str> = output.lines().collect();
+            let hidden = all.len().saturating_sub(SHELL_CARD_LINES);
+            if hidden > 0 {
+                lines.push(Line::styled(format!("… {hidden} earlier lines"), dim));
+            }
+            lines.extend(
+                all[hidden..]
+                    .iter()
+                    .map(|l| Line::styled((*l).to_string(), dim)),
+            );
             if *running && output.is_empty() {
                 lines.push(Line::styled("running…".to_string(), dim.italic()));
             }
-            match exit_code {
-                Some(0) => {}
-                Some(n) => lines.push(Line::styled(format!("[exit {n}]"), dim)),
-                None if !*running
-                    && !output.ends_with("[cancelled]")
-                    && !output.ends_with("[timed out after 120s]") =>
-                {
-                    lines.push(Line::styled("[no exit code]".to_string(), dim));
-                }
-                None => {}
+            if let Some(label) = end.and_then(|e| e.label()) {
+                lines.push(Line::styled(label, dim));
             }
             (
                 Spine {
@@ -7510,5 +7513,61 @@ mod tests {
             .map(|l| l.to_string())
             .collect();
         assert!(text.iter().any(|l| l.contains("messages")), "{text:?}");
+    }
+
+    fn shell_rows(output: &str, end: Option<hotl_tools::user_shell::ShellEnd>) -> String {
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(TranscriptItem::Shell {
+            command: "run".into(),
+            output: output.into(),
+            end,
+            running: false,
+        });
+        rows_of(&render_at(&s, &mut TranscriptCache::default(), 80, 50)).join("\n")
+    }
+
+    #[test]
+    fn a_long_card_shows_its_last_twenty_lines() {
+        let output: String = (1..=45).map(|n| format!("line{n:02}\n")).collect();
+        let rows = shell_rows(&output, Some(hotl_tools::user_shell::ShellEnd::Exited(0)));
+        assert!(rows.contains("… 25 earlier lines"), "{rows}");
+        assert!(rows.contains("line26") && rows.contains("line45"), "{rows}");
+        assert!(
+            !rows.contains("line25") && !rows.contains("line01"),
+            "{rows}"
+        );
+    }
+
+    #[test]
+    fn a_short_card_shows_everything() {
+        let rows = shell_rows("a\nb\n", Some(hotl_tools::user_shell::ShellEnd::Exited(0)));
+        assert!(rows.contains('a') && !rows.contains("earlier"), "{rows}");
+    }
+
+    #[test]
+    fn each_end_renders_its_label() {
+        use hotl_tools::user_shell::ShellEnd;
+        let cases = [
+            (ShellEnd::Exited(7), "[exit 7]"),
+            (ShellEnd::TimedOut, "[timed out after 120s]"),
+            (ShellEnd::Cancelled, "[cancelled]"),
+            (ShellEnd::Failed, "[could not run]"),
+        ];
+        for (end, label) in cases {
+            let rows = shell_rows("out\n", Some(end));
+            assert!(rows.contains(label), "{label}: {rows}");
+        }
+        let rows = shell_rows("out\n", Some(ShellEnd::Exited(0)));
+        assert!(!rows.contains("[exit"), "{rows}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_death_renders_its_name() {
+        let rows = shell_rows(
+            "out\n",
+            Some(hotl_tools::user_shell::ShellEnd::Signaled(15)),
+        );
+        assert!(rows.contains("[killed by SIGTERM]"), "{rows}");
     }
 }

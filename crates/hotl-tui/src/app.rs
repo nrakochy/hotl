@@ -4,6 +4,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hotl_tools::ask::{Question, QuestionOption};
+use hotl_tools::user_shell::ShellEnd;
 use hotl_types::{ContextKind, ContextRow};
 use serde_json::Value;
 
@@ -202,7 +203,7 @@ pub enum TranscriptItem {
     Shell {
         command: String,
         output: String,
-        exit_code: Option<i32>,
+        end: Option<hotl_tools::user_shell::ShellEnd>,
         running: bool,
     },
     /// Grows via `text_delta`.
@@ -914,9 +915,7 @@ impl State {
 pub enum Msg {
     ShellDone {
         output: String,
-        exit_code: Option<i32>,
-        timed_out: bool,
-        cancelled: bool,
+        end: hotl_tools::user_shell::ShellEnd,
     },
     /// The `update` object from a `session/update` notification.
     Update(Value),
@@ -1380,12 +1379,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             on_tick(state);
             Vec::new()
         }
-        Msg::ShellDone {
-            output,
-            exit_code,
-            timed_out,
-            cancelled,
-        } => shell_done(state, output, exit_code, timed_out, cancelled),
+        Msg::ShellDone { output, end } => shell_done(state, output, end),
         Msg::EditorDone(content) => {
             match content {
                 Ok(Some(text)) => {
@@ -3199,7 +3193,7 @@ fn run_shell(state: &mut State, command: &str) -> Vec<Cmd> {
     state.transcript.push(TranscriptItem::Shell {
         command: command.to_string(),
         output: String::new(),
-        exit_code: None,
+        end: None,
         running: true,
     });
     state.shell_running = Some(command.to_string());
@@ -3215,33 +3209,20 @@ fn run_shell(state: &mut State, command: &str) -> Vec<Cmd> {
     }]
 }
 
-fn shell_done(
-    state: &mut State,
-    output: String,
-    exit_code: Option<i32>,
-    timed_out: bool,
-    cancelled: bool,
-) -> Vec<Cmd> {
+fn shell_done(state: &mut State, output: String, end: ShellEnd) -> Vec<Cmd> {
     let Some(command) = state.shell_running.take() else {
         return Vec::new();
     };
-    let mut output = output;
-    let tail = if timed_out {
-        Some("[timed out after 120s]")
-    } else if cancelled {
-        Some("[cancelled]")
-    } else {
-        None
-    };
-    if let Some(tail) = tail {
-        if !output.is_empty() && !output.ends_with('\n') {
-            output.push('\n');
+    let mut shared = output.clone();
+    if let Some(label) = end.shared_label() {
+        if !shared.is_empty() && !shared.ends_with('\n') {
+            shared.push('\n');
         }
-        output.push_str(tail);
+        shared.push_str(&label);
     }
     if let Some(TranscriptItem::Shell {
         output: o,
-        exit_code: e,
+        end: e,
         running,
         ..
     }) = state
@@ -3250,17 +3231,17 @@ fn shell_done(
         .rev()
         .find(|i| matches!(i, TranscriptItem::Shell { running: true, .. }))
     {
-        o.clone_from(&output);
-        *e = exit_code;
+        *o = output;
+        *e = Some(end);
         *running = false;
     }
-    if cancelled {
+    if end == ShellEnd::Cancelled {
         return Vec::new();
     }
     vec![Cmd::ShellNote {
         command,
-        output,
-        exit_code,
+        output: shared,
+        exit_code: end.exit_code(),
     }]
 }
 
@@ -10244,12 +10225,10 @@ mod tests {
             .collect()
     }
 
-    fn done(output: &str, exit_code: Option<i32>) -> Msg {
+    fn done(output: &str, end: ShellEnd) -> Msg {
         Msg::ShellDone {
             output: output.into(),
-            exit_code,
-            timed_out: false,
-            cancelled: false,
+            end,
         }
     }
 
@@ -10356,7 +10335,7 @@ mod tests {
     fn shell_done_fills_the_card_and_shares_the_output() {
         let mut s = State::test_default();
         type_and_submit(&mut s, "!false");
-        let cmds = update(&mut s, done("boom\n", Some(1)));
+        let cmds = update(&mut s, done("boom\n", ShellEnd::Exited(1)));
         assert_eq!(
             cmds,
             vec![Cmd::ShellNote {
@@ -10368,7 +10347,7 @@ mod tests {
         assert!(s.shell_running.is_none());
         assert!(matches!(
             shell_cards(&s)[..],
-            [TranscriptItem::Shell { output, exit_code: Some(1), running: false, .. }] if output == "boom\n"
+            [TranscriptItem::Shell { output, end: Some(ShellEnd::Exited(1)), running: false, .. }] if output == "boom\n"
         ));
     }
 
@@ -10380,9 +10359,7 @@ mod tests {
             &mut s,
             Msg::ShellDone {
                 output: "x".into(),
-                exit_code: None,
-                timed_out: true,
-                cancelled: false,
+                end: ShellEnd::TimedOut,
             },
         );
         assert!(
@@ -10391,7 +10368,10 @@ mod tests {
         );
         assert!(matches!(
             shell_cards(&s)[..],
-            [TranscriptItem::Shell { output, .. }] if output.contains("[timed out after 120s]")
+            [TranscriptItem::Shell {
+                end: Some(ShellEnd::TimedOut),
+                ..
+            }]
         ));
     }
 
@@ -10403,16 +10383,18 @@ mod tests {
             &mut s,
             Msg::ShellDone {
                 output: "".into(),
-                exit_code: None,
-                timed_out: false,
-                cancelled: true,
+                end: ShellEnd::Cancelled,
             },
         );
         assert!(cmds.is_empty(), "{cmds:?}");
         assert!(s.shell_running.is_none());
         assert!(matches!(
             shell_cards(&s)[..],
-            [TranscriptItem::Shell { output, running: false, .. }] if output.contains("[cancelled]")
+            [TranscriptItem::Shell {
+                end: Some(ShellEnd::Cancelled),
+                running: false,
+                ..
+            }]
         ));
     }
 
@@ -10462,15 +10444,20 @@ mod tests {
         assert!(matches!(s.phase, Phase::Streaming { .. }));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn a_signal_death_renders_no_exit_code() {
+    fn a_signal_death_is_shared_with_its_name_and_no_exit_code() {
         let mut s = State::test_default();
         type_and_submit(&mut s, "!x");
-        update(&mut s, done("", None));
+        let cmds = update(&mut s, done("", ShellEnd::Signaled(15)));
+        assert!(
+            matches!(&cmds[..], [Cmd::ShellNote { output, exit_code: None, .. }] if output.contains("[killed by SIGTERM]")),
+            "{cmds:?}"
+        );
         assert!(matches!(
             shell_cards(&s)[..],
             [TranscriptItem::Shell {
-                exit_code: None,
+                end: Some(ShellEnd::Signaled(15)),
                 running: false,
                 ..
             }]

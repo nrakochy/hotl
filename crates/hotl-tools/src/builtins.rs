@@ -2239,10 +2239,8 @@ fn shell_outcome(
 /// well-known NTSTATUS values that arrive through `ExitStatus::code()`, and
 /// naming them is the same service.
 #[cfg(unix)]
-fn death_trailer(status: &std::process::ExitStatus) -> Option<(String, String)> {
-    use std::os::unix::process::ExitStatusExt;
-    let sig = status.signal()?;
-    let name = match sig {
+pub(crate) fn signal_name(sig: i32) -> String {
+    match sig {
         libc::SIGHUP => "SIGHUP".to_string(),
         libc::SIGINT => "SIGINT".to_string(),
         libc::SIGQUIT => "SIGQUIT".to_string(),
@@ -2255,7 +2253,14 @@ fn death_trailer(status: &std::process::ExitStatus) -> Option<(String, String)> 
         libc::SIGALRM => "SIGALRM".to_string(),
         libc::SIGTERM => "SIGTERM".to_string(),
         other => format!("signal {other}"),
-    };
+    }
+}
+
+#[cfg(unix)]
+fn death_trailer(status: &std::process::ExitStatus) -> Option<(String, String)> {
+    use std::os::unix::process::ExitStatusExt;
+    let sig = status.signal()?;
+    let name = signal_name(sig);
     Some((format!("signal {name}"), format!("[killed by {name}]")))
 }
 

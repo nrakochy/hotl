@@ -857,9 +857,7 @@ async fn run_loop(
                     shell_current = None;
                     Some(Msg::ShellDone {
                         output: run.output,
-                        exit_code: run.exit_code,
-                        timed_out: run.timed_out,
-                        cancelled: run.cancelled,
+                        end: run.end,
                     })
                 } else {
                     None
