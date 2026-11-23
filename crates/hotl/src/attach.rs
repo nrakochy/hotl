@@ -280,24 +280,22 @@ async fn bang(command: &str, cwd: &std::path::Path) -> (String, Value) {
         tokio_util::sync::CancellationToken::new(),
     )
     .await;
-    let mut output = run.output;
-    let label = run.end.label();
-    if let (Some(label), hotl_tools::user_shell::ShellEnd::TimedOut) = (&label, run.end) {
-        if !output.is_empty() && !output.ends_with('\n') {
-            output.push('\n');
+    let append = |text: &str, label: &str| {
+        let mut out = text.to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
         }
-        output.push_str(label);
-    }
-    let mut shown = output.clone();
-    if let (Some(label), false) = (
-        &label,
-        run.end == hotl_tools::user_shell::ShellEnd::TimedOut,
-    ) {
-        if !shown.is_empty() && !shown.ends_with('\n') {
-            shown.push('\n');
-        }
-        shown.push_str(label);
-    }
+        out.push_str(label);
+        out
+    };
+    let shown = match run.end.label() {
+        Some(label) => append(&run.output, &label),
+        None => run.output.clone(),
+    };
+    let output = match run.end.shared_label() {
+        Some(label) => append(&run.output, &label),
+        None => run.output,
+    };
     let params = json!({"command": command, "output": output, "exitCode": run.end.exit_code()});
     (shown, params)
 }
@@ -917,6 +915,27 @@ mod tests {
                 .contains("marker-0084-attach"),
             "{params}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_killed_bang_run_shares_the_signal() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (shown, params) =
+            rt.block_on(bang("echo hi; kill -TERM $$", std::path::Path::new(".")));
+        rt.shutdown_background();
+        assert!(shown.ends_with("[killed by SIGTERM]"), "{shown}");
+        assert!(
+            params["output"]
+                .as_str()
+                .unwrap()
+                .ends_with("[killed by SIGTERM]"),
+            "{params}"
+        );
+        assert!(params["exitCode"].is_null(), "{params}");
     }
 
     fn usage_update() -> Value {

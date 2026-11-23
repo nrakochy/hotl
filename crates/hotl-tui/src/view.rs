@@ -7551,7 +7551,7 @@ mod tests {
             (ShellEnd::Exited(7), "[exit 7]"),
             (ShellEnd::TimedOut, "[timed out after 120s]"),
             (ShellEnd::Cancelled, "[cancelled]"),
-            (ShellEnd::Failed, "[could not run]"),
+            (ShellEnd::Failed, "[could not start]"),
         ];
         for (end, label) in cases {
             let rows = shell_rows("out\n", Some(end));

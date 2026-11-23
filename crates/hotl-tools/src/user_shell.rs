@@ -35,7 +35,7 @@ impl ShellEnd {
                 USER_SHELL_TIMEOUT.as_secs()
             )),
             ShellEnd::Cancelled => Some("[cancelled]".to_string()),
-            ShellEnd::Failed => Some("[could not run]".to_string()),
+            ShellEnd::Failed => Some("[could not start]".to_string()),
         }
     }
 
@@ -111,6 +111,10 @@ pub fn sanitize(raw: &str) -> String {
                     if n == '\u{7}' {
                         break;
                     }
+                    if n == '\n' {
+                        stripped.push('\n');
+                        break;
+                    }
                     if n == '\u{1b}' {
                         if chars.peek() == Some(&'\\') {
                             chars.next();
@@ -119,6 +123,16 @@ pub fn sanitize(raw: &str) -> String {
                     }
                 }
             }
+            Some('\u{20}'..='\u{2f}') => {
+                while chars
+                    .next_if(|n| ('\u{20}'..='\u{2f}').contains(n))
+                    .is_some()
+                {}
+                if chars.peek().is_some_and(|n| *n != '\n') {
+                    chars.next();
+                }
+            }
+            Some('\n') => stripped.push('\n'),
             _ => {}
         }
     }
@@ -398,6 +412,9 @@ mod tests {
         assert_eq!(sanitize("ok\x1b"), "ok");
         assert_eq!(sanitize("ok\x1b]0;tit"), "ok");
         assert_eq!(sanitize("a\x1b[\nb"), "a\nb");
+        assert_eq!(sanitize("a\x1b(Bb\x1b)0c"), "abc");
+        assert_eq!(sanitize("a\x1b\nb"), "a\nb");
+        assert_eq!(sanitize("a\x1b]0;stray\nb\nc"), "a\nb\nc");
     }
 
     #[test]
