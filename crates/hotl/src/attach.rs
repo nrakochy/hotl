@@ -227,6 +227,8 @@ enum Action {
     AnswerAsk { parked: Parked, allow: bool },
     Steer(String),
     Prompt(String),
+    Shell(String),
+    ShellUsage,
 }
 
 /// A prompt parked on the human, and which reply method answers it. Tool asks
@@ -256,11 +258,44 @@ fn route(text: &str, turn_running: bool, pending_ask: Option<&Parked>) -> Action
             allow: matches!(text, "y" | "Y" | "yes"),
         };
     }
+    if let Some(rest) = text.trim_start().strip_prefix('!') {
+        let command = rest.trim();
+        if command.is_empty() {
+            return Action::ShellUsage;
+        }
+        return Action::Shell(command.to_string());
+    }
     if turn_running {
         Action::Steer(text.to_string())
     } else {
         Action::Prompt(text.to_string())
     }
+}
+
+async fn bang(command: &str, cwd: &std::path::Path) -> (String, Value) {
+    let run = hotl_tools::user_shell::run(
+        command,
+        cwd,
+        hotl_tools::user_shell::USER_SHELL_TIMEOUT,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    let mut output = run.output;
+    if run.timed_out {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str("[timed out after 120s]");
+    }
+    let mut shown = output.clone();
+    if let Some(code) = run.exit_code.filter(|c| *c != 0) {
+        if !shown.is_empty() && !shown.ends_with('\n') {
+            shown.push('\n');
+        }
+        shown.push_str(&format!("[exit {code}]"));
+    }
+    let params = json!({"command": command, "output": output, "exitCode": run.exit_code});
+    (shown, params)
 }
 
 async fn on_input(text: &str, client: &mut Client, state: &mut Attached) -> bool {
@@ -270,6 +305,23 @@ async fn on_input(text: &str, client: &mut Client, state: &mut Attached) -> bool
             true
         }
         Action::Nothing => false,
+        Action::ShellUsage => {
+            eprintln!("usage: !<command> — runs it here and shares the output with the model");
+            false
+        }
+        Action::Shell(command) => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let (shown, params) = bang(&command, &cwd).await;
+            println!("$ {command}");
+            if !shown.is_empty() {
+                println!("{shown}");
+            }
+            let _ = client.request("_hotl/session/shell_note", params).await;
+            if !state.turn_running {
+                show_prompt();
+            }
+            false
+        }
         Action::AnswerAsk { parked, allow } => {
             state.pending_ask = None;
             let _ = match &parked.egress {
@@ -824,6 +876,43 @@ mod tests {
         assert_eq!(route("", false, None), Action::Nothing);
         assert_eq!(route("hi", true, None), Action::Steer("hi".into()));
         assert_eq!(route("hi", false, None), Action::Prompt("hi".into()));
+    }
+
+    #[test]
+    fn a_bang_line_runs_locally_and_is_never_a_prompt() {
+        assert_eq!(
+            route("!git status", false, None),
+            Action::Shell("git status".into())
+        );
+        assert_eq!(
+            route("! ls -la ", true, None),
+            Action::Shell("ls -la".into())
+        );
+        assert_eq!(route("!", false, None), Action::ShellUsage);
+        assert_eq!(route("!   ", true, None), Action::ShellUsage);
+    }
+
+    #[test]
+    fn a_bang_run_prints_its_output_and_builds_the_note() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("marker-0084-attach"), "").unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (shown, params) = rt.block_on(bang("ls; exit 3", dir.path()));
+        rt.shutdown_background();
+        assert!(shown.contains("marker-0084-attach"), "{shown}");
+        assert!(shown.ends_with("[exit 3]"), "{shown}");
+        assert_eq!(params["command"], "ls; exit 3");
+        assert_eq!(params["exitCode"], 3);
+        assert!(
+            params["output"]
+                .as_str()
+                .unwrap()
+                .contains("marker-0084-attach"),
+            "{params}"
+        );
     }
 
     fn usage_update() -> Value {
