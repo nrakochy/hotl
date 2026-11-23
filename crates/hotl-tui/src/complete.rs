@@ -30,7 +30,7 @@ pub struct Completion {
 const BUILTINS: [(&str, &str); 22] = [
     ("rename", "name this session"),
     ("color", "set this session's accent color"),
-    ("plan", "toggle plan mode (file edits always ask)"),
+    ("plan", "toggle plan mode, or /plan <task> to plan it"),
     ("mode", "set the permission mode"),
     ("goal", "run until a condition is met"),
     ("effort", "set reasoning depth"),

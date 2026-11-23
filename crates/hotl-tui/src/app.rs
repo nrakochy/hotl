@@ -3215,14 +3215,32 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
         // A toggle, not a mode switch: plan composes with whatever `/mode`
         // says. `on`/`off` are for scripted input, where a toggle is a race.
         "plan" => {
-            let want = match arg.trim() {
-                "" => !state.plan,
-                "on" | "true" => true,
-                "off" | "false" => false,
-                _ => {
-                    notice(state, "usage: /plan [on|off]".into());
-                    return Vec::new();
-                }
+            let word = arg.trim();
+            let want = if word.is_empty() {
+                !state.plan
+            } else if word.eq_ignore_ascii_case("on") || word.eq_ignore_ascii_case("true") {
+                true
+            } else if word.eq_ignore_ascii_case("off") || word.eq_ignore_ascii_case("false") {
+                false
+            } else {
+                let expanded = payload
+                    .text
+                    .trim()
+                    .strip_prefix('/')
+                    .and_then(|r| r.split_once(char::is_whitespace))
+                    .map(|(_, a)| a.trim().to_string())
+                    .unwrap_or_default();
+                let mut cmds = if state.plan {
+                    Vec::new()
+                } else {
+                    set_plan(state, true)
+                };
+                let payload = paste::PromptPayload {
+                    text: expanded,
+                    images: payload.images,
+                };
+                cmds.extend(submit(state, word.to_string(), payload));
+                return cmds;
             };
             set_plan(state, want)
         }
@@ -8149,11 +8167,62 @@ mod tests {
             [Cmd::SetPlan(false)]
         ));
         assert!(!s.plan);
-        // Anything else is usage, not a silent no-op.
-        assert!(type_and_submit(&mut s, "/plan sideways").is_empty());
+    }
+
+    #[test]
+    fn slash_plan_with_a_description_turns_plan_on_and_sends_it() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/plan migrate the store to sqlite");
+        assert!(matches!(&cmds[0], Cmd::SetPlan(true)), "got {cmds:?}");
         assert!(
-            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("usage"))
+            cmds.iter().any(
+                |c| matches!(c, Cmd::SendPrompt(p) if p.text == "migrate the store to sqlite")
+            ),
+            "got {cmds:?}"
         );
+        assert!(s.plan);
+        assert!(matches!(s.phase, Phase::Sampling { .. }));
+    }
+
+    #[test]
+    fn slash_plan_with_a_description_when_already_on_only_sends_it() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "/plan on");
+        let cmds = type_and_submit(&mut s, "/plan sketch it");
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SetPlan(_))),
+            "got {cmds:?}"
+        );
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Cmd::SendPrompt(p) if p.text == "sketch it")));
+    }
+
+    #[test]
+    fn slash_plan_with_a_description_mid_turn_queues_it_after_plan_on() {
+        let mut s = State::test_default();
+        s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+        let cmds = type_and_submit(&mut s, "/plan then do the rest");
+        assert!(
+            matches!(&cmds[..], [Cmd::SetPlan(true), Cmd::SendSteer(p)] if p.text == "then do the rest"),
+            "got {cmds:?}"
+        );
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Steer { text, queued: true }) if text == "then do the rest")
+        );
+    }
+
+    #[test]
+    fn slash_plan_on_off_words_are_case_insensitive() {
+        let mut s = State::test_default();
+        assert!(matches!(
+            &type_and_submit(&mut s, "/plan ON")[..],
+            [Cmd::SetPlan(true)]
+        ));
+        assert!(matches!(
+            &type_and_submit(&mut s, "/plan Off")[..],
+            [Cmd::SetPlan(false)]
+        ));
     }
 
     /// `/mode plan` was valid before the split. It must point at `/plan`
