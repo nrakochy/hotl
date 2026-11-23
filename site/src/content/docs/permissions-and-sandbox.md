@@ -92,8 +92,8 @@ exits 0 — and exits **3**, naming the paths, if the worktree changed anyway.
 Outside a git repo there is nothing to compare against, and hotl says so
 rather than claiming a clean tree.
 
-Toggle it with `/plan` (or `/plan on` / `/plan off`), `--plan` on the command
-line, `[permissions] plan = true`, `HOTL_PLAN=1`, or the `plan` option of
+Toggle it with `/plan` (or `/plan on` / `/plan off`), or start a planning
+prompt with `/plan <task>`. Other ways: `--plan` on the command line, `[permissions] plan = true`, `HOTL_PLAN=1`, or the `plan` option of
 `session/set_config_option` over ACP. It composes with whichever mode you're in:
 
 | | `ask` | `bypass` | `dontask` |

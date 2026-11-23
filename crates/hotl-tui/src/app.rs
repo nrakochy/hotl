@@ -2963,7 +2963,11 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             // everything via the editor's own ring.
             let starts_turn = cmds.iter().any(|c| matches!(c, Cmd::SendPrompt(_)));
             let runs_shell = cmds.iter().any(|c| matches!(c, Cmd::RunShell { .. }));
-            if (starts_turn && !text.trim_start().starts_with('/')) || runs_shell {
+            let plan_task = text
+                .trim_start()
+                .strip_prefix('/')
+                .is_some_and(|r| r.split_whitespace().next() == Some("plan"));
+            if (starts_turn && (plan_task || !text.trim_start().starts_with('/'))) || runs_shell {
                 let mut out = vec![Cmd::AppendHistory(history_text)];
                 out.extend(cmds);
                 out
@@ -3356,19 +3360,20 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
         // says. `on`/`off` are for scripted input, where a toggle is a race.
         "plan" => {
             let word = arg.trim();
+            let is_word = |names: &[&str]| names.iter().any(|n| word.eq_ignore_ascii_case(n));
             let want = if word.is_empty() {
                 !state.plan
-            } else if word.eq_ignore_ascii_case("on") || word.eq_ignore_ascii_case("true") {
+            } else if is_word(&["on", "true", "yes", "enable"]) {
                 true
-            } else if word.eq_ignore_ascii_case("off") || word.eq_ignore_ascii_case("false") {
+            } else if is_word(&["off", "false", "no", "disable"]) {
                 false
             } else {
                 let expanded = payload
                     .text
-                    .trim()
+                    .trim_start()
                     .strip_prefix('/')
                     .and_then(|r| r.split_once(char::is_whitespace))
-                    .map(|(_, a)| a.trim().to_string())
+                    .map(|(_, a)| a.strip_suffix('\n').unwrap_or(a).to_string())
                     .unwrap_or_default();
                 let mut cmds = if state.plan {
                     Vec::new()
@@ -3376,10 +3381,10 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                     set_plan(state, true)
                 };
                 let payload = paste::PromptPayload {
-                    text: expanded,
+                    text: expanded.clone(),
                     images: payload.images,
                 };
-                cmds.extend(send_text(state, word.to_string(), payload));
+                cmds.extend(send_text(state, expanded, payload));
                 return cmds;
             };
             set_plan(state, want)
@@ -8313,7 +8318,7 @@ mod tests {
     fn slash_plan_with_a_description_turns_plan_on_and_sends_it() {
         let mut s = State::test_default();
         let cmds = type_and_submit(&mut s, "/plan migrate the store to sqlite");
-        assert!(matches!(&cmds[0], Cmd::SetPlan(true)), "got {cmds:?}");
+        assert!(matches!(&cmds[1], Cmd::SetPlan(true)), "got {cmds:?}");
         assert!(
             cmds.iter().any(
                 |c| matches!(c, Cmd::SendPrompt(p) if p.text == "migrate the store to sqlite")
@@ -8368,6 +8373,51 @@ mod tests {
             .transcript
             .iter()
             .any(|i| matches!(i, TranscriptItem::Notice { text } if text.contains("unknown"))));
+    }
+
+    #[test]
+    fn slash_plan_task_persists_to_history() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/plan draft it");
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::AppendHistory(t) if t == "/plan draft it")),
+            "got {cmds:?}"
+        );
+        let toggles = type_and_submit(&mut s, "/plan off");
+        assert!(
+            !toggles.iter().any(|c| matches!(c, Cmd::AppendHistory(_))),
+            "got {toggles:?}"
+        );
+    }
+
+    #[test]
+    fn slash_plan_accepts_yes_no_enable_disable() {
+        let mut s = State::test_default();
+        for (line, want) in [
+            ("/plan yes", true),
+            ("/plan no", false),
+            ("/plan Enable", true),
+            ("/plan DISABLE", false),
+        ] {
+            let cmds = type_and_submit(&mut s, line);
+            assert!(
+                matches!(&cmds[..], [Cmd::SetPlan(w)] if *w == want),
+                "{line}: got {cmds:?}"
+            );
+            assert_eq!(s.plan, want, "{line}");
+        }
+    }
+
+    #[test]
+    fn slash_plan_task_keeps_its_inner_spacing() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/plan  two  spaces ");
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::SendPrompt(p) if p.text == " two  spaces ")),
+            "got {cmds:?}"
+        );
     }
 
     #[test]

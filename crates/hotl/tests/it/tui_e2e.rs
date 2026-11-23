@@ -176,56 +176,10 @@ async fn remember_confirm_allow_golden() {
 /// A session whose scripted model calls bash (a gated tool → a permission
 /// ask) then replies with text.
 fn scripted_factory() -> acp::SessionFactory {
-    Box::new(|_spec| {
-        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
-        let session_id = log.session_id.clone();
-        let provider = Arc::new(ScriptedProvider::new(vec![
-            ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
-            ScriptedProvider::text_reply("all done via tui"),
-        ]));
-        Ok(acp::SessionOpen {
-            history: Vec::new(),
-            memory_mode: None,
-            worktree: None,
-            lease: None,
-            color: None,
-            handle: spawn_session(SessionDeps {
-                concurrency: Default::default(),
-                provider,
-                registry: Arc::new(Registry::builtin()),
-                rules: Arc::new(Rules::default()),
-                sandbox_enforced: false,
-                clock: Arc::new(SystemClock),
-                log,
-                system: "sys".into(),
-                cwd: std::env::temp_dir(),
-                hooks: None,
-                initial_items: Vec::new(),
-                initial_todos: Vec::new(),
-                initial_decisions: Vec::new(),
-                plan_files: None,
-                initial_goal: None,
-                config: EngineConfig {
-                    max_turns: 6,
-                    ..Default::default()
-                },
-            }),
-            name: None,
-            mode: "ask".into(),
-            plan: false,
-            default_effort: None,
-            effort_schedule: None,
-            goal: None,
-            todos: Vec::new(),
-            effort: None,
-            previous_model: None,
-            session_id,
-            warnings: Vec::new(),
-            mcp_warnings: Vec::new(),
-            title: None,
-            model: None,
-        })
-    })
+    provider_factory(Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
+        ScriptedProvider::text_reply("all done via tui"),
+    ])))
 }
 
 fn provider_factory(provider: Arc<ScriptedProvider>) -> acp::SessionFactory {
