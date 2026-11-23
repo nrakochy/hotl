@@ -438,6 +438,13 @@ pub fn stall_text(secs: u64, stream_idle_secs: Option<u64>) -> String {
     }
 }
 
+pub fn waiting_text(secs: u64) -> String {
+    if secs * TICK_HZ < STALL_WARN_AFTER {
+        return format!("quiet {secs}s");
+    }
+    format!("waiting on the model {secs}s")
+}
+
 /// Whole seconds of silence, once past [`QUIET_AFTER`]; `None` while the gap
 /// is still ordinary.
 pub fn quiet_secs(since_frame: u64) -> Option<u64> {
@@ -600,7 +607,12 @@ pub fn strip_segments(state: &State) -> Vec<Segment> {
         Phase::Sampling { .. } | Phase::Streaming { .. } | Phase::Tool { .. }
     ) {
         if let Some(secs) = quiet_secs(state.since_frame) {
-            segs.push(Segment::blocked(stall_text(secs, state.stream_idle_secs)));
+            let text = match state.phase {
+                Phase::Streaming { .. } => stall_text(secs, state.stream_idle_secs),
+                Phase::Sampling { .. } => waiting_text(secs),
+                _ => stall_text(secs, None),
+            };
+            segs.push(Segment::blocked(text));
         }
     }
     // A `/btw` in flight (0071 T5): faint, beside the phase — the phase is
@@ -1225,17 +1237,23 @@ mod tests {
     #[test]
     fn the_strip_escalates_quiet_to_stalled_at_sixty_seconds() {
         let mut s = State::test_default();
-        s.phase = Phase::Sampling {
+        s.phase = Phase::Streaming {
             ticks: 60 * TICK_HZ,
+            chars: 0,
         };
         s.since_frame = 59 * TICK_HZ;
-        assert_eq!(strip_text(&s), "thinking · 60s · quiet 59s");
+        assert!(strip_text(&s).ends_with("quiet 59s"), "{}", strip_text(&s));
         s.since_frame = 60 * TICK_HZ;
-        assert_eq!(strip_text(&s), "thinking · 60s · stalled 60s");
+        assert!(
+            strip_text(&s).ends_with("stalled 60s"),
+            "{}",
+            strip_text(&s)
+        );
         s.stream_idle_secs = Some(90);
-        assert_eq!(
-            strip_text(&s),
-            "thinking · 60s · stalled 60s · retry at 90s"
+        assert!(
+            strip_text(&s).ends_with("stalled 60s · retry at 90s"),
+            "{}",
+            strip_text(&s)
         );
         let seg = strip_segments(&s)
             .into_iter()
@@ -1243,6 +1261,25 @@ mod tests {
             .expect("the stalled segment");
         assert_eq!(seg.tone, Tone::Blocked);
         assert_eq!(seg.rank, KEEP, "it never drops");
+    }
+
+    #[test]
+    fn a_reply_that_has_not_started_promises_no_retry() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling {
+            ticks: 300 * TICK_HZ,
+        };
+        s.stream_idle_secs = Some(90);
+        s.since_frame = 300 * TICK_HZ;
+        assert_eq!(
+            strip_text(&s),
+            "thinking · 300s · waiting on the model 300s"
+        );
+        s.phase = Phase::Tool {
+            ticks: 300 * TICK_HZ,
+            name: "bash".into(),
+        };
+        assert!(!strip_text(&s).contains("retry at"), "{}", strip_text(&s));
     }
 
     /// It is a claim about the engine, not a decoration on the phase — so it

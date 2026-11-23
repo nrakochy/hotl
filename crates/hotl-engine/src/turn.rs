@@ -2641,8 +2641,10 @@ impl Turn {
                 }
                 next = stream.next() => match next {
                     Some(Ok(event)) => {
-                        saw_first_byte = true;
-                        self.ledger.stamp(Phase::FirstByte);
+                        if !matches!(event, StreamEvent::Retrying { .. }) {
+                            saw_first_byte = true;
+                            self.ledger.stamp(Phase::FirstByte);
+                        }
                         match &event {
                             StreamEvent::Started { request_id: id } => {
                                 request_id = id.clone();

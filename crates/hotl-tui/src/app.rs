@@ -2478,6 +2478,11 @@ fn on_prompt_result(
     finished_at: Option<String>,
 ) -> Vec<Cmd> {
     state.tool_input = None;
+    for item in state.transcript.iter_mut() {
+        if let TranscriptItem::Steer { queued, .. } = item {
+            *queued = false;
+        }
+    }
     // A turn that streamed nothing still shows its outcome text.
     if turn_chars(&state.transcript) == 0 {
         if let Some(t) = text.as_deref().filter(|t| kind == "done" && !t.is_empty()) {
@@ -7292,6 +7297,32 @@ mod tests {
 
     /// A rejection with no matching queued chip (already cleared by a racing
     /// `prompt_queued`, or a stale id) must degrade to a notice-only, not panic.
+    #[test]
+    fn a_turn_ending_unpins_every_queued_steer_chip() {
+        let mut s = State::test_default();
+        s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+        type_str(&mut s, "first");
+        press(&mut s, KeyCode::Enter);
+        type_str(&mut s, "second");
+        press(&mut s, KeyCode::Enter);
+        update(
+            &mut s,
+            Msg::PromptResult {
+                outcome_kind: "done".into(),
+                outcome_text: Some("ok".into()),
+                usage: Value::Null,
+                finished_at: None,
+            },
+        );
+        assert!(
+            !s.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::Steer { queued: true, .. })),
+            "{:?}",
+            s.transcript
+        );
+    }
+
     #[test]
     fn steer_rejected_with_no_queued_chip_only_notices() {
         let mut s = State::test_default();

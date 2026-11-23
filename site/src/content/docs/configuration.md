@@ -60,6 +60,7 @@ cache_breakpoints = true                    # OpenAI dialects only: explicit GPT
 cache_warming = true                        # keep the 5-minute prompt cache alive while a long tool runs (one cache-read request when it saves ≥ $0.05); absent = on; env twin HOTL_CACHE_WARMING
 stream_idle_secs = 90                       # a stream with no byte at all (pings included) for this long is dead and retried; floor 15
 thinking_stall_secs = 120                   # an open thinking block with no delta for this long (pings still coming) is dropped and retried; floor 15
+headers_secs = 600                          # how long a sent request may wait for the provider to start replying before it is re-sent; floor 15. Gemini and reasoning gateways send nothing until the model has finished thinking, and a re-send starts that thinking over
 
 [context]
 window = 200000            # usually unnecessary — looked up per model; see below

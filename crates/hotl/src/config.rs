@@ -553,6 +553,7 @@ pub struct ProviderCfg {
     /// keep the socket alive, before the sample is retried. Default 120;
     /// floor 15; `0` is ignored with a warning (0071 T2).
     pub thinking_stall_secs: Option<u64>,
+    pub headers_secs: Option<u64>,
 }
 
 impl ProviderCfg {
@@ -591,6 +592,14 @@ impl ProviderCfg {
             self.stream_idle_secs,
             "stream_idle_secs",
             hotl_provider::timeouts::STREAM_IDLE,
+        )
+    }
+
+    pub fn headers(&self) -> (std::time::Duration, Option<String>) {
+        Self::watchdog(
+            self.headers_secs,
+            "headers_secs",
+            hotl_provider::timeouts::HEADERS,
         )
     }
 
@@ -1493,6 +1502,22 @@ mod tests {
             hotl_provider::timeouts::STREAM_IDLE
         );
         assert_eq!(hotl_provider::timeouts::STREAM_IDLE.as_secs(), 90);
+    }
+
+    #[test]
+    fn headers_secs_defaults_long_enough_for_a_model_that_thinks_before_headers() {
+        assert_eq!(cfg_with("").provider.headers().0.as_secs(), 600);
+        assert_eq!(
+            cfg_with("[provider]\nheaders_secs = 900\n")
+                .provider
+                .headers(),
+            (std::time::Duration::from_secs(900), None)
+        );
+        let (floor, warn) = cfg_with("[provider]\nheaders_secs = 3\n")
+            .provider
+            .headers();
+        assert_eq!(floor, std::time::Duration::from_secs(15));
+        assert!(warn.unwrap().contains("floor"));
     }
 
     /// 0071 T3: `[formatters]` rides the same slice `[diagnostics]` does,

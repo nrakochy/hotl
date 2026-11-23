@@ -1902,12 +1902,33 @@ async fn collect_merged(
     // process group on the timeout and cancel paths, which is what closes them;
     // a descendant that escaped the group would strand one blocking-pool
     // thread. That is the same descendant that already escapes the reaper.
-    let bytes = tokio::task::spawn_blocking(move || drain_capped_blocking(pipe, cap, progress))
-        .await
-        .unwrap_or_default();
-    let status = child.wait().await?;
+    let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let drain = tokio::task::spawn_blocking({
+        let buf = buf.clone();
+        move || drain_capped_blocking(pipe, cap, progress, &buf)
+    });
+    tokio::pin!(drain);
+    let exited = tokio::select! {
+        biased;
+        _ = &mut drain => None,
+        status = child.wait() => Some(status),
+    };
+    let status = match exited {
+        Some(status) => {
+            let _ = tokio::time::timeout(ORPHAN_PIPE_GRACE, &mut drain).await;
+            status?
+        }
+        None => child.wait().await?,
+    };
+    let bytes = std::mem::take(
+        &mut *buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
     Ok((status, bytes))
 }
+
+const ORPHAN_PIPE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// [`drain_capped`]'s blocking twin, for the one pipe that is not async.
 /// Counts and samples every chunk it reads — including the ones past `cap`,
@@ -1916,17 +1937,22 @@ fn drain_capped_blocking<R: std::io::Read>(
     mut reader: R,
     cap: usize,
     progress: Option<(crate::ProgressSink, Arc<AtomicBool>)>,
-) -> Vec<u8> {
-    let mut buf = Vec::new();
+    out: &std::sync::Mutex<Vec<u8>>,
+) {
     let mut chunk = [0u8; 8192];
     let mut tailer = Tailer::default();
     loop {
         match reader.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if buf.len() < cap {
-                    let take = n.min(cap - buf.len());
-                    buf.extend_from_slice(&chunk[..take]);
+                {
+                    let mut buf = out
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if buf.len() < cap {
+                        let take = n.min(cap - buf.len());
+                        buf.extend_from_slice(&chunk[..take]);
+                    }
                 }
                 if let Some((sink, settled)) = &progress {
                     tailer.feed(&chunk[..n]);
@@ -1951,7 +1977,6 @@ fn drain_capped_blocking<R: std::io::Read>(
             }
         }
     }
-    buf
 }
 
 /// At most one progress frame per call per this interval — enough for a build
@@ -3943,6 +3968,32 @@ mod tests {
         assert!(
             !marker.exists(),
             "a grandchild survived the process-group kill"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_background_process_holding_the_pipe_does_not_hold_the_call_open() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (out, took) = rt.block_on(async {
+            let started = std::time::Instant::now();
+            let out = BashTool::default()
+                .run(
+                    json!({"command": "sleep 30 & echo shell-done", "timeout_ms": 20000}),
+                    CancellationToken::new(),
+                )
+                .await;
+            (out, started.elapsed())
+        });
+        rt.shutdown_background();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("shell-done"), "{}", out.content);
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "the call waited {took:?} on a pipe its shell no longer holds"
         );
     }
 

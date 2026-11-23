@@ -546,3 +546,39 @@ async fn cancel_during_the_backoff_ends_the_turn() {
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn a_provider_that_exhausted_its_own_ladder_is_not_re_laddered_by_the_engine() {
+    let retrying = |attempt| {
+        Ok(StreamEvent::Retrying {
+            attempt,
+            max: 5,
+            reason: "response header timeout".into(),
+            delay_ms: 0,
+            status: None,
+            request_id: None,
+        })
+    };
+    let never_answered = vec![
+        retrying(1),
+        retrying(2),
+        Err(ProviderError::Transport(
+            "no response headers within 600s".into(),
+        )),
+    ];
+    let ran = run(vec![
+        never_answered.clone(),
+        never_answered.clone(),
+        never_answered,
+    ])
+    .await;
+    assert_eq!(
+        ran.requests, 1,
+        "the provider never sent a byte of reply, yet the engine re-sent the request and ran the whole provider ladder again"
+    );
+    assert!(
+        !matches!(ran.outcome, Outcome::Done { .. }),
+        "{:?}",
+        ran.outcome
+    );
+}

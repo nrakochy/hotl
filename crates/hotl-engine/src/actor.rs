@@ -3341,8 +3341,8 @@ async fn append_steer(
 /// - **mid-batch** — `awaiting_tool_results`: a steer that split an open
 ///   tool batch would strand the results from the calls they answer.
 ///
-/// Returns whether any released item was a harness notification rather than a
-/// steer — at turn end that is what earns a `Continue` (0064 D3).
+/// Returns whether anything was released — at turn end that is what earns a
+/// `Continue` (0064 D3).
 async fn release_steers(
     shared: &SharedDeps,
     log: &mut SessionLog,
@@ -3360,12 +3360,10 @@ async fn release_steers(
     if held.is_empty() || awaiting_tool_results(head.items()) {
         return false;
     }
-    let mut notified = false;
     for steer in std::mem::take(held) {
-        notified |= steer.synthetic != SyntheticReason::Steer;
         append_steer(shared, log, head, pipeline, steer).await;
     }
-    notified
+    true
 }
 
 /// The error results a batch nothing will ever answer gets, so the request

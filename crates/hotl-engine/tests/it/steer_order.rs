@@ -159,3 +159,62 @@ async fn a_mid_stream_steer_commits_after_the_reply_it_did_not_see() {
         "a steer must never precede the reply that could not have seen it; got {items:?}"
     );
 }
+
+struct SlowThenQuick {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl Provider for SlowThenQuick {
+    fn stream(
+        &self,
+        req: SamplingRequest,
+    ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n == 0 {
+            return SlowFinish.stream(req);
+        }
+        Box::pin(futures_util::stream::iter(vec![
+            Ok(StreamEvent::Started { request_id: None }),
+            Ok(StreamEvent::Completed {
+                stop: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                blocks: vec![json!({"type": "text", "text": "answered the steer"})],
+            }),
+        ]))
+    }
+}
+
+#[tokio::test]
+async fn a_steer_sent_during_the_final_reply_is_answered_not_stranded() {
+    let provider = Arc::new(SlowThenQuick {
+        calls: Default::default(),
+    });
+    let mut s = session(provider.clone(), EngineConfig::default());
+    s.handle.prompt("go".into()).await;
+    loop {
+        if let EngineEvent::TextDelta(_) = next_event(&mut s).await {
+            break;
+        }
+    }
+    s.handle
+        .steer("and also give me a status update".into())
+        .await;
+    let mut texts = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), s.handle.events.recv()).await {
+            Ok(Some(EngineEvent::TurnDone {
+                outcome: Outcome::Done { text },
+                ..
+            })) => texts.push(text),
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) if !texts.is_empty() => break,
+            Err(_) => {}
+        }
+    }
+    assert!(
+        texts.iter().any(|t| t == "answered the steer"),
+        "the steer landed in the log and nothing answered it; turns: {texts:?}"
+    );
+}

@@ -5516,7 +5516,7 @@ fn resolve_anthropic(
         let provider = AnthropicProvider::new(source.clone())
             .with_timeouts(
                 hotl_provider::timeouts::CONNECT,
-                hotl_provider::timeouts::HEADERS,
+                cfg.provider.headers().0,
                 cfg.provider.stream_idle().0,
             )
             .with_base_url(&base)
@@ -5538,7 +5538,7 @@ fn resolve_anthropic(
     }
     let mut provider = AnthropicProvider::new(source.clone()).with_timeouts(
         hotl_provider::timeouts::CONNECT,
-        hotl_provider::timeouts::HEADERS,
+        cfg.provider.headers().0,
         cfg.provider.stream_idle().0,
     );
     if let Some(base) = &base {
@@ -5608,7 +5608,7 @@ fn openai_chat_provider(
 ) -> hotl_provider_openai::OpenAiCompatProvider {
     let provider = hotl_provider_openai::OpenAiCompatProvider::new(base, source).with_timeouts(
         hotl_provider::timeouts::CONNECT,
-        hotl_provider::timeouts::HEADERS,
+        cfg.provider.headers().0,
         cfg.provider.stream_idle().0,
     );
     match cfg.provider.cache_breakpoints {
@@ -5626,7 +5626,7 @@ fn openai_responses_provider(
     let provider = hotl_provider_openai_responses::OpenAiResponsesProvider::new(base, source)
         .with_timeouts(
             hotl_provider::timeouts::CONNECT,
-            hotl_provider::timeouts::HEADERS,
+            cfg.provider.headers().0,
             cfg.provider.stream_idle().0,
         );
     match cfg.provider.cache_breakpoints {

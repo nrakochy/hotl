@@ -31,9 +31,8 @@ pub mod timeouts {
     /// and needs no generosity.
     pub const CONNECT: Duration = Duration::from_secs(10);
 
-    /// Request sent, response headers not yet received. Generous: a local
-    /// server loading model weights can delay headers by a minute.
-    pub const HEADERS: Duration = Duration::from_secs(120);
+    /// Request sent, response headers not yet received.
+    pub const HEADERS: Duration = Duration::from_secs(600);
 
     /// Maximum gap between two SSE chunks once the stream is open. Anthropic
     /// pings every 10–15 s, so 90 s is a dead socket, not a thinking model
