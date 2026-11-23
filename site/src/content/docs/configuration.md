@@ -217,6 +217,10 @@ always use the full width. `warm` is a low-blue
 palette — paper-white ink, amber accent, terracotta — for a less clinical
 feel; it's opt-in, the default stays `tokyo-night`.
 
+**You don't have to edit `preset` by hand.** The first time you open the console with no `[settings.theme]` table, a picker offers the six palettes and saves your choice as `preset`. It asks once per machine: hotl records that in a `palette-asked` file in the data directory, `<xdg-data>/hotl/`. `/theme` opens the same picker later, and `/theme <name>` sets a palette directly. Saving changes only `preset`; comments, other keys and your per-slot colors stay. Keys and details are in [tui.md](../tui/#picking-a-palette).
+
+`hotl setup` writes the starter file with no theme block. If `config.toml` holds nothing but `[settings]` (what a first-run pick leaves), `hotl setup` adds the defaults around it and keeps your palette. With anything else in the file it keeps the file as it is; `--force` replaces the whole file with the starter.
+
 **Precedence for the scalar settings: environment variable > config.toml > default.** So a `HOTL_MODEL` in the shell overrides `[provider].model`, and CI can override anything without editing the file.
 
 ### Reloading without restarting
@@ -934,6 +938,7 @@ explains its own status.
 | Path | Contents |
 |---|---|
 | `~/.local/share/hotl/sessions/<ulid>.jsonl` | Append-only session logs. Permanent by design. Secret-named env values are masked at write time; the log is otherwise sensitive — treat it as such. An `--ephemeral` run writes nothing here. |
+| `~/.local/share/hotl/palette-asked` | An empty marker. Its presence means the first-run palette screen has already been shown; delete it only if you want to be asked again (and have no `[settings.theme]` table). |
 
 **Engine defaults (not user-configurable via env yet):** max 25 turns per prompt, 32000 max output tokens, adaptive thinking on, static prompt caching on, a tool that fails 5 times consecutively stops the turn.
 

@@ -54,6 +54,28 @@ preset = "warm"       # tokyo-night (the default) | warm | catppuccin | gruvbox 
 accent = "#88c0d0"    # optional per-slot #rrggbb overrides
 ```
 
+### Picking a palette
+
+The first time you open the console with no `[settings.theme]` table in your `config.toml`, hotl shows a picker called "Pick a color palette". It lists the six palettes: `tokyo-night` (the default), `catppuccin`, `gruvbox`, `nord`, `dracula` and `warm`. It opens over the normal screen while the session starts behind it. Moving the cursor repaints the whole screen in that palette, so you see the real thing before you choose.
+
+| Key | Effect |
+|---|---|
+| `↑` / `↓`, `j` / `k` | Move the cursor. It wraps around. |
+| `1`–`6` | Jump to that palette. |
+| `Enter` | Choose the highlighted palette and save it. |
+| `Esc` | On the first-run screen: keep `tokyo-night` and save it. From `/theme`: put the old palette back and save nothing. |
+| `Ctrl-C` | Quit hotl. Nothing is saved. |
+
+The screen is asked once per machine, ever. hotl writes a file named `palette-asked` in its data directory (`<xdg-data>/hotl/`) before it draws the screen, so quitting with `Ctrl-C` does not bring it back. If hotl cannot write that file, it skips the screen and uses `tokyo-night`. A config that already has a `[settings.theme]` table never sees the screen. It is not shown for `hotl -p`, `hotl watch` or `hotl attach`.
+
+Choosing a palette writes one line, `preset`, under `[settings.theme]` in `config.toml`. Your comments and other keys stay as they were, and any per-slot colors you set still apply on top of the palette. If the save fails (for example the file is read-only), the palette still applies for this session and a notice says it was not saved and why.
+
+To change it later, type `/theme` to open the same picker, or `/theme <name>` to switch straight to a palette. A name that is not one of the six changes nothing and lists the valid names. Both save the choice. `hotl watch` reads the same setting, so it wears the palette you chose.
+
+`hotl setup` after a first-run pick still writes the starter file and keeps your palette. This works only when your `config.toml` holds nothing but `[settings]`. See [configuration.md](../configuration/).
+
+### Palette slots
+
 Eight slots: `active` (working), `blocked` (waiting on you), `idle` (settled), `ink`/`muted`/`faint` (text tiers), `accent`, and `band` (the strip background). An unknown preset or invalid color falls back with a one-line warning — the console always launches.
 
 ### Making it warmer
@@ -314,6 +336,7 @@ own.
 | `/rename <name>` | Rename the session (1–64 chars, no `●` or `⎇`); the badge and terminal title follow. |
 | `/color [name\|default]` | Color this session's input border, so side-by-side sessions are easy to tell apart: `red`, `blue`, `green`, `yellow`, `purple`, `orange`, `pink` or `cyan`; `default` resets it. Bare `/color` lists them and leaves `/color ` in the input to finish; a word that is none of them picks one at random. Saved with the session, so a resume keeps it, and `hotl watch` shows it as a dot. |
 | `/plan [on\|off\|<task>]` | Toggle plan mode: `write`/`edit` always ask, everything else follows the mode (see [permissions-and-sandbox.md](../permissions-and-sandbox/)). Bare `/plan` toggles; `on`/`off` are for scripted input. `/plan <task>` turns plan mode on and sends `<task>` as your prompt (queued if a turn is running). |
+| `/theme [name]` | Pick the color palette: `tokyo-night`, `catppuccin`, `gruvbox`, `nord`, `dracula` or `warm`. Bare `/theme` opens the picker with a live preview (`Esc` puts the old palette back). `/theme <name>` switches at once. Either way the choice is saved to `[settings.theme] preset` in `config.toml`. See [Picking a palette](#picking-a-palette). |
 | `/mode <ask\|bypass\|dontask>` | Switch to that permission mode. An unknown name prints usage and changes nothing; `/mode plan` points you at `/plan`. |
 | `/effort [level]` | Set the reasoning depth: `low` \| `medium` \| `high` \| `xhigh` \| `max`, or `default` to hand it back to the provider. Bare `/effort` reports the current rung rather than cycling — five rungs are not a toggle. Recorded durably, so `hotl resume` keeps it. See [configuration.md](../configuration/#reasoning-effort-provider-effort). |
 | `/goal [condition]` | Run until a condition is met. **Checks the harness can decide itself, it decides itself** — no model, no tokens: `tests_green("<command>")` (an observed run of that exact command that exited 0 *after* the last edit — text saying the tests passed never counts), `file_exists("<path>")`, `output_matches("<command>", "<glob>")` (what that run actually printed), `no_edits_since_verify`, and `turns <= N`, combined with `and` / `or` / parentheses (`and` binds tighter). A false check settles the turn on the spot; anything else in the condition is ordinary prose, and only that remainder goes to the evaluator. A condition that is entirely prose behaves exactly as it always did. For the prose half, a small fast evaluator judges the condition against the conversation — *not yet* and the agent keeps going with the verdict's reason as guidance, *met* or *impossible* and the goal clears with a transcript notice. The evaluator works to a rubric — a claim without a command result is not evidence — and it reads the harness's own record of what each plan step's `validate_cmd` did, not the transcript's account of it. **It cannot say met while a validation is red, stale or never run**: the harness overrides that verdict and names the command. Both the agent and the evaluator see where the loop stands (`turn 3 · 12m elapsed · 41.2k in / 3.1k out`), so a turn or time bound written into the condition is judged against real numbers. Setting a goal while idle starts the turn at once, with the condition itself as the prompt; setting one mid-turn only arms the check for when that turn ends. `◎ /goal active · Nm` rides the status strip meanwhile. Eight consecutive turns in which no tool ran pause the loop — the goal stays set, and your next prompt re-arms it; a turn that ran a tool resets the count, so a goal making progress is never cut short. An error only you can fix (a revoked key, a 401/403, a context window compaction can no longer make room in) clears the goal instead of retrying against it; a rate limit or an outage leaves it armed. Bare `/goal` reports the condition, elapsed time, turns taken, what the loop has spent (the evaluator's own calls included) the evaluator's last reason, and what the harness saw each `validate_cmd` do — and, once nothing is active, the goal that resolved last. `/goal clear` (or `stop`/`off`/`reset`/`none`/`cancel`) ends it early and echoes what it ended. There is no built-in cap on turns that make progress — bound that in the condition itself ("…or stop after 20 turns"). An active goal survives `hotl resume` (counters restart); an achieved, errored or cleared one does not. Headless: `hotl --goal "<condition>"` runs the loop in one invocation with the condition as the prompt; add `-p "<prompt>"` to open with a different first prompt. |

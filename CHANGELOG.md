@@ -6,8 +6,20 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- The first time you open the console with no `[settings.theme]` in your
+  config, a picker offers the six color palettes and shows each one on the
+  real screen as you move. It asks once per machine. Your choice is saved as
+  `settings.theme.preset`; comments and other keys in `config.toml` are kept.
+- `/theme` opens the same picker any time. `/theme <name>` switches to a
+  palette directly. If the save fails, the palette still applies for the
+  session and a notice says why.
+
 ### Changed
 
+- `hotl setup` now fills in the defaults around a `config.toml` that holds
+  only `[settings]`, and keeps your palette.
 - A prompt you send while a `!` command is still running now waits for that
   command to finish, so the model sees the output first. The same goes for
   approving a plan and for `/goal`.
