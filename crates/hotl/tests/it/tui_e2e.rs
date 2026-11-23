@@ -228,6 +228,56 @@ fn scripted_factory() -> acp::SessionFactory {
     })
 }
 
+fn provider_factory(provider: Arc<ScriptedProvider>) -> acp::SessionFactory {
+    Box::new(move |_spec| {
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
+        let provider = provider.clone();
+        Ok(acp::SessionOpen {
+            history: Vec::new(),
+            memory_mode: None,
+            worktree: None,
+            lease: None,
+            color: None,
+            handle: spawn_session(SessionDeps {
+                concurrency: Default::default(),
+                provider,
+                registry: Arc::new(Registry::builtin()),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: std::env::temp_dir(),
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
+                initial_goal: None,
+                config: EngineConfig {
+                    max_turns: 6,
+                    ..Default::default()
+                },
+            }),
+            name: None,
+            mode: "ask".into(),
+            plan: false,
+            default_effort: None,
+            effort_schedule: None,
+            goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
+            session_id,
+            warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
+            title: None,
+            model: None,
+        })
+    })
+}
+
 /// A session whose scripted model asks a structured question (`ask_user`)
 /// then replies with text — the tier-1 gap #4 golden.
 fn scripted_ask_user_factory() -> acp::SessionFactory {
@@ -870,5 +920,54 @@ async fn drag_select_copies_transcript_prose_without_the_spine_golden() {
     assert_eq!(
         copied, REPLY,
         "the gutter pad and role glyph must not reach the clipboard"
+    );
+}
+
+#[tokio::test]
+async fn slash_plan_with_a_task_reaches_the_model_in_plan_mode() {
+    let provider = Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
+        "planned",
+    )]));
+    let (mut client, mut reader) = start_with(provider_factory(provider.clone())).await;
+    let mut state = State::new(true, "m".into());
+    let mut prompt_ids = VecDeque::new();
+    let mut steer_ids = VecDeque::new();
+    let mut model_ids = VecDeque::new();
+    let mut remember_ids = VecDeque::new();
+    type_prompt(
+        &mut state,
+        &mut client,
+        &mut prompt_ids,
+        &mut steer_ids,
+        &mut model_ids,
+        &mut remember_ids,
+        "/plan draft the migration",
+    )
+    .await;
+    loop {
+        let Some(msg) = translate(
+            next(&mut reader).await,
+            &mut prompt_ids,
+            &mut steer_ids,
+            &mut model_ids,
+            &mut remember_ids,
+        ) else {
+            continue;
+        };
+        let done = matches!(msg, Msg::PromptResult { .. });
+        update(&mut state, msg);
+        if done {
+            break;
+        }
+    }
+    let first = provider.requests().into_iter().next().expect("one request");
+    let carried = first.items.iter().any(|i| {
+        matches!(i.as_ref(), hotl_types::Item::User { text, .. } if text.contains("draft the migration"))
+    });
+    assert!(carried, "the task reached the model");
+    let names: Vec<&str> = first.tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(
+        !names.contains(&"write") && !names.contains(&"edit"),
+        "plan mode was not on for the first request: {names:?}"
     );
 }
