@@ -767,11 +767,11 @@ async fn run_loop(
                                         &mut shell_cancel,
                                         &mut shell_current,
                                     );
-                                    let fresh = State::new(state.vim_mode, String::new());
-                                    let old = std::mem::replace(&mut state, fresh);
-                                    state.editor = old.editor;
-                                    state.density = old.density;
-                                    state.measure = old.measure;
+                                    let old = std::mem::replace(
+                                        &mut state,
+                                        State::new(false, String::new()),
+                                    );
+                                    state = state_for_resumed_session(old);
                                     seed_state(&mut state, default_model.clone(), opened, None);
                                     cache = TranscriptCache::default();
                                     // The server dropped the old session's
@@ -1226,6 +1226,39 @@ fn resolve_mouse(env: Option<&str>, cfg: bool) -> bool {
 
 fn is_current_shell_run(current: Option<u64>, id: u64) -> bool {
     current == Some(id)
+}
+
+fn state_for_resumed_session(old: State) -> State {
+    let mut state = State::new(old.vim_mode, String::new());
+    state.editor = old.editor;
+    state.density = old.density;
+    state.measure = old.measure;
+    if let Some((text, payload)) = old.held_prompt {
+        let dropped = match payload.images.len() {
+            0 => String::new(),
+            n => format!(" (its {n} image(s) were not kept)"),
+        };
+        if state.editor.is_empty() {
+            state.editor.set_text(&text);
+            push_notice(
+                &mut state,
+                format!("held message not sent — it is back in the editor{dropped}"),
+            );
+        } else {
+            let preview: String = text
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(40)
+                .collect();
+            push_notice(
+                &mut state,
+                format!("held message not sent: \"{preview}\"{dropped}"),
+            );
+        }
+    }
+    state
 }
 
 fn settle_shell_for_resume(
@@ -1858,6 +1891,35 @@ mod tests {
         super::settle_shell_for_resume(true, &mut cancel, &mut current);
         assert!(token.is_cancelled());
         assert!(cancel.is_none() && current.is_none());
+    }
+
+    #[test]
+    fn a_resume_switch_puts_a_held_prompt_back_in_the_editor() {
+        let mut old = hotl_tui::app::State::new(false, String::new());
+        old.held_prompt = Some((
+            "explain the failure".into(),
+            hotl_tui::paste::PromptPayload::text_only("explain the failure".into()),
+        ));
+        let state = super::state_for_resumed_session(old);
+        assert_eq!(state.editor.text(), "explain the failure");
+        assert!(state.held_prompt.is_none());
+        assert!(state.transcript.iter().any(|i| matches!(i,
+            hotl_tui::app::TranscriptItem::Notice { text } if text.as_str().contains("not sent"))));
+    }
+
+    #[test]
+    fn a_resume_switch_with_a_draft_keeps_the_draft_and_names_the_held_prompt() {
+        let mut old = hotl_tui::app::State::new(false, String::new());
+        old.editor.set_text("half typed");
+        old.held_prompt = Some((
+            "explain the failure".into(),
+            hotl_tui::paste::PromptPayload::text_only("explain the failure".into()),
+        ));
+        let state = super::state_for_resumed_session(old);
+        assert_eq!(state.editor.text(), "half typed");
+        assert!(state.transcript.iter().any(|i| matches!(i,
+            hotl_tui::app::TranscriptItem::Notice { text }
+                if text.as_str() == "held message not sent: \"explain the failure\"")));
     }
 
     #[test]
