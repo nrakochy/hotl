@@ -2834,7 +2834,9 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             state.band_cursor = None;
             return Vec::new();
         }
-        if state.phase != Phase::Idle && state.completion.is_none() {
+        if (state.phase != Phase::Idle || state.shell_running.is_some())
+            && state.completion.is_none()
+        {
             return interrupt_or_detach(state);
         }
     }
@@ -10315,6 +10317,16 @@ mod tests {
             shell_cards(&s)[..],
             [TranscriptItem::Shell { output, running: false, .. }] if output.contains("[cancelled]")
         ));
+    }
+
+    #[test]
+    fn esc_cancels_a_shell_command_while_the_session_is_idle() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "!sleep 999");
+        assert_eq!(s.phase, Phase::Idle);
+        press(&mut s, KeyCode::Esc);
+        let cmds = press(&mut s, KeyCode::Esc);
+        assert_eq!(cmds, vec![Cmd::CancelShell]);
     }
 
     #[test]

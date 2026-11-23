@@ -309,6 +309,48 @@ async fn the_smoke_sends_its_prompt_to_the_fake_and_reads_the_reply() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bang_command_output_reaches_the_transcript_and_the_model() {
+    let Some((smoke, _serial)) = launch(
+        SmokeConfig::default(),
+        Script::queue(vec![fake::text("noted").into()]),
+    )
+    .await
+    else {
+        return;
+    };
+    smoke.tmux.type_line("!echo hello-bang");
+    smoke.tmux.wait_for(
+        "the command's output",
+        |rows| {
+            rows.iter()
+                .any(|r| r.contains("hello-bang") && !r.contains("echo"))
+        },
+        s(15),
+    );
+    assert_eq!(smoke.fake.request_count(), 0, "a ! command starts no turn");
+    smoke.tmux.type_line("what did it print");
+    smoke.wait_any_row("the reply", "noted", s(15));
+    smoke.wait_at_rest(s(10));
+    let bodies = smoke.fake.bodies();
+    assert_eq!(bodies.len(), 1, "{bodies:#?}");
+    assert!(bodies[0].contains("hello-bang"), "{}", bodies[0]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn escape_cancels_a_running_bang_command() {
+    let Some((smoke, _serial)) = launch(SmokeConfig::default(), Script::default()).await else {
+        return;
+    };
+    smoke.tmux.type_line("!sleep 30");
+    std::thread::sleep(Duration::from_millis(500));
+    let started = std::time::Instant::now();
+    smoke.tmux.send_keys(&["Escape"]);
+    smoke.wait_any_row("the cancelled card", "[cancelled]", s(5));
+    assert!(started.elapsed() < s(3), "{:?}", started.elapsed());
+    assert_eq!(smoke.fake.request_count(), 0);
+}
+
 // --- Task 6: strip liveness (tracker 184, 87) ---------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

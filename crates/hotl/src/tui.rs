@@ -617,6 +617,8 @@ async fn run_loop(
     // first select, through the same machinery every per-msg command uses.
     mut queue: VecDeque<Cmd>,
 ) -> io::Result<i32> {
+    let (shell_tx, mut shell_rx) = mpsc::channel::<hotl_tools::user_shell::UserShellRun>(1);
+    let mut shell_cancel: Option<tokio_util::sync::CancellationToken> = None;
     let mut prompt_ids: VecDeque<u64> = VecDeque::new();
     let mut steer_ids: VecDeque<u64> = VecDeque::new();
     let mut model_ids: VecDeque<u64> = VecDeque::new();
@@ -693,6 +695,26 @@ async fn run_loop(
                     let lines = copy_region(guard, &state, &palette, &mut cache, &sel)?;
                     queue.extend(update(&mut state, Msg::Copied { lines }));
                     needs_draw = true;
+                }
+                Cmd::RunShell { command, cwd } => {
+                    let token = tokio_util::sync::CancellationToken::new();
+                    shell_cancel = Some(token.clone());
+                    let tx = shell_tx.clone();
+                    tokio::spawn(async move {
+                        let run = hotl_tools::user_shell::run(
+                            &command,
+                            &cwd,
+                            hotl_tools::user_shell::USER_SHELL_TIMEOUT,
+                            token,
+                        )
+                        .await;
+                        let _ = tx.send(run).await;
+                    });
+                }
+                Cmd::CancelShell => {
+                    if let Some(token) = &shell_cancel {
+                        token.cancel();
+                    }
                 }
                 Cmd::OpenEditor(text) => {
                     let content = suspended_editor(guard, suspended, &text);
@@ -817,6 +839,15 @@ async fn run_loop(
                 )),
             },
             _ = ticker.tick(), if state.phase != Phase::Idle => Some(Msg::Tick),
+            Some(run) = shell_rx.recv() => {
+                shell_cancel = None;
+                Some(Msg::ShellDone {
+                    output: run.output,
+                    exit_code: run.exit_code,
+                    timed_out: run.timed_out,
+                    cancelled: run.cancelled,
+                })
+            }
         };
         let Some(msg) = msg else {
             needs_draw = true; // redraw-only: resize, mouse motion

@@ -335,6 +335,7 @@ own.
 | `/quit` | Leave the console (the session log is already on disk). |
 | `/<skill> [args]` | Load one of your skills by name and follow it, with the rest of the line passed as arguments — they fill the body's `$ARGUMENTS` / `$1` placeholders at load ([skills.md](../skills/#forcing-one-yourself)) — and any attached images ride along too. |
 | `/<workflow> [args]` | Run a saved workflow recipe (`~/.config/hotl/workflows/<name>.toml`) with the rest of the line as its arguments. Names resolve builtin → skill → workflow, so a recipe named like a skill is unreachable here (and hidden from completion); rename it. |
+| `!<command>` | Run a shell command in the session's folder, as you, outside the sandbox and with no permission prompt. Stops after 120 seconds; `Esc` cancels it. The output shows as a card in the transcript and is shared with the model as context for your next message. It never starts a turn, and it works while a turn is running. |
 
 Typing `/` opens a menu of every command and skill, filtered as you keep
 typing: `↑` / `↓` pick, `Tab` completes the highlighted name, `Enter` runs
