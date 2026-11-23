@@ -3159,8 +3159,20 @@ fn submit(state: &mut State, text: String, payload: paste::PromptPayload) -> Vec
     if let Some(rest) = text.trim().strip_prefix('/') {
         return slash_command(state, rest, payload);
     }
-    if let Some(rest) = text.trim_start().strip_prefix('!') {
-        return run_shell(state, rest.trim());
+    if text.trim_start().starts_with('!') {
+        if !payload.images.is_empty() {
+            notice(
+                state,
+                "images are ignored for ! commands — only the text runs".into(),
+            );
+        }
+        let command = payload
+            .text
+            .trim_start()
+            .strip_prefix('!')
+            .unwrap_or_default()
+            .trim();
+        return run_shell(state, command);
     }
     send_text(state, text, payload)
 }
@@ -10209,6 +10221,41 @@ mod tests {
             shell_cards(&s)[..],
             [TranscriptItem::Shell { running: true, .. }]
         ));
+    }
+
+    #[test]
+    fn a_pasted_bang_command_runs_the_pasted_text() {
+        let mut s = State::test_default();
+        type_str(&mut s, "!");
+        update(&mut s, Msg::Paste("echo one\necho two\necho three".into()));
+        let cmds = press(&mut s, KeyCode::Enter);
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Cmd::RunShell { command, .. } if command == "echo one\necho two\necho three"
+            )),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_bang_command_with_an_image_says_the_image_is_ignored() {
+        let mut s = State::test_default();
+        type_str(&mut s, "!ls ");
+        update(&mut s, Msg::Paste("/tmp/shot.png".into()));
+        let cmds = press(&mut s, KeyCode::Enter);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::RunShell { .. })),
+            "{cmds:?}"
+        );
+        assert!(
+            s.transcript.iter().any(|i| matches!(
+                i,
+                TranscriptItem::Notice { text, .. } if text.contains("images are ignored")
+            )),
+            "{:?}",
+            s.transcript
+        );
     }
 
     #[test]
