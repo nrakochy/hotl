@@ -6,6 +6,29 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- `/plan <task>` turns plan mode on and sends `<task>` as your prompt in one
+  step (queued if a turn is running). Bare `/plan` still toggles, and
+  `/plan on|off` now accepts any case.
+- `[provider] headers_secs` (default 600): how long a sent request may wait
+  for the provider to start replying before it is re-sent.
+
+### Fixed
+
+- Long silences with providers that think before replying (Gemini, reasoning
+  gateways): a request is no longer abandoned and restarted after 120 s
+  without headers, and the engine no longer runs its own retry round on top
+  of the provider's when the provider never answered.
+- A message typed while the model was finishing its reply is now answered
+  instead of sitting in the log, and its chip no longer reads `queued`
+  forever.
+- A Bash command that leaves a background process running (`cmd &`, git
+  credential helpers) returns as soon as its shell exits instead of waiting
+  until the timeout.
+- The status line says `waiting on the model Ns` before a reply starts,
+  instead of promising a `retry at 90s` that did not apply.
+
 ## [0.33.0] - 2026-11-21
 
 ### Changed (breaking)
