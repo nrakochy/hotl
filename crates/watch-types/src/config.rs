@@ -82,6 +82,10 @@ impl Settings {
 pub struct Plugins {}
 
 impl HotlConfig {
+    pub fn path() -> Option<std::path::PathBuf> {
+        dirs_config_path()
+    }
+
     pub fn parse(toml_str: &str) -> HotlConfig {
         HotlConfig::parse_checked(toml_str).0
     }
@@ -129,6 +133,15 @@ fn dirs_config_path() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_matches_the_loader_path() {
+        assert_eq!(HotlConfig::path(), dirs_config_path());
+        if let Some(p) = HotlConfig::path() {
+            assert_eq!(p.file_name().unwrap(), "config.toml");
+            assert_eq!(p.parent().unwrap().file_name().unwrap(), "hotl");
+        }
+    }
 
     #[test]
     fn density_defaults_parses_and_warns() {
