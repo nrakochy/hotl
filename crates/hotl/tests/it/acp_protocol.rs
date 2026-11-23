@@ -1494,6 +1494,95 @@ async fn steer_is_acknowledged_and_reaches_engine() {
     assert!(err["error"]["message"].as_str().unwrap().contains("text"));
 }
 
+#[tokio::test]
+async fn shell_note_is_acknowledged_and_lands_in_history() {
+    let (provider, sid, mut w, mut lines) =
+        open_with(vec![ScriptedProvider::text_reply("seen")], init_params()).await;
+    send(
+        &mut w,
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/shell_note","params":{
+            "command":"echo zebra-marker","output":"zebra-marker\n","exitCode":0}}),
+    )
+    .await;
+    let ack = read_until_id(&mut lines, 3).await;
+    assert_eq!(ack["result"], json!({}), "{ack}");
+    send(
+        &mut w,
+        prompt_msg(4, &sid, json!([{"type": "text", "text": "go"}])),
+    )
+    .await;
+    let reply = read_until_id(&mut lines, 4).await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let users: Vec<String> = requests[0]
+        .items
+        .iter()
+        .filter_map(|i| match i.as_ref() {
+            hotl_types::Item::User { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        users.iter().any(|t| t.contains("zebra-marker")),
+        "{users:?}"
+    );
+}
+
+#[tokio::test]
+async fn shell_note_accepts_a_null_exit_code_and_rejects_missing_params() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"_hotl/session/shell_note","params":{"command":"ls","output":""}}),
+    )
+    .await;
+    let err = read_until_id(&mut lines, 1).await;
+    assert_eq!(err["error"]["code"], -32002, "{err}");
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":new_params()}),
+    )
+    .await;
+    read_until_id(&mut lines, 2).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/shell_note","params":{"command":"ls","output":"x","exitCode":null}}),
+    )
+    .await;
+    assert_eq!(read_until_id(&mut lines, 3).await["result"], json!({}));
+    for (id, params) in [
+        (4, json!({"output":"x"})),
+        (5, json!({"command":"ls"})),
+        (6, json!({})),
+    ] {
+        send(
+            &mut cwrite,
+            json!({"jsonrpc":"2.0","id":id,"method":"_hotl/session/shell_note","params":params}),
+        )
+        .await;
+        let err = read_until_id(&mut lines, id).await;
+        assert_eq!(err["error"]["code"], -32602, "{err}");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("_hotl/session/shell_note requires params.command and params.output"),
+            "{err}"
+        );
+    }
+}
+
 /// Images ride `session/prompt`/`_hotl/session/steer` params and are validated at
 /// the wire — a poisoned payload is rejected before anything is committed —
 /// and the open result advertises `images: true` for feature detection.

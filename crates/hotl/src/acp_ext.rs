@@ -185,6 +185,16 @@ struct SteerParams {
 #[derive(JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
+struct ShellNoteParams {
+    session_id: Option<String>,
+    command: String,
+    output: String,
+    exit_code: Option<i32>,
+}
+
+#[derive(JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct FoldParams {
     session_id: Option<String>,
     #[schemars(description = "What the summary should keep, 1 to 4000 characters")]
@@ -286,6 +296,7 @@ pub fn schema() -> Value {
         "_hotl/session/set_goal": request("client", sub::<GoalParams>(g), sub::<GoalAck>(g)),
         "_hotl/session/remember": request("client", sub::<RememberParams>(g), one_of(&["Ack", "MemoryReport"])),
         "_hotl/session/steer": request("client", sub::<SteerParams>(g), queued.clone()),
+        "_hotl/session/shell_note": request("client", sub::<ShellNoteParams>(g), json!({"type": "object", "additionalProperties": false})),
         "_hotl/session/fold": request("client", sub::<FoldParams>(g), queued.clone()),
         "_hotl/session/reload_config": reload,
         "_hotl/session/aside": request("client", sub::<AsideParams>(g), ack.clone()),

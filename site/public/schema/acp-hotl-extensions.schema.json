@@ -2475,6 +2475,34 @@
       },
       "type": "object"
     },
+    "ShellNoteParams": {
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "exitCode": {
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "output": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "command",
+        "output"
+      ],
+      "type": "object"
+    },
     "SteerParams": {
       "properties": {
         "images": {
@@ -3097,6 +3125,16 @@
       },
       "result": {
         "$ref": "#/$defs/GoalAck"
+      }
+    },
+    "_hotl/session/shell_note": {
+      "from": "client",
+      "params": {
+        "$ref": "#/$defs/ShellNoteParams"
+      },
+      "result": {
+        "additionalProperties": false,
+        "type": "object"
       }
     },
     "_hotl/session/steer": {

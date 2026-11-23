@@ -43,6 +43,7 @@ pub const EXTENSION_METHODS: &[&str] = &[
     "_hotl/session/set_goal",
     "_hotl/session/remember",
     "_hotl/session/steer",
+    "_hotl/session/shell_note",
     "_hotl/session/fold",
     "_hotl/session/reload_config",
     "_hotl/session/aside",
@@ -1996,6 +1997,34 @@ async fn handle_request(
                 };
             state.handle.steer_with(text.to_string(), images).await;
             reply_ok(writer, id, to_json(&Queued { queued: true })).await;
+        }
+        "_hotl/session/shell_note" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(
+                    writer,
+                    id,
+                    codes::NOT_FOUND,
+                    "no session — call session/new first",
+                )
+                .await;
+            };
+            let command = msg.pointer("/params/command").and_then(Value::as_str);
+            let output = msg.pointer("/params/output").and_then(Value::as_str);
+            let (Some(command), Some(output)) = (command, output) else {
+                return reply_err(
+                    writer,
+                    id,
+                    codes::INVALID_PARAMS,
+                    "_hotl/session/shell_note requires params.command and params.output",
+                )
+                .await;
+            };
+            let exit_code = msg
+                .pointer("/params/exitCode")
+                .and_then(Value::as_i64)
+                .and_then(|c| i32::try_from(c).ok());
+            state.handle.shell_note(command, output, exit_code).await;
+            reply_ok(writer, id, json!({})).await;
         }
         // `/compact [focus]` (0066): ack with whether it ran now or waits for
         // the turn boundary; the fold's own frames ride `session/update`.
