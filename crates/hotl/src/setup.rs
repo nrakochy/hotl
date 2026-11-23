@@ -2,8 +2,10 @@
 //!
 //! `setup` writes the default config the "defaults are the safety design"
 //! belief depends on, but **never silently**: it's an explicit subcommand and
-//! it refuses to overwrite an existing file without `--force`. Bare `hotl`
-//! prints a one-line hint on first run rather than writing anything itself.
+//! it refuses to overwrite an existing file without `--force`, except a file
+//! holding only `[settings]`, which gets the defaults added around it. Bare
+//! `hotl` prints a one-line hint on first run rather than writing anything
+//! itself.
 
 use std::path::Path;
 
@@ -210,7 +212,7 @@ fn write_if_absent(path: &Path, content: &str, force: bool) -> Wrote {
         else {
             return Wrote::Exists;
         };
-        return match std::fs::write(path, filled) {
+        return match crate::settings_write::write_atomic(path, &filled) {
             Ok(()) => Wrote::KeptSettings,
             Err(e) => Wrote::Failed(e),
         };
@@ -221,11 +223,13 @@ fn write_if_absent(path: &Path, content: &str, force: bool) -> Wrote {
     }
 }
 
+fn settings_only_table(text: &str) -> Option<toml::Table> {
+    let table: toml::Table = toml::from_str(text).ok()?;
+    (table.len() == 1 && table.contains_key("settings")).then_some(table)
+}
+
 fn defaults_around_settings(defaults: &str, old: &str) -> Option<String> {
-    let old_table: toml::Table = toml::from_str(old).ok()?;
-    if old_table.len() != 1 || !old_table.contains_key("settings") {
-        return None;
-    }
+    let old_table = settings_only_table(old)?;
     let sep = if defaults.ends_with('\n') { "" } else { "\n" };
     let filled = format!("{defaults}{sep}{old}");
     let mut parsed: toml::Table = toml::from_str(&filled).ok()?;
@@ -238,7 +242,12 @@ fn defaults_around_settings(defaults: &str, old: &str) -> Option<String> {
 /// Never writes anything — pointing, not doing.
 pub fn first_run_hint(config_dir: &Path) -> Option<String> {
     if config_dir.exists() {
-        return None;
+        let settings_only = std::fs::read_to_string(config_dir.join("config.toml"))
+            .ok()
+            .is_some_and(|t| settings_only_table(&t).is_some());
+        if !settings_only {
+            return None;
+        }
     }
     Some(format!(
         "first run — no config at {}. `hotl setup` writes safe defaults; `hotl doctor` checks your setup.",
@@ -338,6 +347,18 @@ mod tests {
     fn first_run_hint_only_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         assert!(first_run_hint(&dir.path().join("nope")).is_some());
+        assert!(first_run_hint(dir.path()).is_none());
+    }
+
+    #[test]
+    fn first_run_hint_shows_while_config_holds_only_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "[settings.theme]\npreset = \"nord\"\n").unwrap();
+        assert!(first_run_hint(dir.path()).is_some());
+        std::fs::write(&file, "[settings]\nx = 1\n[provider]\nmodel = \"m\"\n").unwrap();
+        assert!(first_run_hint(dir.path()).is_none());
+        std::fs::write(&file, "[provider]\nmodel = \"m\"\n").unwrap();
         assert!(first_run_hint(dir.path()).is_none());
     }
 
