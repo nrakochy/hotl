@@ -177,6 +177,10 @@ pub fn setup_main(config_dir: &Path, force: bool) -> i32 {
     let cfg = config_dir.join("config.toml");
     match write_if_absent(&cfg, DEFAULT_CONFIG, force) {
         Wrote::Created => println!("wrote {}", cfg.display()),
+        Wrote::KeptSettings => println!(
+            "wrote {} (defaults added, your [settings] kept)",
+            cfg.display()
+        ),
         Wrote::Exists => println!("kept existing {} (use --force to overwrite)", cfg.display()),
         Wrote::Failed(e) => {
             eprintln!("hotl: could not write {}: {e}", cfg.display());
@@ -193,18 +197,41 @@ pub fn setup_main(config_dir: &Path, force: bool) -> i32 {
 
 enum Wrote {
     Created,
+    KeptSettings,
     Exists,
     Failed(std::io::Error),
 }
 
 fn write_if_absent(path: &Path, content: &str, force: bool) -> Wrote {
     if path.exists() && !force {
-        return Wrote::Exists;
+        let Some(filled) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|old| defaults_around_settings(content, &old))
+        else {
+            return Wrote::Exists;
+        };
+        return match std::fs::write(path, filled) {
+            Ok(()) => Wrote::KeptSettings,
+            Err(e) => Wrote::Failed(e),
+        };
     }
     match std::fs::write(path, content) {
         Ok(()) => Wrote::Created,
         Err(e) => Wrote::Failed(e),
     }
+}
+
+fn defaults_around_settings(defaults: &str, old: &str) -> Option<String> {
+    let old_table: toml::Table = toml::from_str(old).ok()?;
+    if old_table.len() != 1 || !old_table.contains_key("settings") {
+        return None;
+    }
+    let sep = if defaults.ends_with('\n') { "" } else { "\n" };
+    let filled = format!("{defaults}{sep}{old}");
+    let mut parsed: toml::Table = toml::from_str(&filled).ok()?;
+    let settings = parsed.remove("settings")?;
+    let defaults_table: toml::Table = toml::from_str(defaults).ok()?;
+    (Some(&settings) == old_table.get("settings") && parsed == defaults_table).then_some(filled)
 }
 
 /// One-line first-run hint printed by bare `hotl` when no config exists.
@@ -269,6 +296,42 @@ mod tests {
         assert!(std::fs::read_to_string(cfg.join("config.toml"))
             .unwrap()
             .contains("allow"));
+    }
+
+    #[test]
+    fn setup_fills_a_theme_only_config_and_keeps_the_palette() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("hotl");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let theme = "[settings.theme]\npreset = \"nord\"\n";
+        std::fs::write(cfg.join("config.toml"), theme).unwrap();
+        assert_eq!(setup_main(&cfg, false), 0);
+        let text = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
+        assert!(text.starts_with(DEFAULT_CONFIG), "{text}");
+        assert!(text.ends_with(theme), "{text}");
+        let parsed: toml::Value = toml::from_str(&text).expect("valid toml");
+        assert_eq!(parsed["settings"]["theme"]["preset"].as_str(), Some("nord"));
+        assert!(parsed.get("provider").is_some());
+    }
+
+    #[test]
+    fn setup_keeps_a_config_with_more_than_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("hotl");
+        std::fs::create_dir_all(&cfg).unwrap();
+        for text in [
+            "[settings.theme]\npreset = \"nord\"\n[provider]\nmodel = \"x/y\"\n",
+            "[settings.theme\npreset = \"nord\"\n",
+            "settings = { theme = { preset = \"nord\" } }\n",
+            "# nothing\n",
+        ] {
+            std::fs::write(cfg.join("config.toml"), text).unwrap();
+            assert_eq!(setup_main(&cfg, false), 0);
+            assert_eq!(
+                std::fs::read_to_string(cfg.join("config.toml")).unwrap(),
+                text
+            );
+        }
     }
 
     #[test]
