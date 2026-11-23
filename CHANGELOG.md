@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-11-23
+
 ### Added
 
 - The first time you open the console with no `[settings.theme]` in your
