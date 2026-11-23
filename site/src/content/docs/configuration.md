@@ -217,7 +217,7 @@ always use the full width. `warm` is a low-blue
 palette — paper-white ink, amber accent, terracotta — for a less clinical
 feel; it's opt-in, the default stays `tokyo-night`.
 
-**You don't have to edit `preset` by hand.** The first time you open the console with no `[settings.theme]` table, a picker offers the six palettes and saves your choice as `preset`. It asks once per machine: hotl records that in a `palette-asked` file in the data directory, `<xdg-data>/hotl/`. `/theme` opens the same picker later, and `/theme <name>` sets a palette directly. Saving changes only `preset`; comments, other keys and your per-slot colors stay. Keys and details are in [tui.md](../tui/#picking-a-palette).
+**You don't have to edit `preset` by hand.** The first time you open the console with no `[settings.theme]` table, a picker offers the six palettes and saves your choice as `preset`. It asks once per machine: hotl records that in a `palette-asked` file in the data directory, `<xdg-data>/hotl/`. `/theme` opens the same picker later, and `/theme <name>` sets a palette directly. Saving changes only `preset`; comments, other keys and your per-slot colors stay. On Windows (with `XDG_CONFIG_HOME` unset) the palette is read from and saved to `%USERPROFILE%\.config\hotl\config.toml`, a different file from the `%LOCALAPPDATA%\hotl\config\config.toml` that `hotl setup` writes. Keys and details are in [tui.md](../tui/#picking-a-palette).
 
 `hotl setup` writes the starter file with no theme block. If `config.toml` holds nothing but `[settings]` (what a first-run pick leaves), `hotl setup` adds the defaults around it and keeps your palette. With anything else in the file it keeps the file as it is; `--force` replaces the whole file with the starter.
 
