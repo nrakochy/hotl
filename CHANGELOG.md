@@ -11,6 +11,10 @@ semver promise of their own.
 - `/plan <task>` turns plan mode on and sends `<task>` as your prompt in one
   step (queued if a turn is running). Bare `/plan` still toggles, and
   `/plan on|off` now accepts any case.
+- `!<command>` in the TUI and in `hotl attach` runs the command right where
+  you are (your folder, as you, outside the sandbox; 120 s limit, Esc
+  cancels in the TUI), shows its output, and hands that output to the model
+  as context for your next message. It never starts a model turn on its own.
 - `[provider] headers_secs` (default 600): how long a sent request may wait
   for the provider to start replying before it is re-sent.
 
