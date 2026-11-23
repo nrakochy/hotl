@@ -23,8 +23,10 @@ semver promise of their own.
 
 ### Fixed
 
-- Clients that load a saved session (editors over ACP) now see earlier `!`
-  results as shell cards instead of losing them.
+- Loading a saved session with `session/load` from a client that speaks
+  hotl's extensions now replays earlier `!` results as shell cards instead of
+  dropping them. (The TUI resumes sessions without replaying history, as
+  before.)
 - If hotl can't hand a `!` result to the model, the TUI now says so.
 - A message you type mid-turn can no longer be swallowed into a background
   agent's notice.
