@@ -10324,7 +10324,17 @@ mod tests {
         let mut s = State::test_default();
         type_and_submit(&mut s, "!sleep 999");
         assert_eq!(s.phase, Phase::Idle);
-        press(&mut s, KeyCode::Esc);
+        let first = press(&mut s, KeyCode::Esc);
+        assert!(first.is_empty(), "{first:?}");
+        let cmds = press(&mut s, KeyCode::Esc);
+        assert_eq!(cmds, vec![Cmd::CancelShell]);
+    }
+
+    #[test]
+    fn one_esc_cancels_a_shell_command_without_vim_mode() {
+        let mut s = State::new(false, "test-model".into());
+        type_and_submit(&mut s, "!sleep 999");
+        assert_eq!(s.phase, Phase::Idle);
         let cmds = press(&mut s, KeyCode::Esc);
         assert_eq!(cmds, vec![Cmd::CancelShell]);
     }
@@ -10334,7 +10344,9 @@ mod tests {
         let mut s = State::test_default();
         s.phase = Phase::Streaming { ticks: 0, chars: 0 };
         type_and_submit(&mut s, "!sleep 999");
-        press(&mut s, KeyCode::Esc);
+        let first = press(&mut s, KeyCode::Esc);
+        assert!(first.is_empty(), "{first:?}");
+        assert!(!s.interrupt_sent);
         let cmds = press(&mut s, KeyCode::Esc);
         assert_eq!(cmds, vec![Cmd::CancelShell]);
         assert!(!s.interrupt_sent);

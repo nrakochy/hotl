@@ -617,8 +617,10 @@ async fn run_loop(
     // first select, through the same machinery every per-msg command uses.
     mut queue: VecDeque<Cmd>,
 ) -> io::Result<i32> {
-    let (shell_tx, mut shell_rx) = mpsc::channel::<hotl_tools::user_shell::UserShellRun>(1);
+    let (shell_tx, mut shell_rx) = mpsc::channel::<(u64, hotl_tools::user_shell::UserShellRun)>(1);
     let mut shell_cancel: Option<tokio_util::sync::CancellationToken> = None;
+    let mut shell_gen: u64 = 0;
+    let mut shell_current: Option<u64> = None;
     let mut prompt_ids: VecDeque<u64> = VecDeque::new();
     let mut steer_ids: VecDeque<u64> = VecDeque::new();
     let mut model_ids: VecDeque<u64> = VecDeque::new();
@@ -698,6 +700,9 @@ async fn run_loop(
                 }
                 Cmd::RunShell { command, cwd } => {
                     let token = tokio_util::sync::CancellationToken::new();
+                    shell_gen += 1;
+                    let id = shell_gen;
+                    shell_current = Some(id);
                     shell_cancel = Some(token.clone());
                     let tx = shell_tx.clone();
                     tokio::spawn(async move {
@@ -708,7 +713,7 @@ async fn run_loop(
                             token,
                         )
                         .await;
-                        let _ = tx.send(run).await;
+                        let _ = tx.send((id, run)).await;
                     });
                 }
                 Cmd::CancelShell => {
@@ -743,6 +748,7 @@ async fn run_loop(
                     needs_draw = true;
                 }
                 Cmd::Resume(arg) => {
+                    abandon_shell(&mut shell_cancel, &mut shell_current);
                     match resume_target(&arg, &mut listed) {
                         Ok(ResumeTarget::Listing(lines)) => {
                             for line in lines {
@@ -778,6 +784,12 @@ async fn run_loop(
                     needs_draw = true;
                 }
                 Cmd::Quit => {
+                    let had_shell = shell_cancel.is_some();
+                    abandon_shell(&mut shell_cancel, &mut shell_current);
+                    if had_shell {
+                        let _ =
+                            tokio::time::timeout(Duration::from_millis(500), shell_rx.recv()).await;
+                    }
                     // The spec's goodbye: a `clear` so the tab stops showing
                     // the last state.
                     if program_status_on {
@@ -839,14 +851,19 @@ async fn run_loop(
                 )),
             },
             _ = ticker.tick(), if state.phase != Phase::Idle => Some(Msg::Tick),
-            Some(run) = shell_rx.recv() => {
-                shell_cancel = None;
-                Some(Msg::ShellDone {
-                    output: run.output,
-                    exit_code: run.exit_code,
-                    timed_out: run.timed_out,
-                    cancelled: run.cancelled,
-                })
+            Some((id, run)) = shell_rx.recv() => {
+                if is_current_shell_run(shell_current, id) {
+                    shell_cancel = None;
+                    shell_current = None;
+                    Some(Msg::ShellDone {
+                        output: run.output,
+                        exit_code: run.exit_code,
+                        timed_out: run.timed_out,
+                        cancelled: run.cancelled,
+                    })
+                } else {
+                    None
+                }
             }
         };
         let Some(msg) = msg else {
@@ -1192,6 +1209,20 @@ fn resolve_mouse(env: Option<&str>, cfg: bool) -> bool {
 
 /// Crossterm events read on a plain thread (no event-stream feature needed);
 /// `suspended` parks it while `$EDITOR` owns the terminal.
+fn is_current_shell_run(current: Option<u64>, id: u64) -> bool {
+    current == Some(id)
+}
+
+fn abandon_shell(
+    cancel: &mut Option<tokio_util::sync::CancellationToken>,
+    current: &mut Option<u64>,
+) {
+    if let Some(token) = cancel.take() {
+        token.cancel();
+    }
+    *current = None;
+}
+
 fn spawn_key_reader(suspended: Arc<AtomicBool>) -> mpsc::Receiver<Event> {
     let (tx, rx) = mpsc::channel(64);
     std::thread::spawn(move || loop {
@@ -1788,6 +1819,23 @@ fn age(t: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_the_current_shell_run_may_land() {
+        assert!(super::is_current_shell_run(Some(3), 3));
+        assert!(!super::is_current_shell_run(Some(4), 3));
+        assert!(!super::is_current_shell_run(None, 3));
+    }
+
+    #[test]
+    fn abandoning_a_shell_cancels_its_token_and_forgets_the_run() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut cancel = Some(token.clone());
+        let mut current = Some(7);
+        super::abandon_shell(&mut cancel, &mut current);
+        assert!(token.is_cancelled());
+        assert!(cancel.is_none() && current.is_none());
+    }
+
     #[test]
     fn startup_titles_the_pane_with_the_resumed_color() {
         let mut state = hotl_tui::app::State::new(false, "m".into());
