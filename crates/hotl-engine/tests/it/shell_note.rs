@@ -207,3 +207,93 @@ async fn the_next_prompt_carries_the_note() {
         .expect("prompt in request");
     assert!(note < prompt);
 }
+
+struct ToolThenSlow {
+    calls: Arc<AtomicUsize>,
+    seen: Seen,
+}
+
+impl Provider for ToolThenSlow {
+    fn stream(
+        &self,
+        req: SamplingRequest,
+    ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(req.items.iter().map(|i| (**i).clone()).collect());
+            return Box::pin(futures_util::stream::iter(
+                hotl_provider::ScriptedProvider::tool_call(
+                    "t1",
+                    "bash",
+                    json!({"command": "echo hi"}),
+                ),
+            ));
+        }
+        SlowFinish {
+            calls: Arc::new(AtomicUsize::new(0)),
+            seen: self.seen.clone(),
+        }
+        .stream(req)
+    }
+}
+
+fn is_steer(item: &Item) -> bool {
+    matches!(
+        item,
+        Item::User {
+            synthetic: Some(SyntheticReason::Steer),
+            ..
+        }
+    )
+}
+
+#[tokio::test]
+async fn a_shell_note_behind_an_answered_steer_starts_no_extra_turn() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Seen::default();
+    let mut s = session(
+        Arc::new(ToolThenSlow {
+            calls: calls.clone(),
+            seen: seen.clone(),
+        }),
+        EngineConfig::default(),
+    );
+    s.handle.prompt("go".into()).await;
+    let reply = loop {
+        if let EngineEvent::Ask { reply, .. } = next_event(&mut s).await {
+            break reply;
+        }
+    };
+    s.handle.steer("also check X".into()).await;
+    let _ = reply.send(hotl_engine::AskReply::Allow);
+    loop {
+        if let EngineEvent::TextDelta(_) = next_event(&mut s).await {
+            let answering = seen
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(|items| items.iter().any(is_steer));
+            if answering {
+                break;
+            }
+        }
+    }
+    let answered_by = calls.load(Ordering::SeqCst);
+    s.handle.shell_note("ls", "a b", Some(0)).await;
+    let mut done = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(EngineEvent::TurnDone { .. })) =
+            tokio::time::timeout(Duration::from_millis(200), s.handle.events.recv()).await
+        {
+            done += 1;
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), answered_by);
+    assert_eq!(done, 1);
+    let items = replayed_items(&s.log_path);
+    assert!(is_note(items.last().expect("items")), "{items:?}");
+}

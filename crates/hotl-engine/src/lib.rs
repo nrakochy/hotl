@@ -1959,7 +1959,16 @@ impl SessionHandle {
 /// in an assistant item (or holding only instructions) is complete.
 pub fn needs_continuation<I: std::borrow::Borrow<Item>>(items: &[I]) -> bool {
     matches!(
-        items.last().map(std::borrow::Borrow::borrow),
+        items
+            .iter()
+            .map(std::borrow::Borrow::borrow)
+            .rfind(|i| !matches!(
+                i,
+                Item::User {
+                    synthetic: Some(hotl_types::SyntheticReason::ShellCommand),
+                    ..
+                }
+            )),
         Some(Item::User { .. } | Item::ToolResults { .. })
     )
 }
