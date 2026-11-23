@@ -34,6 +34,7 @@ struct SmokeConfig {
     editor: Option<String>,
     /// A headless `-p` run first, named `seeded`: a second session on disk.
     seed_prompt: Option<&'static str>,
+    first_run: bool,
 }
 
 impl Default for SmokeConfig {
@@ -46,6 +47,7 @@ impl Default for SmokeConfig {
             extra_toml: "",
             editor: None,
             seed_prompt: None,
+            first_run: false,
         }
     }
 }
@@ -57,6 +59,8 @@ struct Smoke {
     work: PathBuf,
     secret: String,
     masks: Masks,
+    launch: Launch,
+    cfg_path: PathBuf,
 }
 
 impl Drop for Smoke {
@@ -123,7 +127,12 @@ async fn launch(
     std::fs::write(
         cfg_dir.join("hotl/config.toml"),
         format!(
-            "[settings.theme]\npreset = \"tokyo-night\"\n\n[provider]\nmodel = \"claude-smoke\"\nbase_url = \"{}\"\n\n[permissions]\nmode = \"{}\"\n\n[behavior]\nsandbox = false\nvim_mode = {}\nmouse = false\n{}\n",
+            "{}[provider]\nmodel = \"claude-smoke\"\nbase_url = \"{}\"\n\n[permissions]\nmode = \"{}\"\n\n[behavior]\nsandbox = false\nvim_mode = {}\nmouse = false\n{}\n",
+            if cfg.first_run {
+                ""
+            } else {
+                "[settings.theme]\npreset = \"tokyo-night\"\n\n"
+            },
             fake.base_url(),
             cfg.mode,
             cfg.vim_mode,
@@ -161,7 +170,7 @@ async fn launch(
     // The TUI draws on stdout; startup warnings go to stderr, which would
     // land in the pane and corrupt every frame. A file keeps them readable.
     let stderr = dir.path().join("hotl.stderr");
-    let tmux = TmuxSession::start(&Launch {
+    let launch = Launch {
         cols: cfg.cols,
         rows: cfg.rows,
         cwd: work.clone(),
@@ -175,8 +184,8 @@ async fn launch(
                 stderr.display()
             ),
         ],
-    })
-    .expect("tmux session");
+    };
+    let tmux = TmuxSession::start(&launch).expect("tmux session");
     let smoke = Smoke {
         _dir: dir,
         fake,
@@ -184,7 +193,13 @@ async fn launch(
         work,
         secret,
         masks: masks(),
+        launch,
+        cfg_path: cfg_dir.join("hotl/config.toml"),
     };
+    if cfg.first_run {
+        smoke.wait_any_row("the palette screen", "Pick a color palette", s(30));
+        return Some((smoke, serial));
+    }
     // The deadline absorbs a debug binary's startup.
     let at_rest = smoke.masks.at_rest.clone();
     // At 80×24 the strip is the readiness signal; at other sizes (160×40
@@ -243,6 +258,37 @@ impl Smoke {
             |rows| strip_of(rows).is_some_and(|r| r.starts_with(&at_rest)),
             within,
         )
+    }
+
+    fn relaunch(&mut self) {
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", self.tmux.socket(), "kill-server"])
+            .output();
+        self.wait_exit();
+        self.tmux = TmuxSession::start(&self.launch).expect("tmux session");
+    }
+
+    fn wait_resting_strip(&self) {
+        let at_rest = self.masks.at_rest.clone();
+        self.tmux.wait_for(
+            "the console to come up",
+            |rows| {
+                strip_of(rows).is_some_and(|r| r.starts_with(&at_rest) && !r.contains("starting…"))
+            },
+            s(30),
+        );
+    }
+
+    fn wait_exit(&self) {
+        let deadline = std::time::Instant::now() + s(10);
+        while TmuxSession::server_alive(self.tmux.socket()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hotl did not exit:\n{}",
+                self.tmux.capture().join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     fn file(&self, rel: &str) -> PathBuf {
@@ -882,4 +928,62 @@ async fn slash_color_completes_and_colors_the_pane_title() {
     assert!(title.contains("● red"), "{title}");
     assert_eq!(watch_tmux::hotl_title_color(&title).as_deref(), Some("red"));
     assert_eq!(smoke.fake.request_count(), 0);
+}
+
+fn first_run() -> SmokeConfig {
+    SmokeConfig {
+        first_run: true,
+        ..SmokeConfig::default()
+    }
+}
+
+fn no_picker(rows: &[String]) -> bool {
+    !rows.iter().any(|r| r.contains("Pick a color palette"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_run_palette_choice_is_saved_and_not_asked_again() {
+    let Some((mut smoke, _serial)) = launch(first_run(), Script::default()).await else {
+        return;
+    };
+    let rows = smoke.tmux.capture();
+    assert!(rows.iter().any(|r| r.contains("catppuccin")), "{rows:#?}");
+    assert!(rows.iter().any(|r| r.contains("enter choose")), "{rows:#?}");
+    smoke.tmux.send_keys(&["Down"]);
+    smoke.tmux.send_keys(&["Enter"]);
+    smoke.tmux.wait_for("the picker closed", no_picker, s(10));
+    smoke.wait_resting_strip();
+    let saved = std::fs::read_to_string(&smoke.cfg_path).unwrap();
+    assert!(saved.contains("preset = \"catppuccin\""), "{saved}");
+    smoke.tmux.send_keys(&["C-d"]);
+    smoke.relaunch();
+    smoke.wait_resting_strip();
+    assert!(no_picker(&smoke.tmux.capture()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_run_palette_killed_without_a_choice_is_not_asked_again() {
+    let Some((mut smoke, _serial)) = launch(first_run(), Script::default()).await else {
+        return;
+    };
+    let before = std::fs::read_to_string(&smoke.cfg_path).unwrap();
+    smoke.relaunch();
+    smoke.wait_resting_strip();
+    assert!(no_picker(&smoke.tmux.capture()));
+    assert_eq!(std::fs::read_to_string(&smoke.cfg_path).unwrap(), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_c_on_the_first_run_palette_quits_without_writing() {
+    let Some((mut smoke, _serial)) = launch(first_run(), Script::default()).await else {
+        return;
+    };
+    let before = std::fs::read_to_string(&smoke.cfg_path).unwrap();
+    smoke.tmux.send_keys(&["C-c"]);
+    smoke.wait_exit();
+    assert_eq!(std::fs::read_to_string(&smoke.cfg_path).unwrap(), before);
+    assert!(!before.contains("preset"), "{before}");
+    smoke.relaunch();
+    smoke.wait_resting_strip();
+    assert!(no_picker(&smoke.tmux.capture()));
 }
