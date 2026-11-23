@@ -430,16 +430,13 @@ fn the_e2e_harness_uses_the_real_dispatch() {
 }
 
 fn draw_buffer(state: &State) -> ratatui::buffer::Buffer {
+    draw_buffer_in(state, &Palette::default())
+}
+
+fn draw_buffer_in(state: &State, palette: &Palette) -> ratatui::buffer::Buffer {
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal
-        .draw(|f| {
-            view(
-                state,
-                &Palette::default(),
-                &mut TranscriptCache::default(),
-                f,
-            )
-        })
+        .draw(|f| view(state, palette, &mut TranscriptCache::default(), f))
         .unwrap();
     terminal.backend().buffer().clone()
 }
@@ -1070,4 +1067,124 @@ async fn a_loaded_session_replays_its_shell_note_as_a_shell_card() {
     );
     let rows = draw(&state);
     assert!(rows.iter().any(|r| r.contains("! git status")), "{rows:?}");
+}
+
+async fn run_theme_cmds(
+    cmds: Vec<Cmd>,
+    client: &mut Client,
+    state: &mut State,
+    theme: &hotl_theme::ThemeConfig,
+    config_path: &std::path::Path,
+    palette: &mut Palette,
+) {
+    for cmd in cmds {
+        let rest = exec_wire_cmd(
+            cmd,
+            client,
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+        )
+        .await
+        .expect("the duplex write succeeded");
+        match rest {
+            Some(Cmd::PreviewTheme(name)) => {
+                *palette =
+                    crate::theme_switch::apply(state, theme, Some(config_path), &name, false);
+            }
+            Some(Cmd::SetTheme(name)) => {
+                *palette = crate::theme_switch::apply(state, theme, Some(config_path), &name, true);
+            }
+            other => panic!("not a theme cmd: {other:?}"),
+        }
+    }
+}
+
+fn type_line(state: &mut State, text: &str) -> Vec<Cmd> {
+    for c in text.chars() {
+        press(state, KeyCode::Char(c));
+    }
+    press(state, KeyCode::Enter)
+}
+
+fn foregrounds(buffer: &ratatui::buffer::Buffer) -> Vec<ratatui::style::Color> {
+    let area = buffer.area;
+    (0..area.height)
+        .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+        .map(|p| buffer.cell(p).unwrap().fg)
+        .collect()
+}
+
+#[tokio::test]
+async fn slash_theme_picks_saves_and_repaints() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, "# keep me\n[settings]\nmeasure = 100\n").unwrap();
+    let theme = hotl_theme::ThemeConfig::default();
+    let (mut client, _reader) = start().await;
+    let mut state = State::new(false, "m".into());
+    let mut palette = Palette::default();
+    let before = draw_buffer_in(&state, &palette);
+
+    assert!(type_line(&mut state, "/theme").is_empty());
+    let rows = draw(&state);
+    assert!(rows.iter().any(|r| r.contains("gruvbox")), "{rows:?}");
+
+    for code in [KeyCode::Down, KeyCode::Down, KeyCode::Enter] {
+        let cmds = press(&mut state, code);
+        run_theme_cmds(
+            cmds,
+            &mut client,
+            &mut state,
+            &theme,
+            &config_path,
+            &mut palette,
+        )
+        .await;
+    }
+    assert!(state.theme_picker.is_none());
+    assert_eq!(state.theme_name, "gruvbox");
+    let gruvbox = Palette::from(&hotl_theme::preset("gruvbox").unwrap());
+    assert_eq!(palette, gruvbox);
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(text.contains("preset = \"gruvbox\""), "{text}");
+    assert!(
+        text.contains("# keep me") && text.contains("measure = 100"),
+        "{text}"
+    );
+
+    let after = draw_buffer_in(&state, &palette);
+    assert_ne!(before, after, "the frame repaints in the new palette");
+    let old = foregrounds(&before);
+    let new = foregrounds(&after);
+    assert!(new.contains(&gruvbox.muted), "a cell wears gruvbox");
+    assert!(
+        !new.contains(&Palette::default().muted),
+        "no cell keeps the old palette's muted"
+    );
+    assert!(old.contains(&Palette::default().muted));
+}
+
+#[tokio::test]
+async fn slash_theme_with_an_unknown_name_lists_the_names_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, "# keep me\n").unwrap();
+    let (_client, _reader) = start().await;
+    let mut state = State::new(false, "m".into());
+
+    let cmds = type_line(&mut state, "/theme bogus");
+    assert!(cmds.is_empty(), "{cmds:?}");
+    assert!(state.theme_picker.is_none());
+    assert_eq!(state.theme_name, "tokyo-night");
+    let rows = draw(&state).join("\n");
+    for name in hotl_theme::PRESETS {
+        assert!(rows.contains(name), "{name} listed: {rows}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        "# keep me\n"
+    );
 }

@@ -37,6 +37,12 @@ mod run_status;
 #[path = "../../src/schema_cli.rs"]
 #[allow(dead_code)]
 mod schema_cli;
+#[path = "../../src/settings_write.rs"]
+#[allow(dead_code)]
+mod settings_write;
+#[path = "../../src/theme_switch.rs"]
+#[allow(dead_code)]
+mod theme_switch;
 #[path = "../../src/wire.rs"]
 #[allow(dead_code)]
 mod wire;
