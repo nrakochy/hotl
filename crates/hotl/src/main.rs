@@ -44,7 +44,6 @@ mod plugins_cli;
 mod run_status;
 mod schema_cli;
 mod session_server;
-#[cfg_attr(not(test), allow(dead_code))]
 mod settings_write;
 mod setup;
 mod shell_hooks;
@@ -57,6 +56,7 @@ mod structured;
 mod term;
 #[cfg(test)]
 mod testsupport;
+mod theme_switch;
 mod tui;
 mod update;
 mod watch;

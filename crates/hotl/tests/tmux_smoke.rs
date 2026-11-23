@@ -123,7 +123,7 @@ async fn launch(
     std::fs::write(
         cfg_dir.join("hotl/config.toml"),
         format!(
-            "[provider]\nmodel = \"claude-smoke\"\nbase_url = \"{}\"\n\n[permissions]\nmode = \"{}\"\n\n[behavior]\nsandbox = false\nvim_mode = {}\nmouse = false\n{}\n",
+            "[settings.theme]\npreset = \"tokyo-night\"\n\n[provider]\nmodel = \"claude-smoke\"\nbase_url = \"{}\"\n\n[permissions]\nmode = \"{}\"\n\n[behavior]\nsandbox = false\nvim_mode = {}\nmouse = false\n{}\n",
             fake.base_url(),
             cfg.mode,
             cfg.vim_mode,

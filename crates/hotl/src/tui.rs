@@ -56,6 +56,9 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     for w in &settings.warnings {
         eprintln!("hotl: {w}");
     }
+    let config_path = watch_types::HotlConfig::path();
+    let first_palette =
+        crate::theme_switch::first_run(config_path.as_deref(), &crate::agent::data_dir());
 
     let suspended = Arc::new(AtomicBool::new(false));
     let mut keys = spawn_key_reader(suspended.clone());
@@ -82,6 +85,14 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     state.density = settings.density;
     state.measure = settings.measure;
     state.editor.load_history(history);
+    state.theme_name = crate::theme_switch::active_name(&settings.theme);
+    if first_palette {
+        state.theme_picker = Some(hotl_tui::app::ThemePicker::open(
+            crate::theme_switch::DEFAULT_PRESET,
+            true,
+        ));
+    }
+    let mut palette = settings.palette;
     let mut cache = TranscriptCache::default();
     let mut ticker = tokio::time::interval(Duration::from_millis(1_000 / hotl_tui::anim::TICK_HZ));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -89,7 +100,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     let opened = loop {
         if let Err(e) = guard
             .terminal
-            .draw(|f| view(&state, &settings.palette, &mut cache, f))
+            .draw(|f| view(&state, &palette, &mut cache, f))
         {
             drop(guard);
             eprintln!("hotl: {e}");
@@ -104,8 +115,35 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
                     } else {
                         terminal_msg(ev, settings.copy_on_select)
                     };
-                    if let Some(msg) = msg {
-                        let _ = hotl_tui::app::pre_open_input(&mut state, msg);
+                    let cmds = msg
+                        .map(|msg| hotl_tui::app::pre_open_input(&mut state, msg))
+                        .unwrap_or_default();
+                    for cmd in cmds {
+                        match cmd {
+                            Cmd::PreviewTheme(name) => {
+                                palette = crate::theme_switch::apply(
+                                    &mut state,
+                                    &settings.theme,
+                                    config_path.as_deref(),
+                                    &name,
+                                    false,
+                                );
+                            }
+                            Cmd::SetTheme(name) => {
+                                palette = crate::theme_switch::apply(
+                                    &mut state,
+                                    &settings.theme,
+                                    config_path.as_deref(),
+                                    &name,
+                                    true,
+                                );
+                            }
+                            Cmd::Quit => {
+                                drop(guard);
+                                return 0;
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 None => return 1,
@@ -130,7 +168,9 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         keys,
         &suspended,
         state,
-        settings.palette,
+        palette,
+        settings.theme,
+        config_path,
         history_store,
         settings.copy_on_select,
         cache,
@@ -349,6 +389,7 @@ fn open_extras(
 /// prompts submitted since.
 struct ClientSettings {
     palette: Palette,
+    theme: hotl_theme::ThemeConfig,
     density: hotl_theme::Density,
     /// Prose wrap width (`[settings] measure`); `usize::MAX` = full width.
     measure: usize,
@@ -375,6 +416,7 @@ fn client_settings() -> ClientSettings {
     );
     ClientSettings {
         palette: Palette::from(&watch_cfg.settings.theme.resolve().0),
+        theme: watch_cfg.settings.theme.clone(),
         density,
         measure: watch_cfg.settings.measure(),
         vim_mode: cfg.behavior.vim_mode(),
@@ -608,6 +650,8 @@ async fn run_loop(
     suspended: &AtomicBool,
     mut state: State,
     mut palette: Palette,
+    mut theme: hotl_theme::ThemeConfig,
+    config_path: Option<PathBuf>,
     mut history: crate::history::History,
     mut copy_on_select: bool,
     // Carried over from the pre-open loop (0033 Task 8b) so the transition
@@ -736,6 +780,8 @@ async fn run_loop(
                 Cmd::ReloadSettings => {
                     let s = client_settings();
                     palette = s.palette;
+                    theme = s.theme;
+                    state.theme_name = crate::theme_switch::active_name(&theme);
                     guard.set_mouse(s.mouse);
                     copy_on_select = s.copy_on_select;
                     queue.extend(update(
@@ -747,6 +793,26 @@ async fn run_loop(
                             warnings: s.warnings,
                         },
                     ));
+                    needs_draw = true;
+                }
+                Cmd::PreviewTheme(name) => {
+                    palette = crate::theme_switch::apply(
+                        &mut state,
+                        &theme,
+                        config_path.as_deref(),
+                        &name,
+                        false,
+                    );
+                    needs_draw = true;
+                }
+                Cmd::SetTheme(name) => {
+                    palette = crate::theme_switch::apply(
+                        &mut state,
+                        &theme,
+                        config_path.as_deref(),
+                        &name,
+                        true,
+                    );
                     needs_draw = true;
                 }
                 Cmd::Resume(arg) => {
@@ -1233,6 +1299,7 @@ fn state_for_resumed_session(old: State) -> State {
     state.editor = old.editor;
     state.density = old.density;
     state.measure = old.measure;
+    state.theme_name = old.theme_name;
     if let Some((text, payload)) = old.held_prompt {
         let dropped = match payload.images.len() {
             0 => String::new(),
@@ -1955,6 +2022,37 @@ mod tests {
             ),
             "{cmds:?}"
         );
+    }
+
+    #[test]
+    fn seed_state_keeps_the_first_run_picker_and_a_pre_open_notice() {
+        let mut state = hotl_tui::app::State::new(false, "m".into());
+        state.theme_picker = Some(hotl_tui::app::ThemePicker::open("tokyo-night", true));
+        super::push_notice(&mut state, "theme: nord applied, not saved".into());
+        super::seed_state(
+            &mut state,
+            "m".into(),
+            super::Opened::default(),
+            Some("hint".into()),
+        );
+        assert_eq!(
+            state.theme_picker,
+            Some(hotl_tui::app::ThemePicker::open("tokyo-night", true))
+        );
+        assert!(matches!(
+            state.transcript.first(),
+            Some(hotl_tui::app::TranscriptItem::Notice { text }) if text.contains("not saved")
+        ));
+        assert!(super::startup_cmds(&mut state)
+            .iter()
+            .all(|c| !matches!(c, hotl_tui::app::Cmd::SendPrompt(_))));
+    }
+
+    #[test]
+    fn a_resumed_session_keeps_the_active_theme_name() {
+        let mut old = hotl_tui::app::State::new(false, "m".into());
+        old.theme_name = "dracula".into();
+        assert_eq!(super::state_for_resumed_session(old).theme_name, "dracula");
     }
 
     #[test]
