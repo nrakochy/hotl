@@ -18,8 +18,17 @@ semver promise of their own.
   `[could not start]`, `[timed out after 120s]` or `[cancelled]`.
 - `/plan <task>` lines are kept in your prompt history, `/plan` also accepts
   `yes`/`no`/`enable`/`disable`, and the task is sent with its spacing intact.
-- In `hotl attach`, a `!` command runs alongside the session, so its output
-  keeps printing, and a `!` line no longer answers a waiting approval prompt.
+- In `hotl attach`, the session's output keeps printing while a `!` command
+  runs; its result prints when it finishes. A `!` line no longer answers a
+  waiting approval prompt.
+- In `hotl attach`, a line you type while a `!` command runs waits for it and
+  is sent right after its output, so the model sees the output first. Typing
+  a second line replaces the first, and attach says so.
+- In `hotl attach`, pressing Ctrl-D while a `!` command runs now waits for the
+  command, prints its result and shares it with the model before detaching.
+- `_hotl/session/shell_note` takes an optional `end` (how the command ended:
+  `exited`, `signaled`, `timed_out`, `cancelled` or `failed`) and replies
+  `{"ok": true}`. Extension clients see both.
 
 ### Fixed
 
@@ -28,6 +37,11 @@ semver promise of their own.
   dropping them. (The TUI resumes sessions without replaying history, as
   before.)
 - If hotl can't hand a `!` result to the model, the TUI now says so.
+- Switching sessions with `/resume` while a message waits on a `!` command no
+  longer drops it: it goes back into the editor (or, if you had started typing
+  something else, a notice shows the message that was not sent).
+- A `!` command whose output passes the size limit always says it was cut,
+  even when stripping colour codes leaves the rest short.
 - A message you type mid-turn can no longer be swallowed into a background
   agent's notice.
 
