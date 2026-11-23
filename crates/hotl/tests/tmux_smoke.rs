@@ -296,11 +296,8 @@ impl Smoke {
             .expect("tmux display-message");
         let pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
         assert!(pid.parse::<u32>().is_ok(), "pane pid: {pid:?}");
-        let status = std::process::Command::new("kill")
-            .args(["-9", &pid])
-            .status()
-            .expect("kill");
-        assert!(status.success(), "kill -9 {pid}");
+        let rc = unsafe { libc::kill(pid.parse::<i32>().unwrap(), libc::SIGKILL) };
+        assert_eq!(rc, 0, "kill -9 {pid}");
         self.wait_exit();
     }
 
