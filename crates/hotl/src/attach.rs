@@ -168,6 +168,7 @@ async fn connect(id: &str) -> i32 {
     });
 
     let mut state = Attached::default();
+    let (shell_tx, mut shell_rx) = mpsc::unbounded_channel::<ShellDone>();
     loop {
         tokio::select! {
             line = server.next_line() => match line {
@@ -180,8 +181,13 @@ async fn connect(id: &str) -> i32 {
             },
             line = stdin_rx.recv() => {
                 let Some(line) = line else { return detach(&mut client).await };
-                if on_input(line.trim(), &mut client, &mut state).await {
+                if on_input(line.trim(), &mut client, &mut state, &shell_tx).await {
                     return 0;
+                }
+            }
+            done = shell_rx.recv() => {
+                if let Some(done) = done {
+                    on_shell_done(done, &mut client, &mut state).await;
                 }
             }
         }
@@ -193,6 +199,41 @@ struct Attached {
     pending_ask: Option<Parked>,
     turn_running: bool,
     prompts: Vec<u64>,
+    shell_running: bool,
+}
+
+type ShellDone = (String, String, Value);
+
+static MID_LINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn set_mid_line(on: bool) {
+    MID_LINE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn fresh_line() {
+    if MID_LINE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        println!();
+    }
+}
+
+fn shell_text(command: &str, shown: &str, mid_line: bool) -> String {
+    let mut out = String::new();
+    if mid_line {
+        out.push('\n');
+    }
+    out.push_str(&format!("$ {command}\n"));
+    if !shown.is_empty() {
+        out.push_str(shown);
+        out.push('\n');
+    }
+    out
+}
+
+fn spawn_bang(command: String, cwd: std::path::PathBuf, tx: mpsc::UnboundedSender<ShellDone>) {
+    tokio::spawn(async move {
+        let (shown, params) = bang(&command, &cwd).await;
+        let _ = tx.send((command, shown, params));
+    });
 }
 
 impl Attached {
@@ -241,6 +282,7 @@ struct Parked {
     /// `Some(host)` for an egress ask, `None` for a tool ask. The host rides
     /// along so the paste-able config line can name it after a `y`.
     egress: Option<String>,
+    prompt: String,
 }
 
 /// Classify a typed line. A parked ask consumes the next line as its answer —
@@ -252,18 +294,18 @@ fn route(text: &str, turn_running: bool, pending_ask: Option<&Parked>) -> Action
     if text.is_empty() {
         return Action::Nothing;
     }
-    if let Some(parked) = pending_ask {
-        return Action::AnswerAsk {
-            parked: parked.clone(),
-            allow: matches!(text, "y" | "Y" | "yes"),
-        };
-    }
     if let Some(rest) = text.trim_start().strip_prefix('!') {
         let command = rest.trim();
         if command.is_empty() {
             return Action::ShellUsage;
         }
         return Action::Shell(command.to_string());
+    }
+    if let Some(parked) = pending_ask {
+        return Action::AnswerAsk {
+            parked: parked.clone(),
+            allow: matches!(text, "y" | "Y" | "yes"),
+        };
     }
     if turn_running {
         Action::Steer(text.to_string())
@@ -305,7 +347,12 @@ async fn bang(command: &str, cwd: &std::path::Path) -> (String, Value) {
     (shown, params)
 }
 
-async fn on_input(text: &str, client: &mut Client, state: &mut Attached) -> bool {
+async fn on_input(
+    text: &str,
+    client: &mut Client,
+    state: &mut Attached,
+    shell_tx: &mpsc::UnboundedSender<ShellDone>,
+) -> bool {
     match route(text, state.turn_running, state.pending_ask.as_ref()) {
         Action::Stop => {
             let _ = client.request("_hotl/session/stop", json!({})).await;
@@ -318,19 +365,19 @@ async fn on_input(text: &str, client: &mut Client, state: &mut Attached) -> bool
         }
         Action::Shell(command) => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let (shown, params) = bang(&command, &cwd).await;
-            println!("$ {command}");
-            if !shown.is_empty() {
-                println!("{shown}");
+            if state.shell_running {
+                eprintln!("a ! command is already running");
+                return false;
             }
-            let _ = client.request("_hotl/session/shell_note", params).await;
-            if !state.turn_running {
-                show_prompt();
-            }
+            state.shell_running = true;
+            fresh_line();
+            println!("[running !{command}…]");
+            spawn_bang(command, cwd, shell_tx.clone());
             false
         }
         Action::AnswerAsk { parked, allow } => {
             state.pending_ask = None;
+            set_mid_line(false);
             let _ = match &parked.egress {
                 Some(_) => client.reply_egress(parked.id, allow).await,
                 None => client.reply_permission(parked.id, allow, false, None).await,
@@ -363,6 +410,22 @@ async fn on_input(text: &str, client: &mut Client, state: &mut Attached) -> bool
             }
             false
         }
+    }
+}
+
+async fn on_shell_done(done: ShellDone, client: &mut Client, state: &mut Attached) {
+    let (command, shown, params) = done;
+    let mid = MID_LINE.swap(false, std::sync::atomic::Ordering::Relaxed);
+    print!("{}", shell_text(&command, &shown, mid));
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let _ = client.request("_hotl/session/shell_note", params).await;
+    state.shell_running = false;
+    if let Some(parked) = &state.pending_ask {
+        eprint!("{}", parked.prompt);
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        set_mid_line(true);
+    } else if !state.turn_running {
+        show_prompt();
     }
 }
 
@@ -407,11 +470,14 @@ fn render(
             if let Some(why) = protected_why {
                 eprintln!("⚠ PROTECTED PATH — {why}");
             }
-            eprint!("allow {summary}? [y/N] ");
+            let prompt = format!("allow {summary}? [y/N] ");
+            eprint!("{prompt}");
             let _ = std::io::Write::flush(&mut std::io::stderr());
+            set_mid_line(true);
             *pending_ask = Some(Parked {
                 id: req_id,
                 egress: None,
+                prompt,
             });
             Some(true)
         }
@@ -421,11 +487,14 @@ fn render(
         ServerMsg::EgressRequest { req_id, host } => {
             eprintln!("\nnetwork: reaching \"{host}\" was not in the approved command");
             eprintln!("this host is not in [network].allow");
-            eprint!("allow for this session? [y/N] ");
+            let prompt = "allow for this session? [y/N] ".to_string();
+            eprint!("{prompt}");
             let _ = std::io::Write::flush(&mut std::io::stderr());
+            set_mid_line(true);
             *pending_ask = Some(Parked {
                 id: req_id,
                 egress: Some(host),
+                prompt,
             });
             Some(true)
         }
@@ -623,15 +692,17 @@ fn update_line(update: &Value) -> Option<String> {
 
 fn render_update(update: &Value) {
     if update.get("type").and_then(Value::as_str) == Some("text_delta") {
-        print!(
-            "{}",
-            update.get("text").and_then(Value::as_str).unwrap_or("")
-        );
+        let text = update.get("text").and_then(Value::as_str).unwrap_or("");
+        print!("{text}");
         let _ = std::io::Write::flush(&mut std::io::stdout());
+        if !text.is_empty() {
+            set_mid_line(!text.ends_with('\n'));
+        }
         return;
     }
     if let Some(line) = update_line(update) {
         eprintln!("{line}");
+        set_mid_line(false);
     }
 }
 
@@ -851,6 +922,7 @@ mod tests {
         let ask = Parked {
             id: 4,
             egress: None,
+            prompt: String::new(),
         };
         assert_eq!(route("/stop", false, None), Action::Stop);
         assert_eq!(
@@ -872,6 +944,7 @@ mod tests {
         let egress = Parked {
             id: 5,
             egress: Some("registry.npmjs.org".into()),
+            prompt: String::new(),
         };
         assert_eq!(
             route("y", false, Some(&egress)),
@@ -897,6 +970,52 @@ mod tests {
         );
         assert_eq!(route("!", false, None), Action::ShellUsage);
         assert_eq!(route("!   ", true, None), Action::ShellUsage);
+    }
+
+    #[test]
+    fn a_bang_line_with_an_ask_parked_leaves_the_ask_parked() {
+        let ask = Parked {
+            id: 4,
+            egress: None,
+            prompt: "allow x? [y/N] ".into(),
+        };
+        assert_eq!(route("!ls", false, Some(&ask)), Action::Shell("ls".into()));
+        assert_eq!(route("!", true, Some(&ask)), Action::ShellUsage);
+        assert!(matches!(
+            route("y", false, Some(&ask)),
+            Action::AnswerAsk { allow: true, .. }
+        ));
+    }
+
+    #[test]
+    fn a_shell_result_starts_on_a_fresh_line() {
+        assert_eq!(shell_text("ls", "a\nb", false), "$ ls\na\nb\n");
+        assert_eq!(shell_text("true", "", true), "\n$ true\n");
+    }
+
+    #[tokio::test]
+    async fn session_output_prints_while_a_bang_runs() {
+        let (shell_tx, mut shell_rx) = mpsc::unbounded_channel::<ShellDone>();
+        let (server_tx, mut server_rx) = mpsc::unbounded_channel::<Value>();
+        spawn_bang(
+            "sleep 1; echo late".into(),
+            std::path::PathBuf::from("."),
+            shell_tx,
+        );
+        server_tx
+            .send(json!({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {"sessionUpdate": "usage_update"}}}))
+            .unwrap();
+        let mut order = Vec::new();
+        for _ in 0..2 {
+            tokio::select! {
+                Some(_) = server_rx.recv() => order.push("server"),
+                Some(done) = shell_rx.recv() => {
+                    assert!(done.1.contains("late"), "{}", done.1);
+                    order.push("shell");
+                }
+            }
+        }
+        assert_eq!(order, vec!["server", "shell"]);
     }
 
     #[test]
