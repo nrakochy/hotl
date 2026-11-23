@@ -600,6 +600,7 @@ pub struct State {
     pub session_root: Option<std::path::PathBuf>,
     pub shell_running: Option<String>,
     pub held_prompt: Option<(String, paste::PromptPayload)>,
+    pub held_count: u64,
     pub session_color: Option<String>,
     /// A `/btw` in flight (0071 T5): the question and ticks since it was
     /// sent, for the strip's `aside · Ns` segment. `None` = none pending.
@@ -798,6 +799,7 @@ impl State {
             session_root: None,
             shell_running: None,
             held_prompt: None,
+            held_count: 0,
             session_color: None,
             aside_pending: None,
             mode: "ask".into(),
@@ -2860,6 +2862,10 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             KeyCode::Char('a') => {
                 settle_plan(state);
                 notice(state, "plan approved — leaving plan mode".into());
+                let approval = crate::paste::PromptPayload::text_only(PLAN_APPROVED_PROMPT.into());
+                if hold_prompt(state, PLAN_APPROVED_PROMPT, &approval) {
+                    return vec![Cmd::SetPlan(false)];
+                }
                 return vec![
                     Cmd::SetPlan(false),
                     Cmd::SendPrompt(crate::paste::PromptPayload::text_only(
@@ -2968,13 +2974,15 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             state
                 .editor
                 .set_live_tokens(paste::live_tokens(&state.attachments));
+            let held_before = state.held_count;
             let cmds = submit(state, text.clone(), payload);
+            let was_held = state.held_count != held_before;
             // Persist only prompt-starting submissions (they emit SendPrompt),
             // and only when the literal text wasn't a slash command — a skill
             // invocation desugars to a prompt but shouldn't leave its `/name`
             // (or the expanded template) on disk. In-session recall still walks
             // everything via the editor's own ring.
-            let starts_turn = cmds.iter().any(|c| matches!(c, Cmd::SendPrompt(_)));
+            let starts_turn = was_held || cmds.iter().any(|c| matches!(c, Cmd::SendPrompt(_)));
             let runs_shell = cmds.iter().any(|c| matches!(c, Cmd::RunShell { .. }));
             let plan_task = text
                 .trim_start()
@@ -3302,22 +3310,41 @@ fn shell_done(state: &mut State, output: String, end: ShellEnd) -> Vec<Cmd> {
     cmds
 }
 
+fn hold_prompt(state: &mut State, text: &str, payload: &paste::PromptPayload) -> bool {
+    let Some(command) = state.shell_running.clone() else {
+        return false;
+    };
+    let preview: String = text
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(40)
+        .collect();
+    let replacing = state.held_prompt.is_some();
+    let line = if replacing {
+        format!(
+            "waiting for !{command} — \"{preview}\" goes next (replaced the earlier held message)"
+        )
+    } else {
+        format!("waiting for !{command} — \"{preview}\" goes next")
+    };
+    state.held_prompt = Some((text.to_string(), payload.clone()));
+    state.held_count += 1;
+    let slot = state
+        .transcript
+        .iter_mut()
+        .rev()
+        .find(|i| matches!(i, TranscriptItem::Notice { text } if text.as_str().starts_with("waiting for !")));
+    match slot {
+        Some(item) if replacing => *item = TranscriptItem::Notice { text: line.into() },
+        _ => notice(state, line),
+    }
+    true
+}
+
 fn send_text(state: &mut State, text: String, payload: paste::PromptPayload) -> Vec<Cmd> {
-    if let Some(command) = state.shell_running.clone() {
-        let preview: String = text
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .chars()
-            .take(40)
-            .collect();
-        let line = if state.held_prompt.is_some() {
-            format!("replaced the held message — still waiting for !{command}, then \"{preview}\" goes next")
-        } else {
-            format!("waiting for !{command} — \"{preview}\" goes next")
-        };
-        state.held_prompt = Some((text, payload));
-        notice(state, line);
+    if hold_prompt(state, &text, &payload) {
         return Vec::new();
     }
     // Anything the human sends answers a live plan card — usually a revision.
@@ -3608,7 +3635,14 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                     // admitted. Not via `submit`: a condition may begin with
                     // `/` (a path) and must never read as a slash command.
                     // Mid-turn: set only; the gate fires when this turn ends.
-                    if state.phase == Phase::Idle {
+                    let goal_payload = paste::PromptPayload::text_only(goal.clone());
+                    if state.phase == Phase::Idle && hold_prompt(state, &goal, &goal_payload) {
+                        notice(
+                            state,
+                            format!("◎ goal set — it starts after the ! command: {goal}"),
+                        );
+                        vec![Cmd::SetGoal(Some(goal))]
+                    } else if state.phase == Phase::Idle {
                         notice(state, format!("◎ goal set — working toward it now: {goal}"));
                         state.transcript.push(TranscriptItem::User {
                             text: goal.clone().into(),
@@ -10464,6 +10498,9 @@ mod tests {
         type_and_submit(&mut s, "first");
         type_and_submit(&mut s, "second");
         assert!(last_notice(&s).contains("replaced"), "{}", last_notice(&s));
+        assert!(!last_notice(&s).contains("first\""), "{}", last_notice(&s));
+        let waiting = s.transcript.iter().filter(|i| matches!(i, TranscriptItem::Notice { text } if text.as_str().starts_with("waiting for !"))).count();
+        assert_eq!(waiting, 1);
         let cmds = update(&mut s, done("x", ShellEnd::Exited(0)));
         assert_eq!(sent_texts(&cmds), vec!["second".to_string()]);
     }
@@ -10493,6 +10530,106 @@ mod tests {
         assert!(sent_texts(&cmds).is_empty());
         let cmds = update(&mut s, done("x", ShellEnd::Exited(0)));
         assert_eq!(sent_texts(&cmds), vec!["write it".to_string()]);
+    }
+
+    fn history_lines(cmds: &[Cmd]) -> Vec<String> {
+        cmds.iter()
+            .filter_map(|c| match c {
+                Cmd::AppendHistory(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_held_prompt_reaches_history_when_typed() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "!sleep 5");
+        let cmds = type_and_submit(&mut s, "remember me");
+        assert_eq!(history_lines(&cmds), vec!["remember me".to_string()]);
+        let cmds = type_and_submit(&mut s, "/plan sketch it");
+        assert_eq!(history_lines(&cmds).len(), 1, "{cmds:?}");
+        let cmds = update(&mut s, done("x", ShellEnd::Exited(0)));
+        assert!(history_lines(&cmds).is_empty(), "{cmds:?}");
+    }
+
+    #[test]
+    fn a_slash_command_during_a_bang_with_a_held_prompt_is_not_history() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "!sleep 5");
+        type_and_submit(&mut s, "held");
+        let cmds = type_and_submit(&mut s, "/rename x");
+        assert!(history_lines(&cmds).is_empty(), "{cmds:?}");
+    }
+
+    #[test]
+    fn plan_approval_waits_for_a_running_bang() {
+        let mut s = State::test_default();
+        s.transcript.push(TranscriptItem::Plan(PresentedPlan {
+            summary: "do it".into(),
+            steps: Vec::new(),
+            path: None,
+            live: true,
+        }));
+        type_and_submit(&mut s, "!sleep 5");
+        let cmds = press(&mut s, KeyCode::Char('a'));
+        assert!(matches!(&cmds[..], [Cmd::SetPlan(false)]), "{cmds:?}");
+        let cmds = update(&mut s, done("x", ShellEnd::Exited(0)));
+        assert!(
+            matches!(&cmds[..], [Cmd::ShellNote { .. }, Cmd::SendPrompt(p), ..] if p.text == PLAN_APPROVED_PROMPT),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn an_idle_goal_waits_for_a_running_bang() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "!sleep 5");
+        let cmds = type_and_submit(&mut s, "/goal ship it");
+        assert!(
+            matches!(&cmds[..], [Cmd::SetGoal(Some(g))] if g == "ship it"),
+            "{cmds:?}"
+        );
+        assert_eq!(s.phase, Phase::Idle);
+        let cmds = update(&mut s, done("x", ShellEnd::Exited(0)));
+        assert!(
+            matches!(&cmds[..], [Cmd::ShellNote { .. }, Cmd::SendPrompt(p), ..] if p.text == "ship it"),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_held_prompt_follows_a_timed_out_note() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "!sleep 500");
+        type_and_submit(&mut s, "and now");
+        let cmds = update(&mut s, done("", ShellEnd::TimedOut));
+        assert!(
+            matches!(&cmds[..], [Cmd::ShellNote { end: "timed_out", .. }, Cmd::SendPrompt(p), ..] if p.text == "and now"),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_held_prompt_keeps_its_image_on_release() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "!sleep 5");
+        let image = paste::ImageAttachment {
+            marker: "[Image #1]".into(),
+            path: "/tmp/a.png".into(),
+            media_type: "image/png".into(),
+            data: None,
+        };
+        let payload = paste::PromptPayload {
+            text: "look [Image #1]".into(),
+            images: vec![image.clone()],
+        };
+        assert!(submit(&mut s, "look [Image #1]".into(), payload).is_empty());
+        let cmds = update(&mut s, done("x", ShellEnd::Exited(0)));
+        let Some(Cmd::SendPrompt(p)) = cmds.iter().find(|c| matches!(c, Cmd::SendPrompt(_))) else {
+            panic!("{cmds:?}");
+        };
+        assert_eq!(p.images, vec![image]);
     }
 
     #[test]
