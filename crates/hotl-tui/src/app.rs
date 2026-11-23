@@ -3252,6 +3252,8 @@ fn replayed_shell_card(v: &Value) -> Option<TranscriptItem> {
         (Some("timed_out"), _) => Some(ShellEnd::TimedOut),
         (Some("failed"), _) => Some(ShellEnd::Failed),
         (Some("cancelled"), _) => Some(ShellEnd::Cancelled),
+        #[cfg(unix)]
+        (Some("signaled"), _) => signal_from_label(&output),
         _ => None,
     };
     if let Some(label) = end.and_then(ShellEnd::shared_label) {
@@ -3267,6 +3269,14 @@ fn replayed_shell_card(v: &Value) -> Option<TranscriptItem> {
         end,
         running: false,
     })
+}
+
+#[cfg(unix)]
+fn signal_from_label(output: &str) -> Option<ShellEnd> {
+    let last = output.rsplit('\n').next()?;
+    (1..=64)
+        .map(ShellEnd::Signaled)
+        .find(|end| end.label().as_deref() == Some(last))
 }
 
 fn shell_done(state: &mut State, output: String, end: ShellEnd) -> Vec<Cmd> {
@@ -10820,6 +10830,41 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_replayed_signal_death_is_a_signaled_card_with_its_label_once() {
+        let mut s = State::test_default();
+        let card = replayed(
+            &mut s,
+            json!({"type": "shell_replay", "command": "x", "output": "partial\n[killed by SIGTERM]", "exit_code": null, "end": "signaled"}),
+        );
+        assert_eq!(
+            card,
+            TranscriptItem::Shell {
+                command: "x".into(),
+                output: "partial".into(),
+                end: Some(ShellEnd::Signaled(15)),
+                running: false,
+            }
+        );
+        let card = replayed(
+            &mut s,
+            json!({"type": "shell_replay", "command": "x", "output": "[killed by SIGTERM]", "exit_code": null, "end": "signaled"}),
+        );
+        assert!(matches!(
+            card,
+            TranscriptItem::Shell { end: Some(ShellEnd::Signaled(15)), ref output, .. } if output.is_empty()
+        ));
+        let card = replayed(
+            &mut s,
+            json!({"type": "shell_replay", "command": "x", "output": "no label here", "exit_code": null, "end": "signaled"}),
+        );
+        assert!(matches!(
+            card,
+            TranscriptItem::Shell { end: None, ref output, .. } if output == "no label here"
+        ));
+    }
+
     #[test]
     fn a_replayed_shell_note_shows_its_end_label_once() {
         let mut s = State::test_default();
@@ -10833,19 +10878,6 @@ mod tests {
                 command: "sleep 999".into(),
                 output: "partial".into(),
                 end: Some(ShellEnd::TimedOut),
-                running: false,
-            }
-        );
-        let card = replayed(
-            &mut s,
-            json!({"type": "shell_replay", "command": "x", "output": "[killed by SIGTERM]", "exit_code": null, "end": "signaled"}),
-        );
-        assert_eq!(
-            card,
-            TranscriptItem::Shell {
-                command: "x".into(),
-                output: "[killed by SIGTERM]".into(),
-                end: None,
                 running: false,
             }
         );
