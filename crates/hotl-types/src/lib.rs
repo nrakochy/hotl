@@ -50,6 +50,7 @@ pub enum SyntheticReason {
     /// A background job ended (0064 D3): exit status, wall time, the command
     /// and the log's tail, delivered through the steer inbox.
     BackgroundJob,
+    ShellCommand,
     #[serde(other)]
     Unknown,
 }

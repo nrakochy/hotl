@@ -41,6 +41,7 @@ mod recall;
 mod rename;
 mod set_mode;
 mod set_model;
+mod shell_note;
 mod skill_hints;
 mod speculation;
 mod steer_order;

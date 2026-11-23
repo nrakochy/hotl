@@ -78,6 +78,7 @@ fn label(reason: &SyntheticReason) -> &'static str {
         SyntheticReason::ProjectInstructions => "project instructions",
         SyntheticReason::SystemReminder => "system reminder",
         SyntheticReason::Steer => "steer",
+        SyntheticReason::ShellCommand => "shell command",
         SyntheticReason::CompactionSummary => "compaction summary",
         SyntheticReason::SubagentResult => "sub-agent result",
         SyntheticReason::DoomLoopNudge => "doom-loop nudge",

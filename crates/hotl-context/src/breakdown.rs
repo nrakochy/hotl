@@ -50,7 +50,9 @@ pub fn classify(item: &Item) -> ContextKind {
         // An item kind this binary does not know: counted, never dropped.
         Item::Unknown => ContextKind::HarnessInjections,
         Item::User { synthetic, .. } => match synthetic {
-            None | Some(SyntheticReason::Steer) => ContextKind::Messages,
+            None | Some(SyntheticReason::Steer | SyntheticReason::ShellCommand) => {
+                ContextKind::Messages
+            }
             Some(SyntheticReason::ProjectInstructions | SyntheticReason::SubdirInstructions) => {
                 ContextKind::ProjectInstructions
             }
@@ -164,10 +166,11 @@ mod tests {
             .tokens
     }
 
-    const ALL_REASONS: [SyntheticReason; 17] = [
+    const ALL_REASONS: [SyntheticReason; 18] = [
         SyntheticReason::ProjectInstructions,
         SyntheticReason::SystemReminder,
         SyntheticReason::Steer,
+        SyntheticReason::ShellCommand,
         SyntheticReason::CompactionSummary,
         SyntheticReason::SubagentResult,
         SyntheticReason::DoomLoopNudge,

@@ -476,6 +476,13 @@ pub const DENIAL_SPIRAL_CONSECUTIVE: u32 = 3;
 pub const DENIAL_SPIRAL_TOTAL: u32 = 20;
 
 /// The `[behavior]` key that raises a budget of this kind.
+pub fn shell_note_text(command: &str, output: &str, exit_code: Option<i32>) -> String {
+    let code = exit_code.map_or("none".to_string(), |c| c.to_string());
+    format!(
+        "The user ran this command in their terminal. Its output is context for their next message, not a request.\n<shell-command exit=\"{code}\">\n$ {command}\n{output}\n</shell-command>"
+    )
+}
+
 pub fn budget_key(kind: &str) -> &'static str {
     match kind {
         "cost_usd" => "max_cost_usd",
@@ -1225,6 +1232,9 @@ pub enum SessionCmd {
         text: String,
         images: Vec<hotl_types::UserImage>,
     },
+    ShellNote {
+        text: String,
+    },
     /// A harness notification for the model (0064 D3: a background job
     /// ended; 0072 D3: a background child reported): idle → a tagged turn
     /// starts; running → held like a steer and released at the next
@@ -1690,6 +1700,10 @@ impl SessionHandle {
     /// A steer carrying attached images — same plumbing as [`Self::steer`].
     pub async fn steer_with(&self, text: String, images: Vec<hotl_types::UserImage>) {
         let _ = self.cmd.send(SessionCmd::Steer { text, images }).await;
+    }
+    pub async fn shell_note(&self, command: &str, output: &str, exit_code: Option<i32>) {
+        let text = shell_note_text(command, output, exit_code);
+        let _ = self.cmd.send(SessionCmd::ShellNote { text }).await;
     }
     /// Name the session durably (a `rename` log entry; last one wins).
     pub async fn rename(&self, name: String) {

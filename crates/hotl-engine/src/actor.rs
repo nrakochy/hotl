@@ -1517,6 +1517,23 @@ pub(crate) async fn run(
                 )
                 .await
             }
+            SessionCmd::ShellNote { text } => {
+                admit_steer(
+                    &shared,
+                    &mut log,
+                    &mut head,
+                    &mut pipeline,
+                    &mut held_steers,
+                    running,
+                    HeldSteer {
+                        text,
+                        images: Vec::new(),
+                        synthetic: SyntheticReason::ShellCommand,
+                        key: None,
+                    },
+                )
+                .await
+            }
             SessionCmd::Notify {
                 text,
                 synthetic,
@@ -3341,8 +3358,8 @@ async fn append_steer(
 /// - **mid-batch** — `awaiting_tool_results`: a steer that split an open
 ///   tool batch would strand the results from the calls they answer.
 ///
-/// Returns whether anything was released — at turn end that is what earns a
-/// `Continue` (0064 D3).
+/// Returns whether anything but a shell note was released — at turn end that
+/// is what earns a `Continue` (0064 D3).
 async fn release_steers(
     shared: &SharedDeps,
     log: &mut SessionLog,
@@ -3360,10 +3377,13 @@ async fn release_steers(
     if held.is_empty() || awaiting_tool_results(head.items()) {
         return false;
     }
+    let earns_turn = held
+        .iter()
+        .any(|s| s.synthetic != SyntheticReason::ShellCommand);
     for steer in std::mem::take(held) {
         append_steer(shared, log, head, pipeline, steer).await;
     }
-    true
+    earns_turn
 }
 
 /// The error results a batch nothing will ever answer gets, so the request
