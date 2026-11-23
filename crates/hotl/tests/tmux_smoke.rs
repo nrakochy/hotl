@@ -61,6 +61,7 @@ struct Smoke {
     masks: Masks,
     launch: Launch,
     cfg_path: PathBuf,
+    marker: PathBuf,
 }
 
 impl Drop for Smoke {
@@ -195,6 +196,7 @@ async fn launch(
         masks: masks(),
         launch,
         cfg_path: cfg_dir.join("hotl/config.toml"),
+        marker: data.join("hotl/palette-asked"),
     };
     if cfg.first_run {
         smoke.wait_any_row("the palette screen", "Pick a color palette", s(30));
@@ -277,6 +279,29 @@ impl Smoke {
             },
             s(30),
         );
+    }
+
+    fn sigkill_pane(&self) {
+        let out = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                self.tmux.socket(),
+                "display-message",
+                "-p",
+                "-t",
+                "smoke",
+                "#{pane_pid}",
+            ])
+            .output()
+            .expect("tmux display-message");
+        let pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(pid.parse::<u32>().is_ok(), "pane pid: {pid:?}");
+        let status = std::process::Command::new("kill")
+            .args(["-9", &pid])
+            .status()
+            .expect("kill");
+        assert!(status.success(), "kill -9 {pid}");
+        self.wait_exit();
     }
 
     fn wait_exit(&self) {
@@ -967,6 +992,8 @@ async fn first_run_palette_killed_without_a_choice_is_not_asked_again() {
         return;
     };
     let before = std::fs::read_to_string(&smoke.cfg_path).unwrap();
+    smoke.sigkill_pane();
+    assert!(smoke.marker.exists(), "{:?}", smoke.marker);
     smoke.relaunch();
     smoke.wait_resting_strip();
     assert!(no_picker(&smoke.tmux.capture()));
