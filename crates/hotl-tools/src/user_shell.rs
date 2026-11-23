@@ -1,10 +1,11 @@
 use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
 use crate::builtins::{
-    adopt, clip_output, collect_merged, kill_tree, merged_pipe, new_reaper, BASH_MAX_OUTPUT,
+    adopt, clip_output, collect_merged_into, kill_tree, merged_pipe, new_reaper, BASH_MAX_OUTPUT,
     BASH_OUTPUT_SLACK,
 };
 
@@ -56,27 +57,41 @@ pub async fn run(
     };
     adopt(&reaper, &child);
     drop(cmd);
-    let wait = collect_merged(child, pipe, BASH_MAX_OUTPUT + BASH_OUTPUT_SLACK, None);
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let wait = collect_merged_into(
+        child,
+        pipe,
+        BASH_MAX_OUTPUT + BASH_OUTPUT_SLACK,
+        None,
+        buf.clone(),
+    );
     tokio::pin!(wait);
-    tokio::select! {
-        result = &mut wait => match result {
-            Ok((status, bytes)) => UserShellRun {
-                output: clip_output(&bytes),
+    let (timed_out, cancelled) = tokio::select! {
+        result = &mut wait => return match result {
+            Ok(status) => UserShellRun {
+                output: clip_output(&take(&buf)),
                 exit_code: status.code(),
                 timed_out: false,
                 cancelled: false,
             },
             Err(e) => UserShellRun::failed(format!("Failed waiting on command: {e}.")),
         },
-        _ = tokio::time::sleep(timeout) => {
-            kill_tree(&reaper);
-            UserShellRun { timed_out: true, ..UserShellRun::failed(String::new()) }
-        }
-        _ = cancel.cancelled() => {
-            kill_tree(&reaper);
-            UserShellRun { cancelled: true, ..UserShellRun::failed(String::new()) }
-        }
+        _ = tokio::time::sleep(timeout) => (true, false),
+        _ = cancel.cancelled() => (false, true),
+    };
+    kill_tree(&reaper);
+    let _ = tokio::time::timeout(KILLED_DRAIN_GRACE, &mut wait).await;
+    UserShellRun {
+        timed_out,
+        cancelled,
+        ..UserShellRun::failed(clip_output(&take(&buf)))
     }
+}
+
+const KILLED_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+fn take(buf: &Mutex<Vec<u8>>) -> Vec<u8> {
+    std::mem::take(&mut *buf.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
 #[cfg(all(test, unix))]
@@ -154,6 +169,39 @@ mod tests {
         });
         assert!(r.timed_out && !r.cancelled);
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    }
+
+    #[test]
+    fn a_timeout_keeps_what_the_command_printed() {
+        let r = block(run(
+            "echo before; sleep 5",
+            Path::new("."),
+            Duration::from_millis(500),
+            CancellationToken::new(),
+        ));
+        assert!(r.timed_out);
+        assert!(r.output.contains("before"), "{:?}", r.output);
+    }
+
+    #[test]
+    fn a_cancel_keeps_what_the_command_printed() {
+        let r = block(async {
+            let token = CancellationToken::new();
+            let c = token.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                c.cancel();
+            });
+            run(
+                "echo before; sleep 5",
+                Path::new("."),
+                USER_SHELL_TIMEOUT,
+                token,
+            )
+            .await
+        });
+        assert!(r.cancelled);
+        assert!(r.output.contains("before"), "{:?}", r.output);
     }
 
     #[test]

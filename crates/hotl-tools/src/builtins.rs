@@ -1887,11 +1887,28 @@ pub(crate) fn merged_pipe() -> std::io::Result<(
 /// Additive beside `collect_output`, whose signature is shared with the
 /// diagnostics runner and is deliberately left alone.
 pub(crate) async fn collect_merged(
-    mut child: tokio::process::Child,
+    child: tokio::process::Child,
     pipe: std::io::PipeReader,
     cap: usize,
     progress: Option<(crate::ProgressSink, Arc<AtomicBool>)>,
 ) -> std::io::Result<(std::process::ExitStatus, Vec<u8>)> {
+    let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let status = collect_merged_into(child, pipe, cap, progress, buf.clone()).await?;
+    let bytes = std::mem::take(
+        &mut *buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    Ok((status, bytes))
+}
+
+pub(crate) async fn collect_merged_into(
+    mut child: tokio::process::Child,
+    pipe: std::io::PipeReader,
+    cap: usize,
+    progress: Option<(crate::ProgressSink, Arc<AtomicBool>)>,
+    buf: Arc<std::sync::Mutex<Vec<u8>>>,
+) -> std::io::Result<std::process::ExitStatus> {
     // `std::io::pipe` has no async reader, so the drain moves to a blocking
     // thread and `bash_impl`'s `select!` keeps the timeout and cancel arms
     // responsive around it.
@@ -1902,7 +1919,6 @@ pub(crate) async fn collect_merged(
     // process group on the timeout and cancel paths, which is what closes them;
     // a descendant that escaped the group would strand one blocking-pool
     // thread. That is the same descendant that already escapes the reaper.
-    let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
     let drain = tokio::task::spawn_blocking({
         let buf = buf.clone();
         move || drain_capped_blocking(pipe, cap, progress, &buf)
@@ -1920,12 +1936,7 @@ pub(crate) async fn collect_merged(
         }
         None => child.wait().await?,
     };
-    let bytes = std::mem::take(
-        &mut *buf
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    );
-    Ok((status, bytes))
+    Ok(status)
 }
 
 const ORPHAN_PIPE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
