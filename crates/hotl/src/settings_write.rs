@@ -24,6 +24,12 @@ pub(crate) fn theme_is_unset(config_path: &Path) -> bool {
 
 pub(crate) fn set_theme_preset(config_path: &Path, name: &str) -> io::Result<()> {
     let target = dunce::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    if std::fs::metadata(&target).is_ok_and(|m| m.permissions().readonly()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "config.toml is read-only",
+        ));
+    }
     let original = match std::fs::read_to_string(&target) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
@@ -57,6 +63,13 @@ pub(crate) fn set_theme_preset(config_path: &Path, name: &str) -> io::Result<()>
         .get_mut("theme")
         .and_then(|t| t.as_table_like_mut())
         .ok_or_else(|| invalid("settings.theme in config.toml is not a table"))?;
+    if let Some(existing) = theme.get("preset") {
+        if existing.as_str().is_none() {
+            return Err(invalid(
+                "settings.theme.preset in config.toml is not a string",
+            ));
+        }
+    }
     let new_value = match theme.get("preset").and_then(|p| p.as_value()) {
         Some(old) => {
             let mut v = toml_edit::Value::from(name);
@@ -319,5 +332,34 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn read_only_config_is_an_error_and_untouched() {
+        let d = tempfile::tempdir().unwrap();
+        let text = "[settings.theme]\npreset = \"nord\"\n";
+        let p = cfg(&d, text);
+        let mut perms = std::fs::metadata(&p).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&p, perms).unwrap();
+        let err = set_theme_preset(&p, "warm").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), text);
+    }
+
+    #[test]
+    fn non_string_preset_is_an_error_and_untouched() {
+        let d = tempfile::tempdir().unwrap();
+        for text in [
+            "[settings.theme.preset]\na = 1\n",
+            "[settings.theme]\npreset = [\"a\", \"b\"]\n",
+            "[settings.theme]\npreset = 3\n",
+            "[settings.theme]\npreset = { a = 1 }\n",
+        ] {
+            let p = cfg(&d, text);
+            let err = set_theme_preset(&p, "warm").unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{text}");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), text);
+        }
     }
 }
