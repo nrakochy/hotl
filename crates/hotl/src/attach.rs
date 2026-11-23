@@ -190,7 +190,7 @@ where
                         state.on_server(&msg);
                     }
                 }
-                _ => { println!("\n(session closed)"); return 0; }
+                _ => { println!("{}", closed_message(&state)); return 0; }
             },
             line = stdin_rx.recv(), if stdin_open => {
                 let Some(line) = line else {
@@ -216,6 +216,22 @@ where
                 }
             }
         }
+    }
+}
+
+fn closed_message(state: &Attached) -> String {
+    match &state.held {
+        Some(text) => {
+            let preview: String = text
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(40)
+                .collect();
+            format!("\n(session closed)\nheld message not sent: \"{preview}\"")
+        }
+        None => "\n(session closed)".to_string(),
     }
 }
 
@@ -782,6 +798,18 @@ async fn detach<W: tokio::io::AsyncWrite + Unpin>(client: &mut AcpClient<W>) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_session_closing_with_a_held_line_says_it_was_not_sent() {
+        let mut state = Attached::default();
+        assert_eq!(closed_message(&state), "\n(session closed)");
+        state.held = Some("why did it fail?".into());
+        let msg = closed_message(&state);
+        assert!(
+            msg.contains("held message not sent: \"why did it fail?\""),
+            "{msg}"
+        );
+    }
+
     use super::*;
     use hotl_engine::EngineEvent;
 

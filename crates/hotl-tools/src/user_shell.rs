@@ -174,7 +174,7 @@ const RAW_CAP: usize = BASH_MAX_OUTPUT + BASH_OUTPUT_SLACK;
 fn decode(bytes: &[u8]) -> String {
     let clean = sanitize(&String::from_utf8_lossy(bytes));
     let mut text = clip_output(clean.as_bytes());
-    if bytes.len() >= RAW_CAP && text.len() == clean.len() {
+    if bytes.len() >= RAW_CAP && clean.len() <= BASH_MAX_OUTPUT {
         text.push_str(TRUNCATION_MARKER);
     }
     text
@@ -237,6 +237,21 @@ fn take(buf: &Mutex<Vec<u8>>) -> Vec<u8> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn a_capped_run_carries_exactly_one_truncation_marker() {
+        let mut raw = "a".repeat(BASH_MAX_OUTPUT + TRUNCATION_MARKER.len());
+        while raw.len() < RAW_CAP {
+            raw.push_str("\x1b[0m");
+        }
+        let text = decode(raw.as_bytes());
+        assert_eq!(
+            text.matches(TRUNCATION_MARKER).count(),
+            1,
+            "{}",
+            &text[text.len() - 200..]
+        );
+    }
+
     use super::*;
     use std::time::Instant;
 
