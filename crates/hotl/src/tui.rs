@@ -748,7 +748,6 @@ async fn run_loop(
                     needs_draw = true;
                 }
                 Cmd::Resume(arg) => {
-                    abandon_shell(&mut shell_cancel, &mut shell_current);
                     match resume_target(&arg, &mut listed) {
                         Ok(ResumeTarget::Listing(lines)) => {
                             for line in lines {
@@ -760,6 +759,7 @@ async fn run_loop(
                             // the current session installed and untouched.
                             match handshake(client, reader, TuiArgs::resume(sid)).await {
                                 Ok(opened) => {
+                                    abandon_shell(&mut shell_cancel, &mut shell_current);
                                     let fresh = State::new(state.vim_mode, String::new());
                                     let old = std::mem::replace(&mut state, fresh);
                                     state.editor = old.editor;
@@ -1207,8 +1207,6 @@ fn resolve_mouse(env: Option<&str>, cfg: bool) -> bool {
     }
 }
 
-/// Crossterm events read on a plain thread (no event-stream feature needed);
-/// `suspended` parks it while `$EDITOR` owns the terminal.
 fn is_current_shell_run(current: Option<u64>, id: u64) -> bool {
     current == Some(id)
 }
@@ -1223,6 +1221,8 @@ fn abandon_shell(
     *current = None;
 }
 
+/// Crossterm events read on a plain thread (no event-stream feature needed);
+/// `suspended` parks it while `$EDITOR` owns the terminal.
 fn spawn_key_reader(suspended: Arc<AtomicBool>) -> mpsc::Receiver<Event> {
     let (tx, rx) = mpsc::channel(64);
     std::thread::spawn(move || loop {
