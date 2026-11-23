@@ -3274,7 +3274,7 @@ async fn admit_steer(
     append_steer(shared, log, head, pipeline, steer).await;
 }
 
-/// Push a steer onto the held buffer, or fold it into the last entry once
+/// Push a steer onto the held buffer, or fold it into the last entry of its kind once
 /// either cap is reached. Sync and self-contained so the bound is unit-testable
 /// without a session behind it.
 fn push_or_fold_steer(held: &mut Vec<HeldSteer>, steer: HeldSteer) {
@@ -3286,7 +3286,12 @@ fn push_or_fold_steer(held: &mut Vec<HeldSteer>, steer: HeldSteer) {
         .sum();
     let incoming: usize = steer.images.iter().map(|i| i.data.len()).sum();
     let full = text_total >= HELD_BYTES_MAX || image_total + incoming > HELD_IMAGE_B64_MAX;
-    match held.last_mut() {
+    let is_note = steer.synthetic == SyntheticReason::ShellCommand;
+    let same_kind = held
+        .iter_mut()
+        .rev()
+        .find(|s| (s.synthetic == SyntheticReason::ShellCommand) == is_note);
+    match same_kind {
         Some(last) if full => {
             // Images first, disclosure on the INCOMING text, one fold_into
             // call — keeps FOLD_MARK the literal tail so it never stacks.
@@ -4759,6 +4764,39 @@ mod tests {
              ...{}",
             &text[text.len().saturating_sub(120)..]
         );
+    }
+
+    #[test]
+    fn a_steer_past_the_cap_never_folds_into_a_shell_note() {
+        let note = |n: usize| HeldSteer {
+            text: "n".repeat(n),
+            images: Vec::new(),
+            synthetic: SyntheticReason::ShellCommand,
+            key: None,
+        };
+        let mut held: Vec<HeldSteer> = Vec::new();
+        push_or_fold_steer(&mut held, note(40_000));
+        push_or_fold_steer(&mut held, note(40_000));
+        push_or_fold_steer(
+            &mut held,
+            HeldSteer {
+                text: "also check X".into(),
+                images: Vec::new(),
+                synthetic: SyntheticReason::Steer,
+                key: None,
+            },
+        );
+        let steer = held
+            .iter()
+            .find(|s| s.text.contains("also check X"))
+            .expect("steer kept");
+        assert_eq!(steer.synthetic, SyntheticReason::Steer);
+        push_or_fold_steer(&mut held, note(10));
+        assert!(held
+            .iter()
+            .filter(|s| s.synthetic == SyntheticReason::Steer)
+            .all(|s| !s.text.contains("nnnnnnnnnn")));
+        assert_eq!(held.len(), 3);
     }
 
     #[test]
