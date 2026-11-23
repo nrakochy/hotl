@@ -3121,6 +3121,10 @@ fn submit(state: &mut State, text: String, payload: paste::PromptPayload) -> Vec
     if let Some(rest) = text.trim().strip_prefix('/') {
         return slash_command(state, rest, payload);
     }
+    send_text(state, text, payload)
+}
+
+fn send_text(state: &mut State, text: String, payload: paste::PromptPayload) -> Vec<Cmd> {
     // Anything the human sends answers a live plan card — usually a revision.
     settle_plan(state);
     if state.phase == Phase::Idle {
@@ -3239,7 +3243,7 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                     text: expanded,
                     images: payload.images,
                 };
-                cmds.extend(submit(state, word.to_string(), payload));
+                cmds.extend(send_text(state, word.to_string(), payload));
                 return cmds;
             };
             set_plan(state, want)
@@ -8210,6 +8214,52 @@ mod tests {
         assert!(
             matches!(s.transcript.last(), Some(TranscriptItem::Steer { text, queued: true }) if text == "then do the rest")
         );
+    }
+
+    #[test]
+    fn slash_plan_with_a_task_that_starts_with_a_slash_sends_it_verbatim() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/plan /tmp/x is wrong, plan a fix");
+        let prompts: Vec<&str> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::SendPrompt(p) => Some(p.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prompts, vec!["/tmp/x is wrong, plan a fix"], "got {cmds:?}");
+        assert!(!s
+            .transcript
+            .iter()
+            .any(|i| matches!(i, TranscriptItem::Notice { text } if text.contains("unknown"))));
+    }
+
+    #[test]
+    fn slash_plan_with_only_spaces_is_a_bare_toggle() {
+        let mut s = State::test_default();
+        assert!(matches!(
+            &type_and_submit(&mut s, "/plan    ")[..],
+            [Cmd::SetPlan(true)]
+        ));
+    }
+
+    #[test]
+    fn slash_plan_with_a_task_carries_its_attached_images() {
+        let mut s = State::test_default();
+        type_str(&mut s, "/plan fix this layout ");
+        update(&mut s, Msg::Paste("/tmp/mockup.png".into()));
+        let cmds = press(&mut s, KeyCode::Enter);
+        let Some(p) = cmds.iter().find_map(|c| match c {
+            Cmd::SendPrompt(p) => Some(p.clone()),
+            _ => None,
+        }) else {
+            panic!("got {cmds:?}");
+        };
+        assert_eq!(p.images.len(), 1);
+        assert_eq!(p.images[0].path, "/tmp/mockup.png");
+        assert!(p.text.starts_with("fix this layout"), "{}", p.text);
+        assert!(p.text.contains("[Image #1]"), "{}", p.text);
+        assert!(!p.text.contains("/plan"), "{}", p.text);
     }
 
     #[test]
