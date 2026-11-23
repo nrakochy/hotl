@@ -176,6 +176,15 @@ impl ThemeConfig {
     }
 }
 
+pub const PRESETS: &[&str] = &[
+    "tokyo-night",
+    "catppuccin",
+    "gruvbox",
+    "nord",
+    "dracula",
+    "warm",
+];
+
 /// Look up a built-in palette by name. `None` if the name is unknown.
 pub fn preset(name: &str) -> Option<Theme> {
     Some(match name {
@@ -423,6 +432,49 @@ mod tests {
         let t = preset("tokyo-night").expect("exists");
         assert_eq!(t.blocked, "#f7768e");
         assert_eq!(t.accent, "#7aa2f7");
+    }
+    #[test]
+    fn presets_list_the_six_in_display_order() {
+        assert_eq!(
+            PRESETS,
+            &[
+                "tokyo-night",
+                "catppuccin",
+                "gruvbox",
+                "nord",
+                "dracula",
+                "warm"
+            ]
+        );
+    }
+    #[test]
+    fn every_listed_preset_resolves() {
+        for name in PRESETS {
+            assert!(preset(name).is_some(), "{name}");
+        }
+    }
+    #[test]
+    fn preset_accepts_only_listed_names_and_default() {
+        for name in [
+            "Tokyo-Night",
+            "TOKYO-NIGHT",
+            "tokyonight",
+            "tokyo_night",
+            " nord",
+            "nord ",
+            "Nord",
+            "solarized",
+            "catppuccin-mocha",
+            "Default",
+            "",
+        ] {
+            assert_eq!(preset(name), None, "{name:?}");
+        }
+        assert!(preset("default").is_some());
+    }
+    #[test]
+    fn default_preset_equals_first_listed() {
+        assert_eq!(preset("default"), preset(PRESETS[0]));
     }
     #[test]
     fn preset_unknown_is_none() {
