@@ -105,7 +105,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
                         terminal_msg(ev, settings.copy_on_select)
                     };
                     if let Some(msg) = msg {
-                        hotl_tui::app::pre_open_input(&mut state, msg);
+                        let _ = hotl_tui::app::pre_open_input(&mut state, msg);
                     }
                 }
                 None => return 1,

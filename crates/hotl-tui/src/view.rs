@@ -360,6 +360,9 @@ pub fn view(state: &State, p: &Palette, cache: &mut TranscriptCache, frame: &mut
     if state.help_open {
         render_help(state, p, frame, area);
     }
+    if state.theme_picker.is_some() {
+        render_theme_picker(state, p, frame, area);
+    }
     if let Some(sel) = &state.selection {
         highlight(sel, frame);
     }
@@ -3046,6 +3049,52 @@ fn render_ask(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
 /// one (0047 D3): its own title and the accent border, so blocked color +
 /// "waiting on you" stay exclusive to prompts where a key grants authority.
 /// The strip's blocked phase text is untouched — the turn *is* halted.
+fn render_theme_picker(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
+    let Some(picker) = &state.theme_picker else {
+        return;
+    };
+    let mut body: Body = Vec::new();
+    for (i, name) in hotl_theme::PRESETS.iter().enumerate() {
+        let on = i == picker.cursor;
+        let label = if on {
+            Style::new().fg(p.ink).bold()
+        } else {
+            Style::new().fg(p.ink)
+        };
+        let mut spans = vec![
+            Span::styled(
+                if on { "❯ " } else { "  " },
+                Style::new().fg(p.accent).bold(),
+            ),
+            Span::styled((*name).to_string(), label),
+        ];
+        if i == 0 {
+            spans.push(Span::styled("  (default)", Style::new().fg(p.muted)));
+        }
+        body.push((Line::from(spans), Fold::Clip));
+    }
+    body.push((Line::raw(""), Fold::Clip));
+    body.push((
+        Line::styled(
+            "↑↓ move · enter choose · esc keep",
+            Style::new().fg(p.faint),
+        ),
+        Fold::Clip,
+    ));
+    draw_modal(
+        frame,
+        p,
+        over,
+        Chrome {
+            title: " Pick a color palette ",
+            border: Style::new().fg(p.accent),
+            max_pct: 100,
+        },
+        &body,
+        0,
+    );
+}
+
 fn render_question(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
     let Phase::WaitingQuestion {
         header,
@@ -3422,6 +3471,7 @@ mod tests {
     fn normalize(state: &State, buffer: &mut Buffer) {
         let overlay = state.help_open
             || state.completion.is_some()
+            || state.theme_picker.is_some()
             || matches!(
                 state.phase,
                 Phase::WaitingAsk { .. }
@@ -3491,6 +3541,106 @@ mod tests {
             corner_fg(&s),
             hotl_theme::session_color_rgb("pink").unwrap()
         );
+    }
+
+    fn picker_state(first_run: bool) -> State {
+        let mut s = State::test_default();
+        s.theme_picker = Some(crate::app::ThemePicker::open("tokyo-night", first_run));
+        s
+    }
+
+    fn picker_rows(state: &State, w: u16, h: u16) -> Vec<String> {
+        let mut rows = draw_raw(state, w, h);
+        for row in &mut rows {
+            *row = row.trim_end().to_string();
+        }
+        rows
+    }
+
+    #[test]
+    fn the_theme_picker_lists_the_six_presets_over_the_frame() {
+        let s = picker_state(true);
+        let rows = picker_rows(&s, 80, 24);
+        let top = rows
+            .iter()
+            .position(|r| r.contains("Pick a color palette"))
+            .expect("title row");
+        let box_rows: Vec<String> = rows[top..top + 10]
+            .iter()
+            .map(|r| r.trim().to_string())
+            .collect();
+        assert_eq!(
+            box_rows,
+            [
+                "┌ Pick a color palette ────────────────────────┐",
+                "│ ❯ tokyo-night  (default)                     │",
+                "│   catppuccin                                 │",
+                "│   gruvbox                                    │",
+                "│   nord                                       │",
+                "│   dracula                                    │",
+                "│   warm                                       │",
+                "│                                              │",
+                "│ ↑↓ move · enter choose · esc keep            │",
+                "└──────────────────────────────────────────────┘",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_theme_picker_follows_the_cursor_and_fits_a_narrow_frame() {
+        let mut s = picker_state(false);
+        s.theme_picker.as_mut().unwrap().cursor = 3;
+        let rows = picker_rows(&s, 40, 24);
+        let at = |needle: &str| rows.iter().find(|r| r.contains(needle)).cloned().unwrap();
+        assert!(at("nord").contains("❯ nord"), "{rows:#?}");
+        assert!(at("tokyo-night").contains("  tokyo-night  (default)"));
+        let top = rows
+            .iter()
+            .position(|r| r.contains("Pick a color palette"))
+            .unwrap();
+        assert_eq!(
+            rows[top..top + 10]
+                .iter()
+                .map(|r| r.trim().to_string())
+                .collect::<Vec<_>>(),
+            [
+                "┌ Pick a color palette ─────────────┐",
+                "│   tokyo-night  (default)          │",
+                "│   catppuccin                      │",
+                "│   gruvbox                         │",
+                "│ ❯ nord                            │",
+                "│   dracula                         │",
+                "│   warm                            │",
+                "│                                   │",
+                "│ ↑↓ move · enter choose · esc keep │",
+                "└───────────────────────────────────┘",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_theme_picker_wears_the_palette_passed_in() {
+        let s = picker_state(true);
+        let accent_fg = |p: &Palette| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|f| view(&s, p, &mut TranscriptCache::default(), f))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..buf.area.height)
+                .find_map(|y| {
+                    (0..buf.area.width).find_map(|x| {
+                        let c = &buf[(x, y)];
+                        (c.symbol() == "❯").then_some(c.fg)
+                    })
+                })
+                .expect("the cursor glyph is drawn")
+        };
+        let a = Palette::default();
+        let b = Palette::from(&hotl_theme::preset("dracula").unwrap());
+        assert_eq!(accent_fg(&a), a.accent);
+        assert_eq!(accent_fg(&b), b.accent);
+        assert_ne!(accent_fg(&a), accent_fg(&b));
     }
 
     /// The 80×24 buffer, transcript normalized, for cell-level assertions.

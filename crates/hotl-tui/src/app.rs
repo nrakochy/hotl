@@ -565,6 +565,7 @@ pub struct State {
     /// Running totals across every turn, the basis of `usage_line`.
     pub session_usage: SessionUsage,
     pub help_open: bool,
+    pub theme_picker: Option<ThemePicker>,
     /// Row offset into an ask/question/help body taller than the frame;
     /// reset whenever a modal opens. The view clamps the top.
     pub modal_scroll: usize,
@@ -787,6 +788,7 @@ impl State {
             flag_count: 0,
             session_usage: SessionUsage::default(),
             help_open: false,
+            theme_picker: None,
             modal_scroll: 0,
             queued_submit: false,
             interrupt_sent: false,
@@ -1008,7 +1010,70 @@ pub enum Msg {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemePicker {
+    pub cursor: usize,
+    pub original: String,
+    pub first_run: bool,
+}
+
+impl ThemePicker {
+    pub fn open(original: &str, first_run: bool) -> Self {
+        let cursor = hotl_theme::PRESETS
+            .iter()
+            .position(|name| *name == original)
+            .unwrap_or(0);
+        Self {
+            cursor,
+            original: original.to_string(),
+            first_run,
+        }
+    }
+
+    pub fn highlighted(&self) -> &'static str {
+        hotl_theme::PRESETS[self.cursor]
+    }
+}
+
+fn theme_picker_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
+    let Some(picker) = state.theme_picker.as_mut() else {
+        return Vec::new();
+    };
+    let count = hotl_theme::PRESETS.len();
+    let moved = match key.code {
+        KeyCode::Down | KeyCode::Char('j') => Some((picker.cursor + 1) % count),
+        KeyCode::Up | KeyCode::Char('k') => Some((picker.cursor + count - 1) % count),
+        KeyCode::Char(c @ '1'..='9') => {
+            let n = c as usize - '1' as usize;
+            (n < count).then_some(n)
+        }
+        _ => None,
+    };
+    if let Some(cursor) = moved {
+        picker.cursor = cursor;
+        return vec![Cmd::PreviewTheme(picker.highlighted().to_string())];
+    }
+    match key.code {
+        KeyCode::Enter => {
+            let name = picker.highlighted().to_string();
+            state.theme_picker = None;
+            vec![Cmd::SetTheme(name)]
+        }
+        KeyCode::Esc => {
+            let picker = state.theme_picker.take().expect("picker is open");
+            let mut cmds = vec![Cmd::PreviewTheme(picker.original.clone())];
+            if picker.first_run {
+                cmds.push(Cmd::SetTheme(picker.original));
+            }
+            cmds
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
+    PreviewTheme(String),
+    SetTheme(String),
     /// The wire-bound draft: paste tokens already expanded, `[Image #N]`
     /// tokens inline, image paths riding with `data: None` until the
     /// runtime seam reads and encodes the files.
@@ -2770,6 +2835,7 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
     // presses always suffice to leave.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         state.help_open = false;
+        state.theme_picker = None;
         if state.phase == Phase::Idle || state.interrupt_sent {
             return vec![Cmd::Quit];
         }
@@ -2777,6 +2843,9 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
         // No notice (0061 T20): the strip says `interrupting` and the hint
         // names the second press — a transcript item said it a third time.
         return vec![Cmd::Cancel];
+    }
+    if state.theme_picker.is_some() {
+        return theme_picker_key(state, key);
     }
     // The help table scrolls on the arrow and page keys (0049 T7); every
     // other key closes it.
@@ -3025,8 +3094,15 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
 /// exactly as normal; Enter marks the draft queued instead of submitting
 /// (`fire_queued_submit` replays it on open); everything session-addressed
 /// — slash commands included — stays inert, buffered as text.
-pub fn pre_open_input(state: &mut State, msg: Msg) {
+pub fn pre_open_input(state: &mut State, msg: Msg) -> Vec<Cmd> {
     match msg {
+        Msg::Key(key)
+            if state.theme_picker.is_some()
+                && !(key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.code == KeyCode::Char('c')) =>
+        {
+            return theme_picker_key(state, key);
+        }
         Msg::Key(key) => {
             let event = state.editor.handle(key);
             refresh(state);
@@ -3044,11 +3120,12 @@ pub fn pre_open_input(state: &mut State, msg: Msg) {
         // The paste arm of `update` touches only the editor and the
         // attachment side table — safe pre-open, and reusing it keeps the
         // marker bookkeeping in one place.
-        Msg::Paste(_) => {
+        Msg::Paste(_) if state.theme_picker.is_none() => {
             let _ = update(state, msg);
         }
         _ => {}
     }
+    Vec::new()
 }
 
 /// The open transition (0033 Task 8b): replay the queued draft through the
@@ -4591,6 +4668,127 @@ mod tests {
         );
         assert!(!s.queued_submit);
         assert!(fire_queued_submit(&mut s).is_empty());
+    }
+
+    fn picker_state(original: &str, first_run: bool) -> State {
+        let mut s = State::test_default();
+        s.theme_picker = Some(ThemePicker::open(original, first_run));
+        s
+    }
+
+    fn preview(name: &str) -> Cmd {
+        Cmd::PreviewTheme(name.into())
+    }
+
+    fn char_key(s: &mut State, c: char) -> Vec<Cmd> {
+        update(
+            s,
+            Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+        )
+    }
+
+    #[test]
+    fn the_picker_opens_on_the_active_preset() {
+        assert_eq!(ThemePicker::open("nord", false).cursor, 3);
+        assert_eq!(ThemePicker::open("nope", false).cursor, 0);
+        assert_eq!(ThemePicker::open("nord", true).original, "nord");
+    }
+
+    #[test]
+    fn picker_moves_and_previews_each_name() {
+        let mut s = picker_state("tokyo-night", true);
+        assert_eq!(press(&mut s, KeyCode::Down), vec![preview("catppuccin")]);
+        assert_eq!(char_key(&mut s, 'j'), vec![preview("gruvbox")]);
+        assert_eq!(press(&mut s, KeyCode::Up), vec![preview("catppuccin")]);
+        assert_eq!(char_key(&mut s, 'k'), vec![preview("tokyo-night")]);
+        assert_eq!(s.theme_picker.as_ref().unwrap().cursor, 0);
+    }
+
+    #[test]
+    fn picker_wraps_at_both_ends() {
+        let mut s = picker_state("tokyo-night", false);
+        assert_eq!(press(&mut s, KeyCode::Up), vec![preview("warm")]);
+        assert_eq!(press(&mut s, KeyCode::Down), vec![preview("tokyo-night")]);
+    }
+
+    #[test]
+    fn picker_digits_jump_and_other_digits_do_nothing() {
+        let mut s = picker_state("tokyo-night", false);
+        assert_eq!(char_key(&mut s, '5'), vec![preview("dracula")]);
+        assert_eq!(char_key(&mut s, '1'), vec![preview("tokyo-night")]);
+        assert_eq!(char_key(&mut s, '6'), vec![preview("warm")]);
+        assert!(char_key(&mut s, '7').is_empty());
+        assert!(char_key(&mut s, '0').is_empty());
+        assert_eq!(s.theme_picker.as_ref().unwrap().cursor, 5);
+    }
+
+    #[test]
+    fn picker_enter_sets_the_highlighted_name_and_closes() {
+        let mut s = picker_state("tokyo-night", true);
+        press(&mut s, KeyCode::Down);
+        press(&mut s, KeyCode::Down);
+        let cmds = press(&mut s, KeyCode::Enter);
+        assert_eq!(cmds, vec![Cmd::SetTheme("gruvbox".into())]);
+        assert!(s.theme_picker.is_none());
+    }
+
+    #[test]
+    fn picker_esc_restores_and_writes_only_on_first_run() {
+        let mut s = picker_state("nord", false);
+        press(&mut s, KeyCode::Down);
+        let cmds = press(&mut s, KeyCode::Esc);
+        assert_eq!(cmds, vec![preview("nord")]);
+        assert!(s.theme_picker.is_none());
+
+        let mut s = picker_state("tokyo-night", true);
+        press(&mut s, KeyCode::Down);
+        let cmds = press(&mut s, KeyCode::Esc);
+        assert_eq!(
+            cmds,
+            vec![preview("tokyo-night"), Cmd::SetTheme("tokyo-night".into())]
+        );
+        assert!(s.theme_picker.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_with_the_picker_open_quits_and_sets_nothing() {
+        let mut s = picker_state("tokyo-night", true);
+        let cmds = ctrl(&mut s, 'c');
+        assert!(matches!(cmds[..], [Cmd::Quit]), "{cmds:?}");
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::SetTheme(_))));
+    }
+
+    #[test]
+    fn picker_swallows_other_keys_before_the_composer() {
+        let mut s = picker_state("tokyo-night", false);
+        for c in ['a', 'x', '?', '/'] {
+            assert!(char_key(&mut s, c).is_empty());
+        }
+        press(&mut s, KeyCode::Tab);
+        assert_eq!(s.editor.text(), "");
+        assert!(s.theme_picker.is_some());
+        assert!(!s.help_open);
+    }
+
+    #[test]
+    fn pre_open_picker_returns_its_cmds_and_swallows_keys() {
+        let mut s = State::new(false, "m".into());
+        s.theme_picker = Some(ThemePicker::open("tokyo-night", true));
+        let key = |code| Msg::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        assert_eq!(
+            pre_open_input(&mut s, key(KeyCode::Down)),
+            vec![preview("catppuccin")]
+        );
+        assert!(pre_open_input(&mut s, key(KeyCode::Char('z'))).is_empty());
+        assert_eq!(s.editor.text(), "");
+        assert_eq!(
+            pre_open_input(&mut s, key(KeyCode::Enter)),
+            vec![Cmd::SetTheme("catppuccin".into())]
+        );
+        assert!(!s.queued_submit);
+        assert!(s.theme_picker.is_none());
+        assert!(pre_open_input(&mut s, key(KeyCode::Char('h'))).is_empty());
+        assert_eq!(s.editor.text(), "h");
     }
 
     fn notices(n: usize) -> Vec<TranscriptItem> {
