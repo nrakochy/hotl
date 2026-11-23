@@ -2231,13 +2231,6 @@ fn shell_outcome(
     ToolOutcome::err(content).with_facts(facts)
 }
 
-/// How a child died, when it did not exit with a status of its own.
-///
-/// `[killed by SIGSEGV]` is a **structured** signal the model branches on, not
-/// decoration, so the Windows arm reproduces it rather than degrading to
-/// `[exit 3221225477]`. Windows has no signals; what it has is a small set of
-/// well-known NTSTATUS values that arrive through `ExitStatus::code()`, and
-/// naming them is the same service.
 #[cfg(unix)]
 pub(crate) fn signal_name(sig: i32) -> String {
     match sig {
@@ -2256,6 +2249,13 @@ pub(crate) fn signal_name(sig: i32) -> String {
     }
 }
 
+/// How a child died, when it did not exit with a status of its own.
+///
+/// `[killed by SIGSEGV]` is a **structured** signal the model branches on, not
+/// decoration, so the Windows arm reproduces it rather than degrading to
+/// `[exit 3221225477]`. Windows has no signals; what it has is a small set of
+/// well-known NTSTATUS values that arrive through `ExitStatus::code()`, and
+/// naming them is the same service.
 #[cfg(unix)]
 fn death_trailer(status: &std::process::ExitStatus) -> Option<(String, String)> {
     use std::os::unix::process::ExitStatusExt;
@@ -2269,15 +2269,20 @@ fn death_trailer(status: &std::process::ExitStatus) -> Option<(String, String)> 
 /// and the caller renders it as such.
 #[cfg(windows)]
 fn death_trailer(status: &std::process::ExitStatus) -> Option<(String, String)> {
-    let name = match status.code()? as u32 {
-        0xC000_0005 => "ACCESS_VIOLATION",
-        0xC000_013A => "CONTROL_C_EXIT",
-        0xC000_00FD => "STACK_OVERFLOW",
-        0xC000_0374 => "HEAP_CORRUPTION",
-        0x4001_0004 => "DBG_TERMINATE_PROCESS",
-        _ => return None,
-    };
+    let name = windows_crash_name(status.code()?)?;
     Some((format!("exception {name}"), format!("[killed by {name}]")))
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_crash_name(code: i32) -> Option<&'static str> {
+    match code as u32 {
+        0xC000_0005 => Some("ACCESS_VIOLATION"),
+        0xC000_013A => Some("CONTROL_C_EXIT"),
+        0xC000_00FD => Some("STACK_OVERFLOW"),
+        0xC000_0374 => Some("HEAP_CORRUPTION"),
+        0x4001_0004 => Some("DBG_TERMINATE_PROCESS"),
+        _ => None,
+    }
 }
 
 pub(crate) fn clip_output(bytes: &[u8]) -> String {

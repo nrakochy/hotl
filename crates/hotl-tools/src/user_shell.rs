@@ -25,7 +25,7 @@ impl ShellEnd {
     pub fn label(self) -> Option<String> {
         match self {
             ShellEnd::Exited(0) => None,
-            ShellEnd::Exited(n) => Some(format!("[exit {n}]")),
+            ShellEnd::Exited(n) => crash_label(n).or_else(|| Some(format!("[exit {n}]"))),
             #[cfg(unix)]
             ShellEnd::Signaled(sig) => {
                 Some(format!("[killed by {}]", crate::builtins::signal_name(sig)))
@@ -41,7 +41,8 @@ impl ShellEnd {
 
     pub fn shared_label(self) -> Option<String> {
         match self {
-            ShellEnd::Exited(_) | ShellEnd::Cancelled | ShellEnd::Failed => None,
+            ShellEnd::Exited(n) => crash_label(n),
+            ShellEnd::Cancelled | ShellEnd::Failed => None,
             _ => self.label(),
         }
     }
@@ -77,6 +78,16 @@ impl ShellEnd {
         }
         ShellEnd::Failed
     }
+}
+
+#[cfg(windows)]
+fn crash_label(code: i32) -> Option<String> {
+    crate::builtins::windows_crash_name(code).map(|name| format!("[killed by {name}]"))
+}
+
+#[cfg(not(windows))]
+fn crash_label(_code: i32) -> Option<String> {
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -460,5 +471,30 @@ mod tests {
             "{:?}",
             &r.output[r.output.len() - 60..]
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn a_windows_crash_code_is_named_like_the_bash_tool_names_it() {
+        let access = ShellEnd::Exited(0xC000_0005_u32 as i32);
+        assert_eq!(
+            access.label().as_deref(),
+            Some("[killed by ACCESS_VIOLATION]")
+        );
+        assert_eq!(
+            access.shared_label().as_deref(),
+            Some("[killed by ACCESS_VIOLATION]")
+        );
+        let ctrl_c = ShellEnd::Exited(0xC000_013A_u32 as i32);
+        assert_eq!(
+            ctrl_c.label().as_deref(),
+            Some("[killed by CONTROL_C_EXIT]")
+        );
+        assert_eq!(ShellEnd::Exited(3).label().as_deref(), Some("[exit 3]"));
+        assert_eq!(ShellEnd::Exited(3).shared_label(), None);
     }
 }
