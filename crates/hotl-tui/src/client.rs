@@ -636,11 +636,12 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
             command,
             output,
             exit_code,
+            end,
         } => {
             client
                 .request(
                     "_hotl/session/shell_note",
-                    json!({"command": command, "output": output, "exitCode": exit_code}),
+                    json!({"command": command, "output": output, "exitCode": exit_code, "end": end}),
                 )
                 .await?;
         }
@@ -1505,12 +1506,13 @@ mod tests {
             command: "ls".into(),
             output: "a\n".into(),
             exit_code: Some(2),
+            end: "exited",
         })
         .await;
         assert_eq!(lines[0]["method"], "_hotl/session/shell_note");
         assert_eq!(
             lines[0]["params"],
-            json!({"sessionId": "s1", "command": "ls", "output": "a\n", "exitCode": 2})
+            json!({"sessionId": "s1", "command": "ls", "output": "a\n", "exitCode": 2, "end": "exited"})
         );
     }
 

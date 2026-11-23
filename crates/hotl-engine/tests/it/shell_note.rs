@@ -139,7 +139,9 @@ fn is_note(item: &Item) -> bool {
 async fn an_idle_shell_note_is_logged_and_starts_no_turn() {
     let (provider, calls, _) = counting();
     let s = session(Arc::new(provider), EngineConfig::default());
-    s.handle.shell_note("git status", "clean", Some(0)).await;
+    s.handle
+        .shell_note("git status", "clean", Some(0), None)
+        .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let items = replayed_items(&s.log_path);
@@ -161,7 +163,7 @@ async fn a_shell_note_mid_reply_lands_after_it_and_earns_no_continuation() {
             break;
         }
     }
-    s.handle.shell_note("ls", "a b", Some(0)).await;
+    s.handle.shell_note("ls", "a b", Some(0), None).await;
     let mut done = 0;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
@@ -187,7 +189,7 @@ async fn the_next_prompt_carries_the_note() {
     let (provider, _, seen) = counting();
     let mut s = session(Arc::new(provider), EngineConfig::default());
     s.handle
-        .shell_note("cargo test", "FAILED one", Some(101))
+        .shell_note("cargo test", "FAILED one", Some(101), None)
         .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     s.handle.prompt("what failed?".into()).await;
@@ -282,7 +284,7 @@ async fn a_shell_note_behind_an_answered_steer_starts_no_extra_turn() {
         }
     }
     let answered_by = calls.load(Ordering::SeqCst);
-    s.handle.shell_note("ls", "a b", Some(0)).await;
+    s.handle.shell_note("ls", "a b", Some(0), None).await;
     let mut done = 0;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {

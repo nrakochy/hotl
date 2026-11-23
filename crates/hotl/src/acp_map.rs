@@ -937,13 +937,17 @@ fn chunk(text: &str) -> ContentChunk {
     }
 }
 
-fn flush_unanswered(open: &mut Vec<OpenTool>, out: &mut Vec<SessionUpdate>) {
+fn flush_unanswered(open: &mut Vec<OpenTool>, out: &mut Vec<Outgoing>) {
     for tool in open.drain(..) {
-        out.push(tool_call(tool, ToolCallStatus::Failed, None));
+        out.push(Outgoing::Update(tool_call(
+            tool,
+            ToolCallStatus::Failed,
+            None,
+        )));
     }
 }
 
-pub fn replay_updates(items: &[Item]) -> Vec<SessionUpdate> {
+pub fn replay_updates(items: &[Item], ext: bool) -> Vec<Outgoing> {
     let mut out = Vec::new();
     let mut open: Vec<OpenTool> = Vec::new();
     for item in items {
@@ -952,8 +956,23 @@ pub fn replay_updates(items: &[Item]) -> Vec<SessionUpdate> {
                 text, synthetic, ..
             } => {
                 flush_unanswered(&mut open, &mut out);
+                if ext && *synthetic == Some(SyntheticReason::ShellCommand) {
+                    if let Some(note) = hotl_engine::parse_shell_note_text(text) {
+                        out.push(Outgoing::Ext(
+                            serde_json::to_value(crate::acp::ReplayUpdate::ShellReplay {
+                                command: note.command,
+                                output: note.output,
+                                exit_code: note.exit_code,
+                                end: note.end,
+                            })
+                            .expect("a replay update always serializes"),
+                        ));
+                    }
+                }
                 if matches!(synthetic, None | Some(SyntheticReason::Steer)) && !text.is_empty() {
-                    out.push(SessionUpdate::UserMessageChunk(chunk(text)));
+                    out.push(Outgoing::Update(SessionUpdate::UserMessageChunk(chunk(
+                        text,
+                    ))));
                 }
             }
             Item::Assistant { blocks, .. } => {
@@ -962,12 +981,16 @@ pub fn replay_updates(items: &[Item]) -> Vec<SessionUpdate> {
                     match block.get("type").and_then(Value::as_str) {
                         Some("text") => {
                             if let Some(t) = block.get("text").and_then(Value::as_str) {
-                                out.push(SessionUpdate::AgentMessageChunk(chunk(t)));
+                                out.push(Outgoing::Update(SessionUpdate::AgentMessageChunk(
+                                    chunk(t),
+                                )));
                             }
                         }
                         Some("thinking") => {
                             if let Some(t) = block.get("thinking").and_then(Value::as_str) {
-                                out.push(SessionUpdate::AgentThoughtChunk(chunk(t)));
+                                out.push(Outgoing::Update(SessionUpdate::AgentThoughtChunk(
+                                    chunk(t),
+                                )));
                             }
                         }
                         Some("tool_use") => open.push(OpenTool {
@@ -996,9 +1019,13 @@ pub fn replay_updates(items: &[Item]) -> Vec<SessionUpdate> {
                             } else {
                                 ToolCallStatus::Completed
                             };
-                            out.push(tool_call(tool, status, Some(&r.content)));
+                            out.push(Outgoing::Update(tool_call(tool, status, Some(&r.content))));
                         }
-                        None => out.push(tool_call(tool, ToolCallStatus::Failed, None)),
+                        None => out.push(Outgoing::Update(tool_call(
+                            tool,
+                            ToolCallStatus::Failed,
+                            None,
+                        ))),
                     }
                 }
             }
@@ -1268,10 +1295,13 @@ mod tests {
         }
     }
 
-    fn wire(updates: &[SessionUpdate]) -> Vec<Value> {
+    fn wire(updates: &[Outgoing]) -> Vec<Value> {
         updates
             .iter()
-            .map(|u| serde_json::to_value(u).unwrap())
+            .map(|u| match u {
+                Outgoing::Update(u) => serde_json::to_value(u).unwrap(),
+                Outgoing::Ext(v) => v.clone(),
+            })
             .collect()
     }
 
@@ -1308,7 +1338,7 @@ mod tests {
             assistant(vec![json!({"type": "text", "text": "Done."})]),
         ];
         assert_eq!(
-            wire(&replay_updates(&items)),
+            wire(&replay_updates(&items, true)),
             vec![
                 json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "list files"}}),
                 json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "use ls"}}),
@@ -1332,7 +1362,7 @@ mod tests {
                 json!({"type": "tool_use", "id": "t9", "name": "edit", "input": {}}),
             ]),
         ];
-        let out = wire(&replay_updates(&items));
+        let out = wire(&replay_updates(&items, true));
         assert_eq!(out.len(), 2);
         assert_eq!(out[1]["toolCallId"], "t9");
         assert_eq!(out[1]["status"], "failed");
@@ -1354,9 +1384,44 @@ mod tests {
                 images: Vec::new(),
             },
         ];
-        let out = wire(&replay_updates(&items));
+        let out = wire(&replay_updates(&items, true));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["content"]["text"], "also check tests");
+    }
+
+    fn shell_note(text: String) -> Item {
+        Item::User {
+            text,
+            synthetic: Some(SyntheticReason::ShellCommand),
+            images: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_shell_note_replays_as_a_shell_card_for_an_extension_client() {
+        let items = vec![
+            user("look"),
+            shell_note(hotl_engine::shell_note_text(
+                "sleep 999",
+                "partial\n[timed out after 120s]",
+                None,
+                Some("timed_out"),
+            )),
+            shell_note("<shell-command exit=\"0\">\nmangled".into()),
+            shell_note(hotl_engine::shell_note_text("ls", "a b", Some(0), None)),
+        ];
+        let out = wire(&replay_updates(&items, true));
+        assert_eq!(
+            out,
+            vec![
+                json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "look"}}),
+                json!({"type": "shell_replay", "command": "sleep 999", "output": "partial\n[timed out after 120s]", "exit_code": null, "end": "timed_out"}),
+                json!({"type": "shell_replay", "command": "ls", "output": "a b", "exit_code": 0}),
+            ]
+        );
+        let plain = wire(&replay_updates(&items, false));
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0]["sessionUpdate"], "user_message_chunk");
     }
 
     #[test]

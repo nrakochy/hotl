@@ -1501,11 +1501,11 @@ async fn shell_note_is_acknowledged_and_lands_in_history() {
     send(
         &mut w,
         json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/shell_note","params":{
-            "command":"echo zebra-marker","output":"zebra-marker\n","exitCode":0}}),
+            "command":"echo zebra-marker","output":"zebra-marker\n","exitCode":0,"end":"exited"}}),
     )
     .await;
     let ack = read_until_id(&mut lines, 3).await;
-    assert_eq!(ack["result"], json!({}), "{ack}");
+    assert_eq!(ack["result"], json!({"ok": true}), "{ack}");
     send(
         &mut w,
         prompt_msg(4, &sid, json!([{"type": "text", "text": "go"}])),
@@ -1524,7 +1524,9 @@ async fn shell_note_is_acknowledged_and_lands_in_history() {
         })
         .collect();
     assert!(
-        users.iter().any(|t| t.contains("zebra-marker")),
+        users
+            .iter()
+            .any(|t| t.contains("zebra-marker") && t.contains("exit=\"0\" end=\"exited\"")),
         "{users:?}"
     );
 }
@@ -1557,10 +1559,13 @@ async fn shell_note_accepts_a_null_exit_code_and_rejects_missing_params() {
     read_until_id(&mut lines, 2).await;
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/shell_note","params":{"command":"ls","output":"x","exitCode":null}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"_hotl/session/shell_note","params":{"command":"ls","output":"x","exitCode":null,"end":"exploded"}}),
     )
     .await;
-    assert_eq!(read_until_id(&mut lines, 3).await["result"], json!({}));
+    assert_eq!(
+        read_until_id(&mut lines, 3).await["result"],
+        json!({"ok": true})
+    );
     for (id, params) in [
         (4, json!({"output":"x"})),
         (5, json!({"command":"ls"})),

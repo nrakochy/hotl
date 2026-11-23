@@ -1016,6 +1016,7 @@ pub enum Cmd {
         command: String,
         output: String,
         exit_code: Option<i32>,
+        end: &'static str,
     },
     /// Send `_hotl/session/rename` (fire-and-forget; the ack is noise).
     Rename(String),
@@ -1877,6 +1878,11 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             }
             if state.session_name.is_none() && state.session_title.is_some() {
                 return title_cmds(state, "");
+            }
+        }
+        "shell_replay" => {
+            if let Some(card) = replayed_shell_card(v) {
+                state.transcript.push(card);
             }
         }
         "goal_changed" => {
@@ -3209,6 +3215,39 @@ fn run_shell(state: &mut State, command: &str) -> Vec<Cmd> {
     }]
 }
 
+fn replayed_shell_card(v: &Value) -> Option<TranscriptItem> {
+    let command = v.get("command").and_then(Value::as_str)?.to_string();
+    let mut output = v
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let exit_code = v
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .and_then(|c| i32::try_from(c).ok());
+    let end = match (v.get("end").and_then(Value::as_str), exit_code) {
+        (None | Some("exited"), Some(code)) => Some(ShellEnd::Exited(code)),
+        (Some("timed_out"), _) => Some(ShellEnd::TimedOut),
+        (Some("failed"), _) => Some(ShellEnd::Failed),
+        (Some("cancelled"), _) => Some(ShellEnd::Cancelled),
+        _ => None,
+    };
+    if let Some(label) = end.and_then(ShellEnd::shared_label) {
+        if output == label {
+            output.clear();
+        } else if let Some(kept) = output.strip_suffix(&format!("\n{label}")) {
+            output = kept.to_string();
+        }
+    }
+    Some(TranscriptItem::Shell {
+        command,
+        output,
+        end,
+        running: false,
+    })
+}
+
 fn shell_done(state: &mut State, output: String, end: ShellEnd) -> Vec<Cmd> {
     let Some(command) = state.shell_running.take() else {
         return Vec::new();
@@ -3242,6 +3281,7 @@ fn shell_done(state: &mut State, output: String, end: ShellEnd) -> Vec<Cmd> {
         command,
         output: shared,
         exit_code: end.exit_code(),
+        end: end.wire(),
     }]
 }
 
@@ -10341,7 +10381,8 @@ mod tests {
             vec![Cmd::ShellNote {
                 command: "false".into(),
                 output: "boom\n".into(),
-                exit_code: Some(1)
+                exit_code: Some(1),
+                end: "exited",
             }]
         );
         assert!(s.shell_running.is_none());
@@ -10363,7 +10404,7 @@ mod tests {
             },
         );
         assert!(
-            matches!(&cmds[..], [Cmd::ShellNote { output, .. }] if output.contains("[timed out after 120s]")),
+            matches!(&cmds[..], [Cmd::ShellNote { output, end: "timed_out", .. }] if output.contains("[timed out after 120s]")),
             "{cmds:?}"
         );
         assert!(matches!(
@@ -10451,7 +10492,7 @@ mod tests {
         type_and_submit(&mut s, "!x");
         let cmds = update(&mut s, done("", ShellEnd::Signaled(15)));
         assert!(
-            matches!(&cmds[..], [Cmd::ShellNote { output, exit_code: None, .. }] if output.contains("[killed by SIGTERM]")),
+            matches!(&cmds[..], [Cmd::ShellNote { output, exit_code: None, end: "signaled", .. }] if output.contains("[killed by SIGTERM]")),
             "{cmds:?}"
         );
         assert!(matches!(
@@ -10461,6 +10502,84 @@ mod tests {
                 running: false,
                 ..
             }]
+        ));
+    }
+
+    fn replayed(s: &mut State, v: Value) -> TranscriptItem {
+        let before = s.transcript.len();
+        let cmds = upd(s, v);
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert_eq!(s.transcript.len(), before + 1);
+        assert!(s.shell_running.is_none());
+        s.transcript.last().cloned().unwrap()
+    }
+
+    #[test]
+    fn a_replayed_shell_note_is_a_finished_shell_card() {
+        let mut s = State::test_default();
+        let card = replayed(
+            &mut s,
+            json!({"type": "shell_replay", "command": "cargo test", "output": "FAILED one", "exit_code": 101, "end": "exited"}),
+        );
+        assert_eq!(
+            card,
+            TranscriptItem::Shell {
+                command: "cargo test".into(),
+                output: "FAILED one".into(),
+                end: Some(ShellEnd::Exited(101)),
+                running: false,
+            }
+        );
+        let card = replayed(
+            &mut s,
+            json!({"type": "shell_replay", "command": "ls", "output": "a b", "exit_code": 0}),
+        );
+        assert!(matches!(
+            card,
+            TranscriptItem::Shell {
+                end: Some(ShellEnd::Exited(0)),
+                running: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_replayed_shell_note_shows_its_end_label_once() {
+        let mut s = State::test_default();
+        let card = replayed(
+            &mut s,
+            json!({"type": "shell_replay", "command": "sleep 999", "output": "partial\n[timed out after 120s]", "exit_code": null, "end": "timed_out"}),
+        );
+        assert_eq!(
+            card,
+            TranscriptItem::Shell {
+                command: "sleep 999".into(),
+                output: "partial".into(),
+                end: Some(ShellEnd::TimedOut),
+                running: false,
+            }
+        );
+        let card = replayed(
+            &mut s,
+            json!({"type": "shell_replay", "command": "x", "output": "[killed by SIGTERM]", "exit_code": null, "end": "signaled"}),
+        );
+        assert_eq!(
+            card,
+            TranscriptItem::Shell {
+                command: "x".into(),
+                output: "[killed by SIGTERM]".into(),
+                end: None,
+                running: false,
+            }
+        );
+        let card = replayed(
+            &mut s,
+            json!({"type": "shell_replay", "command": "y", "output": "[timed out after 120s]", "exit_code": null}),
+        );
+        assert!(matches!(
+            card,
+            TranscriptItem::Shell { end: None, ref output, .. } if output == "[timed out after 120s]"
         ));
     }
 

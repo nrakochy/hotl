@@ -363,6 +363,23 @@ fn every_hotl_meta_payload_validates_against_the_published_schema() {
             None => panic!("{event:?} sent nothing"),
         }
     }
+    let notes: Vec<hotl_types::Item> = [Some("timed_out"), None]
+        .into_iter()
+        .map(|end| hotl_types::Item::User {
+            text: hotl_engine::shell_note_text("ls", "a", Some(0), end),
+            synthetic: Some(hotl_types::SyntheticReason::ShellCommand),
+            images: Vec::new(),
+        })
+        .collect();
+    for out in acp_map::replay_updates(&notes, true) {
+        let acp_map::Outgoing::Ext(frame) = out else {
+            panic!("a shell note replays as an extension update");
+        };
+        ext_valid(
+            "ExtSessionUpdateParams",
+            &json!({"sessionId": "s", "update": frame}),
+        );
+    }
     let mut seen = std::collections::BTreeSet::new();
     for value in &sent {
         check_meta(&schema, value, &mut seen);

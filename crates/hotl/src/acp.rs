@@ -1314,8 +1314,15 @@ async fn handle_request(
             };
             extras.context_tokens = context_tokens;
             if kind == OpenKind::Load {
-                for update in crate::acp_map::replay_updates(&history) {
-                    send_update(writer, &sid, update).await;
+                for out in crate::acp_map::replay_updates(&history, client_caps.ext) {
+                    match out {
+                        crate::acp_map::Outgoing::Update(update) => {
+                            send_update(writer, &sid, update).await
+                        }
+                        crate::acp_map::Outgoing::Ext(update) => {
+                            notify_ext(writer, &sid, update).await
+                        }
+                    }
                 }
             }
             let meta = client_caps.ext.then(|| {
@@ -2023,8 +2030,15 @@ async fn handle_request(
                 .pointer("/params/exitCode")
                 .and_then(Value::as_i64)
                 .and_then(|c| i32::try_from(c).ok());
-            state.handle.shell_note(command, output, exit_code).await;
-            reply_ok(writer, id, json!({})).await;
+            let end = msg
+                .pointer("/params/end")
+                .and_then(Value::as_str)
+                .filter(|e| hotl_engine::SHELL_NOTE_ENDS.contains(e));
+            state
+                .handle
+                .shell_note(command, output, exit_code, end)
+                .await;
+            reply_ok(writer, id, to_json(&Ack { ok: true })).await;
         }
         // `/compact [focus]` (0066): ack with whether it ran now or waits for
         // the turn boundary; the fold's own frames ride `session/update`.
@@ -4592,10 +4606,34 @@ pub enum AcpOnlyUpdate {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReplayUpdate {
+    #[schemars(
+        description = "A stored ! command note, replayed by session/load as a finished shell card"
+    )]
+    ShellReplay {
+        command: String,
+        output: String,
+        exit_code: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schemars(description = "One of exited, signaled, failed, timed_out, cancelled")]
+        end: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+pub enum ExtUpdate {
+    Stream(crate::wire::Frame),
+    Replay(ReplayUpdate),
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtSessionUpdateParams {
     pub session_id: String,
-    pub update: crate::wire::Frame,
+    pub update: ExtUpdate,
 }
 
 /// Server → client `_hotl/session/request_question` params.

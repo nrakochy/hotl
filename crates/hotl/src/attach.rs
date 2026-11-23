@@ -296,7 +296,12 @@ async fn bang(command: &str, cwd: &std::path::Path) -> (String, Value) {
         Some(label) => append(&run.output, &label),
         None => run.output,
     };
-    let params = json!({"command": command, "output": output, "exitCode": run.end.exit_code()});
+    let params = json!({
+        "command": command,
+        "output": output,
+        "exitCode": run.end.exit_code(),
+        "end": run.end.wire(),
+    });
     (shown, params)
 }
 
@@ -908,6 +913,7 @@ mod tests {
         assert!(shown.ends_with("[exit 3]"), "{shown}");
         assert_eq!(params["command"], "ls; exit 3");
         assert_eq!(params["exitCode"], 3);
+        assert_eq!(params["end"], "exited");
         assert!(
             params["output"]
                 .as_str()
@@ -936,6 +942,7 @@ mod tests {
             "{params}"
         );
         assert!(params["exitCode"].is_null(), "{params}");
+        assert_eq!(params["end"], "signaled");
     }
 
     fn usage_update() -> Value {

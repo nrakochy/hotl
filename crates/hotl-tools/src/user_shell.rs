@@ -46,6 +46,17 @@ impl ShellEnd {
         }
     }
 
+    pub fn wire(self) -> &'static str {
+        match self {
+            ShellEnd::Exited(_) => "exited",
+            #[cfg(unix)]
+            ShellEnd::Signaled(_) => "signaled",
+            ShellEnd::TimedOut => "timed_out",
+            ShellEnd::Cancelled => "cancelled",
+            ShellEnd::Failed => "failed",
+        }
+    }
+
     pub fn exit_code(self) -> Option<i32> {
         match self {
             ShellEnd::Exited(n) => Some(n),

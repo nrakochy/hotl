@@ -925,3 +925,97 @@ async fn slash_plan_with_a_task_reaches_the_model_in_plan_mode() {
         "plan mode was not on for the first request: {names:?}"
     );
 }
+
+fn history_factory(history: Vec<hotl_types::Item>) -> acp::SessionFactory {
+    Box::new(move |_spec| {
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
+        Ok(acp::SessionOpen {
+            history: history.clone(),
+            memory_mode: None,
+            worktree: None,
+            lease: None,
+            color: None,
+            handle: spawn_session(SessionDeps {
+                concurrency: Default::default(),
+                provider: Arc::new(ScriptedProvider::new(vec![])),
+                registry: Arc::new(Registry::builtin()),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: std::env::temp_dir(),
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
+                initial_goal: None,
+                config: EngineConfig::default(),
+            }),
+            name: None,
+            mode: "ask".into(),
+            plan: false,
+            default_effort: None,
+            effort_schedule: None,
+            goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
+            session_id,
+            warnings: Vec::new(),
+            mcp_warnings: Vec::new(),
+            title: None,
+            model: None,
+        })
+    })
+}
+
+#[tokio::test]
+async fn a_loaded_session_replays_its_shell_note_as_a_shell_card() {
+    let note = hotl_types::Item::User {
+        text: hotl_engine::shell_note_text("git status", "clean", Some(0), Some("exited")),
+        synthetic: Some(hotl_types::SyntheticReason::ShellCommand),
+        images: Vec::new(),
+    };
+    let (mut client, mut reader) = start_with(history_factory(vec![note])).await;
+    let mut state = State::new(true, "m".into());
+    let mut prompt_ids = VecDeque::new();
+    let mut steer_ids = VecDeque::new();
+    let mut model_ids = VecDeque::new();
+    let mut remember_ids = VecDeque::new();
+    let load = client
+        .request(
+            "session/load",
+            json!({"sessionId": "S1", "cwd": std::env::temp_dir(), "mcpServers": []}),
+        )
+        .await
+        .expect("write");
+    loop {
+        let msg = next(&mut reader).await;
+        if matches!(&msg, ServerMsg::Response { id, .. } if *id == load) {
+            break;
+        }
+        if let Some(msg) = translate(
+            msg,
+            &mut prompt_ids,
+            &mut steer_ids,
+            &mut model_ids,
+            &mut remember_ids,
+        ) {
+            update(&mut state, msg);
+        }
+    }
+    assert!(
+        state.transcript.iter().any(|i| matches!(
+            i,
+            hotl_tui::app::TranscriptItem::Shell { command, output, running: false, .. }
+                if command == "git status" && output == "clean"
+        )),
+        "{:?}",
+        state.transcript
+    );
+    let rows = draw(&state);
+    assert!(rows.iter().any(|r| r.contains("! git status")), "{rows:?}");
+}

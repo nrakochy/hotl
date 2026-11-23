@@ -291,7 +291,7 @@
           "type": "string"
         },
         "update": {
-          "$ref": "#/$defs/Frame"
+          "$ref": "#/$defs/ExtUpdate"
         }
       },
       "required": [
@@ -299,6 +299,16 @@
         "update"
       ],
       "type": "object"
+    },
+    "ExtUpdate": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Frame"
+        },
+        {
+          "$ref": "#/$defs/ReplayUpdate"
+        }
+      ]
     },
     "Flagged": {
       "properties": {
@@ -2215,6 +2225,45 @@
       ],
       "type": "object"
     },
+    "ReplayUpdate": {
+      "oneOf": [
+        {
+          "description": "A stored ! command note, replayed by session/load as a finished shell card",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "end": {
+              "description": "One of exited, signaled, failed, timed_out, cancelled",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "exit_code": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "output": {
+              "type": "string"
+            },
+            "type": {
+              "const": "shell_replay",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "command",
+            "output"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "Reply": {
       "properties": {
         "input": {
@@ -2479,6 +2528,13 @@
       "properties": {
         "command": {
           "type": "string"
+        },
+        "end": {
+          "description": "How the run ended: exited, signaled, failed, timed_out or cancelled; any other value is ignored",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "exitCode": {
           "format": "int32",
@@ -3133,8 +3189,7 @@
         "$ref": "#/$defs/ShellNoteParams"
       },
       "result": {
-        "additionalProperties": false,
-        "type": "object"
+        "$ref": "#/$defs/Ack"
       }
     },
     "_hotl/session/steer": {

@@ -3290,7 +3290,7 @@ fn push_or_fold_steer(held: &mut Vec<HeldSteer>, steer: HeldSteer) {
     let same_kind = held
         .iter_mut()
         .rev()
-        .find(|s| (s.synthetic == SyntheticReason::ShellCommand) == is_note);
+        .find(|s| s.key.is_none() && (s.synthetic == SyntheticReason::ShellCommand) == is_note);
     match same_kind {
         Some(last) if full => {
             // Images first, disclosure on the INCOMING text, one fold_into
@@ -4764,6 +4764,42 @@ mod tests {
              ...{}",
             &text[text.len().saturating_sub(120)..]
         );
+    }
+
+    #[test]
+    fn a_steer_never_folds_into_a_keyed_notice() {
+        let mut held: Vec<HeldSteer> = vec![
+            HeldSteer {
+                text: "s".repeat(HELD_BYTES_MAX - 100),
+                images: Vec::new(),
+                synthetic: SyntheticReason::Steer,
+                key: None,
+            },
+            HeldSteer {
+                text: format!("child c1 finished {}", "c".repeat(200)),
+                images: Vec::new(),
+                synthetic: SyntheticReason::BackgroundJob,
+                key: Some("c1".into()),
+            },
+        ];
+        push_or_fold_steer(
+            &mut held,
+            HeldSteer {
+                text: "also check X".into(),
+                images: Vec::new(),
+                synthetic: SyntheticReason::Steer,
+                key: None,
+            },
+        );
+        assert_eq!(held.len(), 2);
+        assert_eq!(
+            held[1].text,
+            format!("child c1 finished {}", "c".repeat(200))
+        );
+        assert_eq!(held[1].key.as_deref(), Some("c1"));
+        assert!(held[0].text.contains("also check X"));
+        held.retain(|s| s.key.as_deref() != Some("c1"));
+        assert!(held.iter().any(|s| s.text.contains("also check X")));
     }
 
     #[test]

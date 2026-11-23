@@ -190,6 +190,10 @@ struct ShellNoteParams {
     command: String,
     output: String,
     exit_code: Option<i32>,
+    #[schemars(
+        description = "How the run ended: exited, signaled, failed, timed_out or cancelled; any other value is ignored"
+    )]
+    end: Option<String>,
 }
 
 #[derive(JsonSchema)]
@@ -296,7 +300,7 @@ pub fn schema() -> Value {
         "_hotl/session/set_goal": request("client", sub::<GoalParams>(g), sub::<GoalAck>(g)),
         "_hotl/session/remember": request("client", sub::<RememberParams>(g), one_of(&["Ack", "MemoryReport"])),
         "_hotl/session/steer": request("client", sub::<SteerParams>(g), queued.clone()),
-        "_hotl/session/shell_note": request("client", sub::<ShellNoteParams>(g), json!({"type": "object", "additionalProperties": false})),
+        "_hotl/session/shell_note": request("client", sub::<ShellNoteParams>(g), ack.clone()),
         "_hotl/session/fold": request("client", sub::<FoldParams>(g), queued.clone()),
         "_hotl/session/reload_config": reload,
         "_hotl/session/aside": request("client", sub::<AsideParams>(g), ack.clone()),
