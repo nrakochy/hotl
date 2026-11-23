@@ -566,6 +566,7 @@ pub struct State {
     pub session_usage: SessionUsage,
     pub help_open: bool,
     pub theme_picker: Option<ThemePicker>,
+    pub theme_name: String,
     /// Row offset into an ask/question/help body taller than the frame;
     /// reset whenever a modal opens. The view clamps the top.
     pub modal_scroll: usize,
@@ -789,6 +790,7 @@ impl State {
             session_usage: SessionUsage::default(),
             help_open: false,
             theme_picker: None,
+            theme_name: "tokyo-night".into(),
             modal_scroll: 0,
             queued_submit: false,
             interrupt_sent: false,
@@ -3104,11 +3106,11 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
 /// — slash commands included — stays inert, buffered as text.
 pub fn pre_open_input(state: &mut State, msg: Msg) -> Vec<Cmd> {
     match msg {
-        Msg::Key(key)
-            if state.theme_picker.is_some()
-                && !(key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('c')) =>
-        {
+        Msg::Key(key) if state.theme_picker.is_some() => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                let picker = state.theme_picker.take().expect("picker is open");
+                return vec![Cmd::PreviewTheme(picker.original), Cmd::Quit];
+            }
             return theme_picker_key(state, key);
         }
         Msg::Key(key) => {
@@ -3496,6 +3498,31 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
             let mut cmds = vec![Cmd::Rename(name)];
             cmds.extend(title_cmds(state, suffix));
             cmds
+        }
+        "theme" => {
+            if arg.is_empty() {
+                state.theme_picker = Some(ThemePicker::open(&state.theme_name, false));
+                return Vec::new();
+            }
+            match hotl_theme::PRESETS
+                .iter()
+                .find(|n| n.eq_ignore_ascii_case(arg))
+            {
+                Some(name) => vec![
+                    Cmd::PreviewTheme((*name).to_string()),
+                    Cmd::SetTheme((*name).to_string()),
+                ],
+                None => {
+                    notice(
+                        state,
+                        format!(
+                            "no theme \"{arg}\" — themes: {}",
+                            hotl_theme::PRESETS.join(", ")
+                        ),
+                    );
+                    Vec::new()
+                }
+            }
         }
         "color" => {
             if arg.is_empty() {
@@ -8255,7 +8282,7 @@ mod tests {
     fn typing_a_slash_opens_the_popup_and_narrows_as_you_type() {
         let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/");
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(23));
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(24));
         type_str(&mut s, "re");
         assert_eq!(selected(&s), "reload");
         // `reload`, `rename`, `resume`, `review` and `remember` prefix-match,
@@ -8581,6 +8608,77 @@ mod tests {
             last_notice(&s),
             format!("no color \"surprise\" — picked {c}")
         );
+    }
+
+    #[test]
+    fn bare_slash_theme_opens_the_picker_on_the_active_preset() {
+        let mut s = State::test_default();
+        s.theme_name = "nord".into();
+        let cmds = type_and_submit(&mut s, "/theme");
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert_eq!(s.theme_picker, Some(ThemePicker::open("nord", false)));
+        assert_eq!(s.editor.text(), "");
+        assert_eq!(
+            press(&mut s, KeyCode::Esc),
+            vec![Cmd::PreviewTheme("nord".into())]
+        );
+    }
+
+    #[test]
+    fn slash_theme_with_a_name_previews_and_sets_it() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/theme Gruvbox");
+        assert_eq!(
+            cmds,
+            vec![
+                Cmd::PreviewTheme("gruvbox".into()),
+                Cmd::SetTheme("gruvbox".into())
+            ]
+        );
+        assert!(s.theme_picker.is_none());
+    }
+
+    #[test]
+    fn slash_theme_with_an_unknown_name_lists_the_names_and_changes_nothing() {
+        let mut s = State::test_default();
+        s.theme_name = "nord".into();
+        let cmds = type_and_submit(&mut s, "/theme bogus");
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(s.theme_picker.is_none());
+        assert_eq!(s.theme_name, "nord");
+        assert_eq!(
+            last_notice(&s),
+            "no theme \"bogus\" — themes: tokyo-night, catppuccin, gruvbox, nord, dracula, warm"
+        );
+    }
+
+    #[test]
+    fn pre_open_ctrl_c_with_the_picker_open_restores_and_quits() {
+        let mut s = State::new(false, "m".into());
+        s.theme_picker = Some(ThemePicker::open("tokyo-night", true));
+        let key = |code| Msg::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        pre_open_input(&mut s, key(KeyCode::Down));
+        let cmds = pre_open_input(
+            &mut s,
+            Msg::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        );
+        assert_eq!(cmds, vec![preview("tokyo-night"), Cmd::Quit]);
+        assert!(s.theme_picker.is_none());
+    }
+
+    #[test]
+    fn pre_open_ctrl_c_without_the_picker_does_nothing() {
+        let mut s = State::new(false, "m".into());
+        let cmds = pre_open_input(
+            &mut s,
+            Msg::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        );
+        assert!(cmds.is_empty(), "{cmds:?}");
+    }
+
+    #[test]
+    fn a_new_state_starts_on_tokyo_night() {
+        assert_eq!(State::new(false, "m".into()).theme_name, "tokyo-night");
     }
 
     #[test]

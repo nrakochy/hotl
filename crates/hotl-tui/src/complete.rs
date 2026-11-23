@@ -27,9 +27,10 @@ pub struct Completion {
 
 /// The TUI's own commands, in `slash_command`'s dispatch order. Descriptions
 /// are hand-written here because built-ins have no roster to read them from.
-const BUILTINS: [(&str, &str); 22] = [
+const BUILTINS: [(&str, &str); 23] = [
     ("rename", "name this session"),
     ("color", "set this session's accent color"),
+    ("theme", "pick the color palette, or /theme <name>"),
     ("plan", "toggle plan mode, or /plan <task> to plan it"),
     ("mode", "set the permission mode"),
     ("goal", "run until a condition is met"),
@@ -225,6 +226,13 @@ mod tests {
     }
 
     #[test]
+    fn theme_is_offered_from_slash() {
+        let cmds = builtins();
+        let c = recompute(&cmds, "/the", (0, 4), false).expect("popup");
+        assert_eq!(names(&cmds, &c), vec!["theme"]);
+    }
+
+    #[test]
     fn effort_is_offered_from_slash() {
         let cmds = builtins();
         let c = recompute(&cmds, "/eff", (0, 4), false).expect("popup");
@@ -250,6 +258,7 @@ mod tests {
                 "clear",
                 "color",
                 "model",
+                "theme",
                 "agents",
                 "effort",
                 "reload",

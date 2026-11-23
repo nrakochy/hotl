@@ -5598,7 +5598,7 @@ mod tests {
         s.help_open = true;
         let rows = draw_at(&s, 80, 14);
         assert!(rows.iter().any(|r| r.contains("more · pgdn")), "{rows:#?}");
-        s.modal_scroll = 6;
+        s.modal_scroll = 7;
         assert!(draw_at(&s, 80, 14)
             .iter()
             .any(|r| r.contains("any key closes")));
